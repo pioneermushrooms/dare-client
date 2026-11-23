@@ -360,6 +360,74 @@ fn parse_region(s: &str) -> Option<SkinRegion> {
     Some(SkinRegion { rect, norm, alt })
 }
 
+/// The skin used when none is chosen, or the chosen one is gone.
+pub const DEFAULT_SKIN: &str = "Dare";
+
+/// A skin file found on disk; named by its file stem.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkinEntry {
+    pub name: String,
+    pub path: std::path::PathBuf,
+}
+
+/// The folders skins are looked for in, in order: the bundled one, the
+/// settings folder's, a Continuum install's, then any the settings add. A
+/// later folder's skin replaces an earlier one of the same name.
+pub fn skin_dirs(
+    bundled_assets: Option<&std::path::Path>,
+    settings_dir: &std::path::Path,
+    continuum: Option<&std::path::Path>,
+    extra: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    v.extend(bundled_assets.map(|a| a.join("skins")));
+    v.push(settings_dir.join("skins"));
+    v.extend(continuum.map(|c| c.join("skins")));
+    v.extend(extra.iter().cloned());
+    v
+}
+
+/// Every `.skn` in `dirs`; `Dare` first, then by name ignoring case.
+pub fn find_skins(dirs: &[std::path::PathBuf]) -> Vec<SkinEntry> {
+    let mut found: Vec<SkinEntry> = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut here: Vec<_> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("skn")))
+            .collect();
+        here.sort();
+        for path in here {
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            found.retain(|e| !e.name.eq_ignore_ascii_case(name));
+            found.push(SkinEntry {
+                name: name.to_string(),
+                path,
+            });
+        }
+    }
+    found.sort_by_key(|e| {
+        (
+            !e.name.eq_ignore_ascii_case(DEFAULT_SKIN),
+            e.name.to_lowercase(),
+        )
+    });
+    found
+}
+
+/// The skin called `wanted` (ignoring case), else `Dare`, else the first.
+pub fn pick<'a>(entries: &'a [SkinEntry], wanted: &str) -> Option<&'a SkinEntry> {
+    let named = |n: &str| entries.iter().find(|e| e.name.eq_ignore_ascii_case(n));
+    named(wanted)
+        .or_else(|| named(DEFAULT_SKIN))
+        .or_else(|| entries.first())
+}
+
 /// Loads a skin from the bytes of a `.skn` file.
 pub fn load_skin(name: &str, bytes: &[u8]) -> Result<Skin, SkinError> {
     if bytes.is_empty() {
@@ -434,6 +502,53 @@ mod tests {
         d.extend_from_slice(&[0; 24]);
         d.resize(size as usize, 0x80);
         d
+    }
+
+    #[test]
+    fn later_folder_wins_and_dare_first() {
+        let root = std::env::temp_dir().join(format!("oss-skins-{}", std::process::id()));
+        let (a, b) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for f in ["b.skn", "Dare.skn", "a.SKN", "notes.txt"] {
+            std::fs::write(a.join(f), b"x").unwrap();
+        }
+        std::fs::write(b.join("A.skn"), b"x").unwrap();
+        let found = find_skins(&[a.clone(), root.join("missing"), b.clone()]);
+        let names: Vec<_> = found.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Dare", "A", "b"]);
+        assert_eq!(found[1].path, b.join("A.skn"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pick_is_case_insensitive_then_dare() {
+        let e = |n: &str| SkinEntry {
+            name: n.into(),
+            path: n.into(),
+        };
+        let list = vec![e("Dare"), e("Pipe Dreams")];
+        assert_eq!(pick(&list, "pipe dreams").unwrap().name, "Pipe Dreams");
+        assert_eq!(pick(&list, "Gone").unwrap().name, "Dare");
+        assert_eq!(pick(&[e("Solo")], "Gone").unwrap().name, "Solo");
+        assert!(pick(&[], "Dare").is_none());
+    }
+
+    #[test]
+    fn skin_dirs_in_order() {
+        let d = skin_dirs(
+            Some(std::path::Path::new("/app/assets")),
+            std::path::Path::new("/cfg"),
+            Some(std::path::Path::new("/cont")),
+            &["/extra".into()],
+        );
+        let want: Vec<std::path::PathBuf> = vec![
+            "/app/assets/skins".into(),
+            "/cfg/skins".into(),
+            "/cont/skins".into(),
+            "/extra".into(),
+        ];
+        assert_eq!(d, want);
     }
 
     #[test]

@@ -87,6 +87,10 @@ pub struct Config {
     pub security: oss_session::security::SecurityMode,
     /// Offer zones an OpenSec identity key (one per zone) they can use for bans.
     pub identity: bool,
+    /// The start screen's skin, by name.
+    pub skin: String,
+    /// Extra folders to look for skins in.
+    pub skin_folders: Vec<PathBuf>,
 }
 
 impl Default for Config {
@@ -106,6 +110,8 @@ impl Default for Config {
             directories: DEFAULT_DIRECTORIES.iter().map(|&s| s.to_owned()).collect(),
             security: Default::default(),
             identity: true,
+            skin: crate::game::skin::DEFAULT_SKIN.to_owned(),
+            skin_folders: Vec::new(),
         }
     }
 }
@@ -191,6 +197,23 @@ impl Config {
                 ("video", "scale") => number(value, 0, 8).map(|n| c.scale = (n > 0).then_some(n)),
                 ("video", "vsync") => flag(value).map(|b| c.vsync = b),
                 ("video", "fullscreen") => flag(value).map(|b| c.fullscreen = b),
+                ("video", "skin") => {
+                    c.skin = if value.is_empty() {
+                        crate::game::skin::DEFAULT_SKIN.to_owned()
+                    } else {
+                        value.to_owned()
+                    };
+                    Ok(())
+                }
+                ("skins", "folders") => {
+                    c.skin_folders = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .collect();
+                    Ok(())
+                }
                 ("audio", "mute") => flag(value).map(|b| c.mute = b),
                 ("audio", "volume") => number(value, 0, 100).map(|n| c.volume = n),
                 ("accessibility", "palette") => crate::game::palette::PaletteKind::from_name(value)
@@ -290,9 +313,10 @@ impl Config {
             "scale = {}          ; integer pixel scale 1-8, 0 = from the display\n",
             self.scale.unwrap_or(0)
         );
+        s += &format!("vsync = {}\nfullscreen = {}\n", self.vsync, self.fullscreen);
         s += &format!(
-            "vsync = {}\nfullscreen = {}\n\n",
-            self.vsync, self.fullscreen
+            "skin = {}           ; start screen skin (Cmd-K / F7 cycles them)\n\n",
+            self.skin
         );
         s += &format!(
             "[audio]\nmute = {}\nvolume = {}         ; 0-100\n\n",
@@ -329,6 +353,18 @@ impl Config {
             } else {
                 self.directories.join(", ")
             }
+        );
+        s += &format!(
+            "[skins]\n\
+             ; Extra folders holding .skn skins, comma separated. The bundled skins,\n\
+             ; the `skins` folder beside this file and a Continuum install's are\n\
+             ; always searched.\n\
+             folders = {}\n\n",
+            self.skin_folders
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         // No `[player] name`. The name is the start-up screen's and is
         // remembered in `login.ini`; a file that still carries the key is read
@@ -809,5 +845,33 @@ spectate = F10
         assert!(e.contains("--config"), "{e}");
         assert!(e.contains("empty file"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skin_and_folders_round_trip() {
+        let (c, warnings) =
+            Config::parse("[video]\nskin = Dare Night\n[skins]\nfolders = /x, /y\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(c.skin, "Dare Night");
+        assert_eq!(
+            c.skin_folders,
+            vec![
+                std::path::PathBuf::from("/x"),
+                std::path::PathBuf::from("/y")
+            ]
+        );
+        let (again, _) = Config::parse(&c.to_text());
+        assert_eq!(again.skin, c.skin);
+        assert_eq!(again.skin_folders, c.skin_folders);
+    }
+
+    #[test]
+    fn skin_defaults_to_dare() {
+        let (c, _) = Config::parse("");
+        assert_eq!(c.skin, "Dare");
+        assert!(c.skin_folders.is_empty());
+        let (blank, _) = Config::parse("[video]\nskin =\n[skins]\nfolders =\n");
+        assert_eq!(blank.skin, "Dare");
+        assert!(blank.skin_folders.is_empty());
     }
 }
