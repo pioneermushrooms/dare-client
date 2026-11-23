@@ -1398,6 +1398,11 @@ impl App {
                             s.macros = self.options.macros.clone();
                             s.palette = self.options.palette;
                             s.ui_scale_extra = self.options.ui_scale;
+                            // The start screen goes away here; its skin's texture
+                            // goes with it rather than staying on the GPU.
+                            if let Some(ui) = ls.skin.take() {
+                                ui.tex.free(&mut run.renderer);
+                            }
                             run.screen = Screen::Game(Box::new(s));
                         }
                         Err(e) => return self.fail(event_loop, e),

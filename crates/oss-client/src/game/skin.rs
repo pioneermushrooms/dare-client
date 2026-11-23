@@ -314,8 +314,8 @@ fn parse_region(s: &str) -> Option<SkinRegion> {
     let rect = SkinRect {
         x: x1,
         y: y1,
-        w: x2 - x1 + 1,
-        h: y2 - y1 + 1,
+        w: (x2 - x1).checked_add(1)?,
+        h: (y2 - y1).checked_add(1)?,
     };
     let mut norm = Vec::new();
     let mut alt = Vec::new();
@@ -470,6 +470,16 @@ pub fn load_skin(name: &str, bytes: &[u8]) -> Result<Skin, SkinError> {
             .push("`main` is larger than the image; clipped".into());
     }
     let mut dropped = Vec::new();
+    // A hot spot must be on the image, which also keeps every later sum of a
+    // position and a size far from overflowing.
+    layout.spots.retain(|(spot, region)| {
+        let r = region.rect;
+        let ok = fits(r.x, r.y, r.w, r.h);
+        if !ok {
+            dropped.push(format!("{spot:?}: ({},{}) is off the image", r.x, r.y));
+        }
+        ok
+    });
     for (spot, region) in &mut layout.spots {
         let (w, h) = (region.rect.w, region.rect.h);
         for list in [&mut region.norm, &mut region.alt] {
@@ -838,6 +848,29 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn huge_numbers_never_panic() {
+        let l = parse_layout(
+            "main=(0,0,9,9)\nplay=(0,0,4294967295,10)\nquit=(4294967290,4294967290,4294967295,4294967295)+(1,1)",
+        )
+        .unwrap();
+        assert!(
+            l.first_rect(&HotSpot::Play).is_none(),
+            "width overflows u32"
+        );
+        let mut d = bmp(50, 50);
+        d.extend_from_slice(
+            b"main=(0,0,39,39)\nproftext=(0,4294967290,10,4294967294)\ninfobox=(10,10,20,20)",
+        );
+        let s = load_skin("t", &d).unwrap();
+        assert!(
+            s.layout.first_rect(&HotSpot::ProfText).is_none(),
+            "outside the image"
+        );
+        assert!(s.layout.first_rect(&HotSpot::InfoBox).is_some());
+        assert!(!s.layout.warnings.is_empty());
     }
 
     #[test]

@@ -9,3 +9,6 @@ CLAUDE.local.md
 *.wa2
 !/assets/classic/**/*.bm2
 !/assets/classic/**/*.wa2
+
+# Python bytecode from the skin generator
+__pycache__/

@@ -136,12 +136,18 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 /// sprite: a real area inside the main region. Skins that draw their own ship
 /// art (in ALT overlays) give a dummy first rectangle to turn the sprite off.
 pub fn sprite_slot(main: SkinRect, slot: SkinRect) -> bool {
+    let end = |a: u32, b: u32| u64::from(a) + u64::from(b);
     slot.w >= 16
         && slot.h >= 16
         && slot.x >= main.x
         && slot.y >= main.y
-        && slot.x + slot.w <= main.x + main.w
-        && slot.y + slot.h <= main.y + main.h
+        && end(slot.x, slot.w) <= end(main.x, main.w)
+        && end(slot.y, slot.h) <= end(main.y, main.h)
+}
+
+/// Where the players column starts in a zone line `chars` wide, if there is room.
+pub fn players_x(chars: usize) -> Option<u32> {
+    (chars >= 8).then(|| (chars as u32 - 3) * 8)
 }
 
 /// The skin's bitmap on the GPU.
@@ -374,13 +380,9 @@ pub fn draw_skin(
                     [235, 235, 235],
                     &line[4..line.len() - 4],
                 );
-                text(
-                    r,
-                    b.x + (chars as u32 - 3) * 8,
-                    y + 1,
-                    col,
-                    &line[line.len() - 3..],
-                );
+                if let Some(px) = players_x(chars) {
+                    text(r, b.x + px, y + 1, col, &line[line.len() - 3..]);
+                }
             }
         }
     }
@@ -515,6 +517,18 @@ mod tests {
         );
         assert!(!sprite_slot(main, r(10, 10, 4, 4)), "too small for a ship");
         assert!(!sprite_slot(main, r(580, 370, 30, 30)), "runs off main");
+        assert!(
+            !sprite_slot(main, r(u32::MAX - 5, 10, 30, 30)),
+            "no overflow"
+        );
+    }
+
+    #[test]
+    fn players_column_needs_room() {
+        assert_eq!(players_x(40), Some(37 * 8));
+        assert_eq!(players_x(8), Some(5 * 8));
+        assert_eq!(players_x(2), None);
+        assert_eq!(players_x(0), None);
     }
 
     #[test]
