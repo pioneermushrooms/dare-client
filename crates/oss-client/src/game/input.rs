@@ -857,6 +857,11 @@ impl InputState {
         self.held(KeyCode::ShiftLeft) || self.held(KeyCode::ShiftRight)
     }
 
+    /// The Command key on a Mac (the Windows/Super key elsewhere).
+    pub fn cmd(&self) -> bool {
+        self.held(KeyCode::SuperLeft) || self.held(KeyCode::SuperRight)
+    }
+
     pub fn ctrl(&self) -> bool {
         self.held(KeyCode::ControlLeft) || self.held(KeyCode::ControlRight)
     }

@@ -716,7 +716,8 @@ impl ApplicationHandler for App {
                 let Some(run) = self.running.as_mut() else {
                     return;
                 };
-                let cursor = self.cursor;
+                let size = run.renderer.size();
+                let cursor = self.cursor.map(|at| to_start_scale(at, size, run.scale));
                 if let Screen::Login(ls) = &mut run.screen
                     && let Some((mx, my)) = cursor
                     && ls.spots.over_list(mx, my)
@@ -890,7 +891,10 @@ impl App {
             let clicked = std::mem::take(&mut self.clicked);
             let mut pointed = None;
             if clicked && self.settings.is_none() {
-                pointed = cursor.and_then(|(mx, my)| ls.spots.at(mx, my));
+                let size = run.renderer.size();
+                pointed = cursor
+                    .map(|at| to_start_scale(at, size, run.scale))
+                    .and_then(|(mx, my)| ls.spots.at(mx, my));
                 match pointed {
                     Some(Spot::Field(field)) => {
                         ls.login.focus_on(field);
@@ -938,6 +942,9 @@ impl App {
                 Some(Spot::Options) => Some(Choice::Options),
                 Some(Spot::Sandbox) => Some(Choice::Sandbox),
                 Some(Spot::RefreshZones) => Some(Choice::RefreshZones),
+                _ if self.input.cmd() || self.input.ctrl() => {
+                    crate::game::login::Login::shortcut(&strokes)
+                }
                 _ => ls.login.input(&strokes, self.input.shift()),
             };
             match choice {
@@ -1197,7 +1204,9 @@ impl App {
             }
             Screen::Connecting(_) | Screen::Login(_) if !draw => None,
             Screen::Login(ls) => {
-                draw_start_screen(ls, &mut run.renderer, run.scale, cursor);
+                let size = run.renderer.size();
+                let cursor = cursor.map(|at| to_start_scale(at, size, run.scale));
+                draw_start_screen(ls, &mut run.renderer, start_scale(size, run.scale), cursor);
                 None
             }
             Screen::Connecting(conn) => {
@@ -1410,6 +1419,25 @@ fn utc_stamp(secs: u64) -> String {
         rem / 60 % 60,
         rem % 60
     )
+}
+
+/// The pixel scale the start-up screen is drawn at: the largest whole number that
+/// keeps the panel within most of the window, and never smaller than the game's
+/// own. Without this the panel is a small box in the middle of a big window on a
+/// high-resolution display.
+fn start_scale(screen: (u32, u32), base: u32) -> u32 {
+    // The panel's footprint in unscaled pixels, with room for its tallest list.
+    const PANEL_W: f32 = START_COLS * 8.0;
+    const PANEL_H: f32 = 330.0;
+    let fit_w = screen.0 as f32 * 0.85 / PANEL_W;
+    let fit_h = screen.1 as f32 * 0.85 / PANEL_H;
+    (fit_w.min(fit_h).floor() as u32).clamp(base.max(1), 8)
+}
+
+/// Moves a pointer position from the game's scale to the start-up screen's.
+fn to_start_scale(at: (f32, f32), screen: (u32, u32), base: u32) -> (f32, f32) {
+    let k = base.max(1) as f32 / start_scale(screen, base) as f32;
+    (at.0 * k, at.1 * k)
 }
 
 /// How wide the start-up screen is, in characters of the 8x12 font.
@@ -1662,11 +1690,11 @@ fn draw_start_screen(
         &[
             ("Enter = Play", Some(Spot::Play)),
             ("Tab/arrows = Move", None),
-            ("F2 = Options", Some(Spot::Options)),
+            ("F2/Cmd-O = Options", Some(Spot::Options)),
         ],
         &[
-            ("F3 = Zone Refresh", Some(Spot::RefreshZones)),
-            ("F5 = Sandbox", Some(Spot::Sandbox)),
+            ("F3/Cmd-R = Zone Refresh", Some(Spot::RefreshZones)),
+            ("F5/Cmd-S = Sandbox", Some(Spot::Sandbox)),
             ("Esc = Quit", Some(Spot::Quit)),
         ],
     ];

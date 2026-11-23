@@ -29,6 +29,8 @@ use oss_session::SPECTATOR;
 
 pub const FILE_NAME: &str = "login.ini";
 const MAX_FIELD: usize = 64;
+/// The zone the start-up screen offers before the player has picked one.
+pub const DEFAULT_ZONE: &str = "5.161.238.245:5000";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -149,7 +151,8 @@ impl fmt::Debug for Login {
 impl Default for Login {
     fn default() -> Self {
         Self {
-            server: "127.0.0.1:5000".into(),
+            // Dare, the zone this build is made for.
+            server: DEFAULT_ZONE.into(),
             name: String::new(),
             password: String::new(),
             arena: String::new(),
@@ -512,6 +515,22 @@ impl Login {
             }
         }
         None
+    }
+
+    /// Shortcuts for keyboards whose function keys are taken by the system (a Mac's
+    /// F-row drives brightness and media unless fn is held). Read while Cmd or Ctrl
+    /// is down, in place of [`Login::input`], so the letter never reaches a field.
+    pub fn shortcut(strokes: &[Stroke]) -> Option<Choice> {
+        strokes
+            .iter()
+            .filter(|s| !s.repeat)
+            .find_map(|s| match s.key {
+                Some(KeyCode::KeyO | KeyCode::Comma) => Some(Choice::Options),
+                Some(KeyCode::KeyR) => Some(Choice::RefreshZones),
+                Some(KeyCode::KeyS) => Some(Choice::Sandbox),
+                Some(KeyCode::KeyQ) => Some(Choice::Quit),
+                _ => None,
+            })
     }
 
     fn submit(&mut self) -> Option<Choice> {
@@ -979,7 +998,7 @@ mod tests {
         l.input(&strokes(&[], "duel"), false);
         l.input(&strokes(&[KeyCode::Tab, KeyCode::Backspace], ""), false);
         assert_eq!(l.focused(), Field::Server);
-        assert_eq!(l.server, "127.0.0.1:500");
+        assert_eq!(l.server, &DEFAULT_ZONE[..DEFAULT_ZONE.len() - 1]);
         // A zone address with no port is refused, and the cursor goes to the field
         // that is wrong rather than to the top of the form.
         l.input(&strokes(&[], "0"), false);
