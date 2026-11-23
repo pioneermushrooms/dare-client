@@ -2717,7 +2717,7 @@ impl Sandbox {
                 // since how many pages there are depends on the screen's size.
                 self.help_page = page;
             }
-            None => {}
+            Some(crate::app::StartScreen::Profile) | None => {}
         }
     }
 }

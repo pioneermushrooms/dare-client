@@ -126,7 +126,28 @@ pub struct Login {
     /// `--new-user` were all silently dropped by the version that listed fields by
     /// hand, and a longer list would only have delayed the next one.
     base: Box<ServerOptions>,
+    /// The skinned screen's profile dialog is open: the form is just the
+    /// profile's own fields.
+    profile: bool,
 }
+
+/// What the profile dialog asks for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DialogResult {
+    Close,
+    /// Enter on a complete form: connect with these options.
+    Play(Choice),
+}
+
+/// The profile dialog's fields, in order.
+const PROFILE_FIELDS: [Field; 4] = [Field::Name, Field::Password, Field::Arena, Field::Server];
+const PROFILE_FIELDS_WITH_REMEMBER: [Field; 5] = [
+    Field::Name,
+    Field::Password,
+    Field::Remember,
+    Field::Arena,
+    Field::Server,
+];
 
 /// Everything but the password, which prints as `<redacted>`. The `base` behind it
 /// carries one too and redacts its own.
@@ -144,6 +165,7 @@ impl fmt::Debug for Login {
             .field("vault", &self.vault)
             .field("forget", &self.forget)
             .field("base", &self.base)
+            .field("profile", &self.profile)
             .finish()
     }
 }
@@ -168,6 +190,7 @@ impl Default for Login {
             remember: false,
             vault: false,
             forget: None,
+            profile: false,
             base: Box::new(ServerOptions {
                 server: String::new(),
                 name: String::new(),
@@ -355,10 +378,43 @@ impl Login {
     /// The form's lines, in order: with the Remember line only where there is a
     /// password store.
     pub fn fields(&self) -> &'static [Field] {
-        if self.vault {
-            &FIELDS_WITH_REMEMBER
-        } else {
-            &FIELDS
+        match (self.profile, self.vault) {
+            (true, true) => &PROFILE_FIELDS_WITH_REMEMBER,
+            (true, false) => &PROFILE_FIELDS,
+            (false, true) => &FIELDS_WITH_REMEMBER,
+            (false, false) => &FIELDS,
+        }
+    }
+
+    /// Opens the profile dialog, on the first empty line (or the name).
+    pub fn open_profile(&mut self) {
+        self.profile = true;
+        self.focus = usize::from(!self.name.is_empty() && self.password.is_empty());
+    }
+
+    pub fn profile_open(&self) -> bool {
+        self.profile
+    }
+
+    fn close_profile(&mut self) {
+        self.profile = false;
+        self.focus = 0;
+    }
+
+    /// One frame of keys while the profile dialog is open. Esc closes it; Enter
+    /// on a complete form plays; the function keys belong to the screen
+    /// underneath and do nothing here.
+    pub fn input_profile(&mut self, strokes: &[Stroke], shift: bool) -> Option<DialogResult> {
+        match self.input(strokes, shift)? {
+            Choice::Quit => {
+                self.close_profile();
+                Some(DialogResult::Close)
+            }
+            c @ Choice::Connect(_) => {
+                self.close_profile();
+                Some(DialogResult::Play(c))
+            }
+            Choice::Sandbox | Choice::Options | Choice::RefreshZones => None,
         }
     }
 
@@ -590,6 +646,49 @@ mod tests {
         let mut v: Vec<Stroke> = typed.chars().map(Stroke::text).collect();
         v.extend(keys.iter().copied().map(Stroke::press));
         v
+    }
+
+    #[test]
+    fn profile_input_moves_only_through_profile_fields() {
+        let mut l = Login::load(None, None, Box::new(Login::default().into_base()));
+        l.open_profile();
+        assert_eq!(l.focused(), Field::Name);
+        assert_eq!(l.input_profile(&strokes(&[], "Ace"), false), None);
+        assert_eq!(l.name, "Ace");
+        for _ in 0..3 {
+            l.input_profile(&strokes(&[KeyCode::Tab], ""), false);
+        }
+        assert_eq!(l.focused(), Field::Server);
+        l.input_profile(&strokes(&[KeyCode::Tab], ""), false);
+        assert_eq!(l.focused(), Field::Name, "Tab wraps within the profile");
+        l.input_profile(&strokes(&[KeyCode::Tab], ""), true);
+        assert_eq!(l.focused(), Field::Server, "Shift-Tab wraps backwards");
+        assert_eq!(
+            l.input_profile(&strokes(&[KeyCode::Escape], ""), false),
+            Some(DialogResult::Close)
+        );
+        assert!(!l.profile_open());
+        l.open_profile();
+        assert!(matches!(
+            l.input_profile(&strokes(&[KeyCode::Enter], ""), false),
+            Some(DialogResult::Play(_))
+        ));
+        assert!(!l.profile_open());
+        // F-keys and S do nothing inside the dialog
+        l.open_profile();
+        assert_eq!(l.input_profile(&strokes(&[KeyCode::F5], ""), false), None);
+    }
+
+    #[test]
+    fn profile_enter_without_name_stays_open() {
+        let mut l = Login::load(None, None, Box::new(Login::default().into_base()));
+        l.open_profile();
+        assert_eq!(
+            l.input_profile(&strokes(&[KeyCode::Enter], ""), false),
+            None
+        );
+        assert!(l.profile_open());
+        assert_eq!(l.error.as_deref(), Some("Enter a name"));
     }
 
     /// What the lead called "very unfriendly": one character per press, because

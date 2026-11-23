@@ -34,6 +34,8 @@ pub enum StartScreen {
     Menu,
     /// A help page, counted from zero.
     Help(usize),
+    /// The start screen with its profile dialog open.
+    Profile,
 }
 
 /// What to play.
@@ -290,6 +292,8 @@ struct SkinUi {
     shown: String,
     /// Actions from events between frames (the mouse wheel).
     pending: Vec<SkinAction>,
+    /// The profile dialog's lines as last drawn, in its canvas's pixels.
+    dialog_spots: Vec<(Rect, crate::game::login::Field)>,
 }
 
 /// What one frame of the skinned start screen asks the app to do.
@@ -340,6 +344,30 @@ fn skin_frame(
     }
     ui.scroll = skin_screen::clamp_scroll(ui.scroll, browser.zones.len(), rows);
 
+    // The profile dialog, while open, has the keyboard and the pointer.
+    if login.profile_open() {
+        ui.hovered = None;
+        ui.pending.clear();
+        let mut out = SkinOutcome::default();
+        if clicked
+            && let Some((px, py)) = pointer
+            && let Some((_, f)) = ui
+                .dialog_spots
+                .iter()
+                .find(|(r, _)| r.holds(px / s as f32, py / s as f32))
+        {
+            login.focus_on(*f);
+            if *f == crate::game::login::Field::Remember {
+                login.toggle_remember();
+            }
+        }
+        if let Some(crate::game::login::DialogResult::Play(c)) = login.input_profile(strokes, shift)
+        {
+            out.choice = Some(c);
+        }
+        return out;
+    }
+
     let mut actions = std::mem::take(&mut ui.pending);
     if clicked && let (Some(h), Some((x, y))) = (ui.hovered.clone(), at) {
         let row = skin_view::zone_row_at(layout, x, y, ui.scroll, browser.zones.len());
@@ -369,6 +397,10 @@ fn skin_frame(
     };
     for a in actions {
         match a {
+            SkinAction::Play if login.name.trim().is_empty() => {
+                login.open_profile();
+                login.error = Some("Enter a name".into());
+            }
             SkinAction::Play => out.choice = login.play(),
             SkinAction::Quit => out.choice = Some(Choice::Quit),
             SkinAction::Sandbox => out.choice = Some(Choice::Sandbox),
@@ -392,7 +424,12 @@ fn skin_frame(
             SkinAction::SelectZone(i) => select(browser, login, i),
             SkinAction::PlayZone(i) => {
                 select(browser, login, i);
-                out.choice = login.play();
+                if login.name.trim().is_empty() {
+                    login.open_profile();
+                    login.error = Some("Enter a name".into());
+                } else {
+                    out.choice = login.play();
+                }
             }
             SkinAction::ScrollZones(d) => {
                 let next = (ui.scroll as i64 + i64::from(d)).max(0) as usize;
@@ -408,12 +445,7 @@ fn skin_frame(
                 }
             }
             SkinAction::TogglePing => ui.ping_graph = !ui.ping_graph,
-            SkinAction::OpenProfile => {
-                ui.note = Some((
-                    "The profile dialog is coming next.".into(),
-                    std::time::Instant::now(),
-                ));
-            }
+            SkinAction::OpenProfile => login.open_profile(),
             SkinAction::NextSkin => out.next_skin = true,
             SkinAction::Info(text) => ui.note = Some((text.into(), std::time::Instant::now())),
         }
@@ -421,32 +453,35 @@ fn skin_frame(
     out
 }
 
-/// Switches to the next skin found, and remembers the choice.
+/// Shows `e` in place of the current skin.
+fn switch_skin(ui: &mut SkinUi, e: &SkinEntry, r: &mut Renderer) -> Result<(), String> {
+    let bytes = std::fs::read(&e.path).map_err(|err| err.to_string())?;
+    let skin = crate::game::skin::load_skin(&e.name, &bytes).map_err(|err| err.to_string())?;
+    for w in &skin.layout.warnings {
+        log::warn!("skin {}: {w}", e.name);
+    }
+    let tex = SkinTexture::upload(r, &skin);
+    std::mem::replace(&mut ui.tex, tex).free(r);
+    ui.skin = skin;
+    ui.scroll = 0;
+    ui.shown.clear();
+    ui.note = Some((format!("Skin: {}", e.name), std::time::Instant::now()));
+    Ok(())
+}
+
+/// Switches to the next skin that loads, and remembers the choice.
 fn cycle_skin(options: &mut Options, ls: &mut LoginScreen, r: &mut Renderer) {
     let Some(ui) = ls.skin.as_deref_mut() else {
         return;
     };
-    let current = ui.skin.name.clone();
-    let mut tried = 0;
-    let mut name = current.clone();
-    while tried < ui.entries.len() {
-        tried += 1;
+    let mut name = ui.skin.name.clone();
+    for _ in 0..ui.entries.len() {
         let Some(e) = crate::game::skin::next_skin(&ui.entries, &name).cloned() else {
             return;
         };
         name.clone_from(&e.name);
-        let loaded = std::fs::read(&e.path)
-            .map_err(|err| err.to_string())
-            .and_then(|b| crate::game::skin::load_skin(&e.name, &b).map_err(|err| err.to_string()));
-        match loaded {
-            Ok(skin) => {
-                let tex = SkinTexture::upload(r, &skin);
-                let old = std::mem::replace(&mut ui.tex, tex);
-                old.free(r);
-                ui.skin = skin;
-                ui.scroll = 0;
-                ui.shown.clear();
-                ui.note = Some((format!("Skin: {}", e.name), std::time::Instant::now()));
+        match switch_skin(ui, &e, r) {
+            Ok(()) => {
                 options.saved.skin.clone_from(&e.name);
                 if let Some(p) = &options.settings_path
                     && let Err(err) = std::fs::write(p, options.saved.to_text())
@@ -457,19 +492,24 @@ fn cycle_skin(options: &mut Options, ls: &mut LoginScreen, r: &mut Renderer) {
             }
             Err(err) => log::warn!("skin {}: {err}", e.name),
         }
-        if name.eq_ignore_ascii_case(&current) {
-            return;
-        }
     }
 }
 
 /// Draws the skinned start screen; returns the drifting starfield behind it.
 fn draw_skin_screen(
-    ls: &LoginScreen,
-    ui: &SkinUi,
+    ls: &mut LoginScreen,
     r: &mut Renderer,
+    pointer: Option<(f32, f32)>,
 ) -> Option<crate::gfx::StarParams> {
-    let login = &ls.login;
+    let LoginScreen {
+        login,
+        art,
+        atlas,
+        browser,
+        skin,
+        ..
+    } = ls;
+    let ui = skin.as_deref_mut()?;
     let name = if login.name.is_empty() {
         "(press P)"
     } else {
@@ -484,7 +524,7 @@ fn draw_skin_screen(
             .as_ref()
             .map(skin_screen::help)
             .filter(|h| !h.is_empty())
-            .map_or_else(|| ls.browser.status.clone(), str::to_string),
+            .map_or_else(|| browser.status.clone(), str::to_string),
     };
     let elapsed = ui.opened.elapsed();
     let state = SkinState {
@@ -496,14 +536,22 @@ fn draw_skin_screen(
         tick: skin_view::tick_at(elapsed.as_millis()),
         // The skin format's four lines: profile, player name, macro set, key set.
         profile_lines: ["Default", name, "Default", "Default"],
-        zones: &ls.browser.zones,
-        selected: (!ls.browser.zones.is_empty()).then_some(ls.browser.selected),
+        zones: &browser.zones,
+        selected: (!browser.zones.is_empty()).then_some(browser.selected),
         scroll: ui.scroll,
         ping_graph: ui.ping_graph,
         info: &info,
     };
     let size = r.size();
-    skin_view::draw_skin(r, &ui.tex, &ls.art, ls.atlas, &ui.skin, &state, size);
+    skin_view::draw_skin(r, &ui.tex, art, *atlas, &ui.skin, &state, size);
+    let main = (ui.skin.layout.main.w, ui.skin.layout.main.h);
+    let s = skin_view::skin_scale(size, main);
+    ui.dialog_spots.clear();
+    if login.profile_open() {
+        let c = Canvas::new(art, *atlas, size, s, (0.0, 0.0));
+        let at = pointer.map(|(x, y)| (x / s as f32, y / s as f32));
+        ui.dialog_spots = crate::game::profile_dialog::draw_profile_dialog(&c, r, login, at);
+    }
     let t = elapsed.as_secs_f32();
     Some(crate::gfx::StarParams {
         camera: [t * 14.0, t * 5.0],
@@ -569,6 +617,7 @@ fn load_skin_ui(options: &Options, dir: &AssetDirs, r: &mut Renderer) -> Option<
                     last_click: None,
                     shown: String::new(),
                     pending: Vec::new(),
+                    dialog_spots: Vec::new(),
                 }));
             }
             Err(err) => log::warn!("skin {} ({}): {err}", e.name, e.path.display()),
@@ -890,6 +939,9 @@ impl ApplicationHandler for App {
                     login.focus_zones();
                 }
                 let skin = load_skin_ui(&self.options, &self.dir, &mut renderer);
+                if matches!(self.options.open_screen, Some(StartScreen::Profile)) {
+                    login.open_profile();
+                }
                 Screen::Login(Box::new(LoginScreen {
                     login,
                     art,
@@ -1298,7 +1350,23 @@ impl App {
                 }
             };
             if let Some(section) = open_options {
-                self.settings = Some(SettingsUi::new_at(current_config(&self.options), section));
+                let mut ui = SettingsUi::new_at(current_config(&self.options), section);
+                if let Some(skin) = ls.skin.as_deref() {
+                    ui.set_skins(skin.entries.iter().map(|e| e.name.clone()).collect());
+                }
+                self.settings = Some(ui);
+            }
+            // A skin picked in the options shows as soon as it is saved.
+            if let Some(ui) = ls.skin.as_deref_mut()
+                && !ui.skin.name.eq_ignore_ascii_case(&self.options.saved.skin)
+            {
+                if let Some(e) =
+                    crate::game::skin::pick(&ui.entries, &self.options.saved.skin).cloned()
+                    && let Err(err) = switch_skin(ui, &e, &mut run.renderer)
+                {
+                    log::warn!("skin {}: {err}", e.name);
+                }
+                self.options.saved.skin.clone_from(&ui.skin.name);
             }
             if next_skin {
                 cycle_skin(&mut self.options, ls, &mut run.renderer);
@@ -1569,8 +1637,9 @@ impl App {
             }
             Screen::Connecting(_) | Screen::Login(_) if !draw => None,
             Screen::Login(ls) => {
-                if let Some(ui) = ls.skin.as_deref() {
-                    draw_skin_screen(ls, ui, &mut run.renderer)
+                if ls.skin.is_some() {
+                    let phys = cursor.map(|(x, y)| (x * run.scale as f32, y * run.scale as f32));
+                    draw_skin_screen(ls, &mut run.renderer, phys)
                 } else {
                     let size = run.renderer.size();
                     let cursor = cursor.map(|at| to_start_scale(at, size, run.scale));

@@ -56,7 +56,7 @@ Options:
                             reads --press and --click like every other screen:
                             Tab, the arrows, Enter, Ctrl+S (--hold ControlLeft
                             with --press KeyS) and Esc
-  --screen <menu|helpN>     Open the menu, or help page N, at start (testing)
+  --screen <menu|helpN|profile>  Open the menu, help page N, or the profile dialog at start (testing)
   --press <secs>:<key>      Press this key <secs> in, by its settings-file name
                             (Enter, Tab, KeyQ, ArrowDown...; a key that types a
                             character types it, so this drives the menu, the chat
@@ -340,11 +340,16 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
                 open_screen = Some(match name.as_str() {
                     "menu" => app::StartScreen::Menu,
                     "help" => app::StartScreen::Help(0),
+                    "profile" => app::StartScreen::Profile,
                     other => match other.strip_prefix("help").map(str::parse::<usize>) {
                         // "help2" is the second page, so that a screenshot can
                         // reach the pages past the first.
                         Some(Ok(n)) if n >= 1 => app::StartScreen::Help(n - 1),
-                        _ => return Err("--screen must be menu, help, or help2/help3".into()),
+                        _ => {
+                            return Err(
+                                "--screen must be menu, help, help2/help3 or profile".into()
+                            );
+                        }
                     },
                 });
             }
@@ -570,6 +575,12 @@ mod tests {
     /// line asked for has to reach it. Every one of these was dropped on the floor
     /// by the version that built the screen its own options: a player who typed
     /// `--record` and then used the form got no recording and no complaint.
+    #[test]
+    fn screen_profile_opens_the_profile_dialog() {
+        let o = parse("--screen profile").unwrap().unwrap();
+        assert!(matches!(o.open_screen, Some(app::StartScreen::Profile)));
+    }
+
     #[test]
     fn the_start_up_screen_is_given_what_the_command_line_asked_for() {
         let o = parse("--record visit.ossr --freq 3 --follow Ace --attach Mate --new-user")

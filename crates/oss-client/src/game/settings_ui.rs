@@ -136,6 +136,8 @@ enum Row {
     Mute,
     Volume,
     Palette,
+    /// The start screen's skin, from the names given by [`SettingsUi::set_skins`].
+    Skin,
     InterfaceSize,
     Key(Action),
     RestoreKeys,
@@ -189,7 +191,7 @@ impl Row {
         match self {
             Row::Scale | Row::Volume | Row::InterfaceSize => Kind::Number,
             Row::Fullscreen | Row::Vsync | Row::Mute => Kind::Toggle,
-            Row::Palette => Kind::Choice,
+            Row::Palette | Row::Skin => Kind::Choice,
             Row::Key(_) | Row::Pad(_) | Row::Macro(_) => Kind::Parts,
             Row::RestoreKeys | Row::RestorePad | Row::AddMacro => Kind::Button,
         }
@@ -251,6 +253,8 @@ pub struct SettingsUi {
     warned: bool,
     /// Where everything was drawn last frame, so a click finds it.
     spots: Vec<(Rect, Spot)>,
+    /// Skins the Skin line can pick; none means no Skin line.
+    skins: Vec<String>,
 }
 
 /// How a binding reads in the window and its messages: the key as a player
@@ -306,6 +310,7 @@ impl SettingsUi {
             visible: 12,
             warned: false,
             spots: Vec::new(),
+            skins: Vec::new(),
         }
     }
 
@@ -374,7 +379,13 @@ impl SettingsUi {
     /// The lines of the section on show, in order.
     fn rows(&self) -> Vec<Row> {
         match self.section {
-            Section::Video => vec![Row::Scale, Row::Fullscreen, Row::Vsync],
+            Section::Video => {
+                let mut v = vec![Row::Scale, Row::Fullscreen, Row::Vsync];
+                if !self.skins.is_empty() {
+                    v.push(Row::Skin);
+                }
+                v
+            }
             Section::Audio => vec![Row::Mute, Row::Volume],
             Section::Accessibility => vec![Row::Palette, Row::InterfaceSize],
             Section::Keys => Action::ALL
@@ -480,6 +491,11 @@ impl SettingsUi {
             _ => {}
         }
         UiAction::None
+    }
+
+    /// Gives the Video section a Skin line choosing among `names`.
+    pub fn set_skins(&mut self, names: Vec<String>) {
+        self.skins = names;
     }
 
     /// The options opened at `section`, as the start screen's Keys and Macros
@@ -604,6 +620,20 @@ impl SettingsUi {
                 };
                 self.cfg.palette = all[next as usize];
             }
+            Row::Skin if !self.skins.is_empty() => {
+                let n = self.skins.len() as i32;
+                let i = self
+                    .skins
+                    .iter()
+                    .position(|k| k.eq_ignore_ascii_case(&self.cfg.skin))
+                    .map_or(-1, |i| i as i32);
+                let next = if wrap {
+                    (i + dir).rem_euclid(n)
+                } else {
+                    (i + dir).clamp(0, n - 1)
+                };
+                self.cfg.skin.clone_from(&self.skins[next as usize]);
+            }
             _ => {}
         }
     }
@@ -715,6 +745,7 @@ impl SettingsUi {
             Row::Mute => "Mute".into(),
             Row::Volume => "Volume".into(),
             Row::Palette => "Colour palette".into(),
+            Row::Skin => "Start screen skin".into(),
             Row::InterfaceSize => "Interface size".into(),
             Row::Key(a) | Row::Pad(a) => action_title(a),
             Row::Macro(i) => self
@@ -741,6 +772,7 @@ impl SettingsUi {
             Row::Mute => on(self.cfg.mute),
             Row::Volume => self.cfg.volume.to_string(),
             Row::Palette => self.cfg.palette.name().replace('_', " "),
+            Row::Skin => self.cfg.skin.clone(),
             Row::InterfaceSize => match self.cfg.ui_scale {
                 0 => "normal".into(),
                 n => format!("+{n}"),
@@ -789,6 +821,10 @@ impl SettingsUi {
             Row::Vsync => "Caps the frame rate to the display's. Applies at the next start.".into(),
             Row::Mute => "No sound at all. Applies at the next start.".into(),
             Row::Volume => "How loud, 0 to 100. Applies when saved.".into(),
+            Row::Skin => {
+                "The start screen's look. Cmd-K or F7 cycles it there too. Applies when saved."
+                    .into()
+            }
             Row::Palette => match self.cfg.palette {
                 PaletteKind::Standard => "Continuum's own colours.",
                 PaletteKind::Deuteranopia => "For red-green colour blindness (green-weak).",
@@ -1238,6 +1274,28 @@ mod tests {
         assert_eq!(ui.cfg.palette, PaletteKind::Standard, "and comes round");
         press(&mut ui, &[KeyCode::ArrowDown, KeyCode::ArrowRight]);
         assert_eq!(ui.cfg.ui_scale, 1);
+    }
+
+    /// The Skin line cycles through the skins it was given and comes round;
+    /// with none given there is no Skin line.
+    #[test]
+    fn skin_row_cycles_and_saves() {
+        let plain = SettingsUi::new(Config::default());
+        assert!(!plain.rows().contains(&Row::Skin));
+        let mut ui = SettingsUi::new(Config::default());
+        ui.set_skins(vec![
+            "Dare".into(),
+            "Dare Night".into(),
+            "Pipe Dreams".into(),
+        ]);
+        assert_eq!(ui.rows().last(), Some(&Row::Skin));
+        press(&mut ui, &[KeyCode::ArrowDown; 3]);
+        assert_eq!(ui.current(), Some(Row::Skin));
+        press(&mut ui, &[KeyCode::Enter]);
+        assert_eq!(ui.cfg.skin, "Dare Night");
+        press(&mut ui, &[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(ui.cfg.skin, "Dare", "and comes round");
+        assert!(ui.cfg.to_text().contains("skin = Dare"));
     }
 
     /// A key is rebound from the keyboard alone: Enter on its line waits for a
