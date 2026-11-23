@@ -48,7 +48,7 @@ def main():
 
     p = t["profile"]
     x, y = m.PROFTEXT[0] + 4, m.PROFTEXT[1] + 4
-    for i, line in enumerate(["PROFILE  DEFAULT", "NAME     CHRIS", "ARENA    ANY", "ZONE     DARE"]):
+    for i, line in enumerate(["DEFAULT", "CHRIS", "DEFAULT", "DEFAULT"]):
         m.text(img, x, y + i * 16, line, p[i])
 
     zones = [("Dare", 4, 0), ("ISOJ QS Playground", 69, 1), ("SSCU Trench Wars", 51, 1), ("SSCE Hyperspace", 35, 1),

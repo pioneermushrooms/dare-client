@@ -309,7 +309,7 @@ PROFBOX = (12, 62, 292, 160)
 PROFILE = (22, 70, 112, 84)
 PREVPROF = (240, 70, 256, 84)
 NEXTPROF = (262, 70, 278, 84)
-PROFTEXT = (24, 90, 279, 153)
+PROFTEXT = (96, 90, 279, 153)
 SHIPBOX = (12, 170, 292, 330)
 BAYS = [(26 + (i % 4) * 66, 182 + (i // 4) * 50, 26 + (i % 4) * 66 + 43, 182 + (i // 4) * 50 + 43) for i in range(8)]
 SPECTATE = (130, 282, 173, 325)
@@ -348,7 +348,9 @@ def draw_main(t):
     button(c, *PROFILE, "PROFILE", t, 0)
     side_arrow(c, *PREVPROF, True, t, 0)
     side_arrow(c, *NEXTPROF, False, t, 0)
-    well(c, PROFTEXT[0] - 2, PROFTEXT[1] - 2, PROFTEXT[2] + 2, PROFTEXT[3] + 1, t, scan=True)
+    well(c, 22, PROFTEXT[1] - 2, PROFTEXT[2] + 2, PROFTEXT[3] + 1, t, scan=True)
+    for i, label in enumerate(("PROFILE", "NAME", "MACROS", "KEYS")):
+        text(c, 30, PROFTEXT[1] + 4 + i * 16, label, t["accent"])
     # ships
     panel(c, *SHIPBOX, t, "SHIP")
     for i, b in enumerate(BAYS):

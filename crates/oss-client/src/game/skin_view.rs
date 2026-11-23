@@ -4,8 +4,6 @@
 //! at any window size. Everything here works in *skin pixels* -- the coordinates
 //! the skin file uses -- and converts to physical window pixels only to draw.
 
-#![allow(dead_code)] // Used once the start screen is wired to skins (plan Task 5).
-
 use crate::game::art::Art;
 use crate::game::skin::{Frame, HotSpot, Skin, SkinLayout, SkinRect, TICK_MS, step_at};
 use crate::gfx::{Region, Renderer, TextureId};
@@ -134,11 +132,21 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Whether a ship or spectate slot is somewhere the client should draw its own
+/// sprite: a real area inside the main region. Skins that draw their own ship
+/// art (in ALT overlays) give a dummy first rectangle to turn the sprite off.
+pub fn sprite_slot(main: SkinRect, slot: SkinRect) -> bool {
+    slot.w >= 16
+        && slot.h >= 16
+        && slot.x >= main.x
+        && slot.y >= main.y
+        && slot.x + slot.w <= main.x + main.w
+        && slot.y + slot.h <= main.y + main.h
+}
+
 /// The skin's bitmap on the GPU.
 pub struct SkinTexture {
     pub id: TextureId,
-    pub w: u32,
-    pub h: u32,
 }
 
 impl SkinTexture {
@@ -146,8 +154,6 @@ impl SkinTexture {
         let (w, h) = (skin.image.width, skin.image.height);
         SkinTexture {
             id: r.create_texture(w, h, &skin.image.rgba),
-            w,
-            h,
         }
     }
 
@@ -267,7 +273,10 @@ pub fn draw_skin(
 
     // Ships, centred in each spot's first rectangle.
     for k in 1..=8u8 {
-        if let Some(b) = l.first_rect(&HotSpot::Ship(k)) {
+        if let Some(b) = l
+            .first_rect(&HotSpot::Ship(k))
+            .filter(|b| sprite_slot(l.main, *b))
+        {
             let sprite = art.ship(k - 1, 0);
             let (x, y) = at(b.x, b.y);
             let (w, h) = (sprite.w as f32 * sf, sprite.h as f32 * sf);
@@ -286,7 +295,10 @@ pub fn draw_skin(
         let (px, py) = at(x, y);
         draw_text(r, art, atlas, px, py, sf, rgb, s_);
     };
-    if let Some(b) = l.first_rect(&HotSpot::Spectate) {
+    if let Some(b) = l
+        .first_rect(&HotSpot::Spectate)
+        .filter(|b| sprite_slot(l.main, *b))
+    {
         let label = "SPEC";
         let w = label.len() as u32 * 8;
         text(
@@ -485,6 +497,24 @@ mod tests {
         assert_eq!(zone_row_at(&l, 20, 100 + 14 * 4, 18, 20), None);
         assert_eq!(zone_row_at(&l, 5, 120, 0, 20), None);
         assert_eq!(zone_rows(&parse_layout("main=(0,0,9,9)").unwrap()), 0);
+    }
+
+    #[test]
+    fn sprite_only_in_real_slots() {
+        let main = SkinRect {
+            x: 0,
+            y: 0,
+            w: 588,
+            h: 380,
+        };
+        let r = |x, y, w, h| SkinRect { x, y, w, h };
+        assert!(sprite_slot(main, r(56, 184, 200, 152)));
+        assert!(
+            !sprite_slot(main, r(0, 400, 1, 1)),
+            "dummy slot outside main"
+        );
+        assert!(!sprite_slot(main, r(10, 10, 4, 4)), "too small for a ship");
+        assert!(!sprite_slot(main, r(580, 370, 30, 30)), "runs off main");
     }
 
     #[test]

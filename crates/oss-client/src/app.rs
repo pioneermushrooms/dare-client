@@ -20,6 +20,9 @@ use crate::game::login::{Choice, Login};
 use crate::game::online::{Online, ServerOptions, Supplied};
 use crate::game::sandbox::Sandbox;
 use crate::game::settings_ui::{SettingsUi, UiAction};
+use crate::game::skin::{HotSpot, Skin, SkinEntry};
+use crate::game::skin_screen::{self, SkinAction};
+use crate::game::skin_view::{self, SkinState, SkinTexture};
 use crate::game::start_spots::{Rect, Spot, Spots};
 use crate::game::view::{Canvas, color, ui_color};
 use crate::gfx::{FrameError, Renderer, TextureId};
@@ -263,6 +266,315 @@ struct LoginScreen {
     spots: Spots,
     /// Fills in a saved password when the name and zone have one.
     recall: crate::game::remember::Recall,
+    /// The skinned screen; `None` falls back to the plain drawn one.
+    skin: Option<Box<SkinUi>>,
+}
+
+/// The skinned start screen's state.
+struct SkinUi {
+    skin: Skin,
+    tex: SkinTexture,
+    /// Every skin found, for the picker.
+    entries: Vec<SkinEntry>,
+    hovered: Option<HotSpot>,
+    /// Index into [`skin_screen::FOCUS_ORDER`]; shown once Tab is used.
+    focus: usize,
+    show_focus: bool,
+    scroll: usize,
+    ping_graph: bool,
+    /// A message that replaces the help text for a few seconds.
+    note: Option<(String, std::time::Instant)>,
+    opened: std::time::Instant,
+    last_click: Option<(std::time::Instant, usize)>,
+    /// The zone address the list last scrolled to show.
+    shown: String,
+    /// Actions from events between frames (the mouse wheel).
+    pending: Vec<SkinAction>,
+}
+
+/// What one frame of the skinned start screen asks the app to do.
+#[derive(Default)]
+struct SkinOutcome {
+    choice: Option<Choice>,
+    /// Open the options, at this section if any.
+    options: Option<Option<crate::game::settings_ui::Section>>,
+    next_skin: bool,
+}
+
+/// How close two clicks on the same zone must be to count as a double-click.
+const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+/// How long a note replaces the help text.
+const NOTE_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// One frame of input on the skinned start screen.
+#[allow(clippy::too_many_arguments)]
+fn skin_frame(
+    ui: &mut SkinUi,
+    login: &mut Login,
+    browser: &mut crate::game::zones::ZoneBrowser,
+    window: (u32, u32),
+    pointer: Option<(f32, f32)>,
+    clicked: bool,
+    strokes: &[Stroke],
+    cmd: bool,
+    shift: bool,
+) -> SkinOutcome {
+    let layout = &ui.skin.layout;
+    let main = (layout.main.w, layout.main.h);
+    let s = skin_view::skin_scale(window, main);
+    let o = skin_view::skin_origin(window, main, s);
+    let at = pointer.map(|p| skin_view::to_skin(p, o, s));
+    ui.hovered = at.and_then(|(x, y)| skin_view::hotspot_at(layout, x, y));
+    let rows = skin_view::zone_rows(layout);
+
+    // The selection follows the zone address, so a remembered zone shows
+    // selected once the list arrives, and a refresh keeps it.
+    if let Some(i) = skin_screen::keep_selection(Some(&login.server), &browser.zones)
+        && browser.zones[i].address == login.server
+    {
+        browser.selected = i;
+        if ui.shown != login.server {
+            ui.scroll = skin_screen::scroll_to_show(i, ui.scroll, rows);
+            ui.shown.clone_from(&login.server);
+        }
+    }
+    ui.scroll = skin_screen::clamp_scroll(ui.scroll, browser.zones.len(), rows);
+
+    let mut actions = std::mem::take(&mut ui.pending);
+    if clicked && let (Some(h), Some((x, y))) = (ui.hovered.clone(), at) {
+        let row = skin_view::zone_row_at(layout, x, y, ui.scroll, browser.zones.len());
+        let now = std::time::Instant::now();
+        let double = row.is_some()
+            && ui
+                .last_click
+                .is_some_and(|(t, r)| Some(r) == row && now.duration_since(t) < DOUBLE_CLICK);
+        ui.last_click = row.map(|r| (now, r));
+        actions.extend(skin_screen::click(&h, row, double));
+    }
+    if strokes
+        .iter()
+        .any(|st| st.key == Some(KeyCode::Tab) && !st.repeat)
+    {
+        ui.show_focus = true;
+    }
+    actions.extend(skin_screen::key(strokes, cmd, shift, &mut ui.focus));
+
+    let mut out = SkinOutcome::default();
+    let select = |browser: &mut crate::game::zones::ZoneBrowser, login: &mut Login, i: usize| {
+        browser.select(i);
+        if let Some(z) = browser.zones.get(i) {
+            login.server.clone_from(&z.address);
+            login.error = None;
+        }
+    };
+    for a in actions {
+        match a {
+            SkinAction::Play => out.choice = login.play(),
+            SkinAction::Quit => out.choice = Some(Choice::Quit),
+            SkinAction::Sandbox => out.choice = Some(Choice::Sandbox),
+            SkinAction::RefreshZones => out.choice = Some(Choice::RefreshZones),
+            SkinAction::OpenOptions(section) => out.options = Some(section),
+            SkinAction::SelectShip(k) => login.ship = k,
+            SkinAction::CycleShip(d) => {
+                // Ships 0-7, then spectator, round again.
+                let at = if login.ship == oss_session::SPECTATOR {
+                    8
+                } else {
+                    i32::from(login.ship.min(7))
+                };
+                let next = (at + d).rem_euclid(9);
+                login.ship = if next == 8 {
+                    oss_session::SPECTATOR
+                } else {
+                    next as u8
+                };
+            }
+            SkinAction::SelectZone(i) => select(browser, login, i),
+            SkinAction::PlayZone(i) => {
+                select(browser, login, i);
+                out.choice = login.play();
+            }
+            SkinAction::ScrollZones(d) => {
+                let next = (ui.scroll as i64 + i64::from(d)).max(0) as usize;
+                ui.scroll = skin_screen::clamp_scroll(next, browser.zones.len(), rows);
+            }
+            SkinAction::MoveSelection(d) => {
+                if !browser.zones.is_empty() {
+                    let last = browser.zones.len() as i64 - 1;
+                    let i = (browser.selected as i64 + i64::from(d)).clamp(0, last) as usize;
+                    select(browser, login, i);
+                    ui.scroll = skin_screen::scroll_to_show(i, ui.scroll, rows);
+                    ui.shown.clone_from(&login.server);
+                }
+            }
+            SkinAction::TogglePing => ui.ping_graph = !ui.ping_graph,
+            SkinAction::OpenProfile => {
+                ui.note = Some((
+                    "The profile dialog is coming next.".into(),
+                    std::time::Instant::now(),
+                ));
+            }
+            SkinAction::NextSkin => out.next_skin = true,
+            SkinAction::Info(text) => ui.note = Some((text.into(), std::time::Instant::now())),
+        }
+    }
+    out
+}
+
+/// Switches to the next skin found, and remembers the choice.
+fn cycle_skin(options: &mut Options, ls: &mut LoginScreen, r: &mut Renderer) {
+    let Some(ui) = ls.skin.as_deref_mut() else {
+        return;
+    };
+    let current = ui.skin.name.clone();
+    let mut tried = 0;
+    let mut name = current.clone();
+    while tried < ui.entries.len() {
+        tried += 1;
+        let Some(e) = crate::game::skin::next_skin(&ui.entries, &name).cloned() else {
+            return;
+        };
+        name.clone_from(&e.name);
+        let loaded = std::fs::read(&e.path)
+            .map_err(|err| err.to_string())
+            .and_then(|b| crate::game::skin::load_skin(&e.name, &b).map_err(|err| err.to_string()));
+        match loaded {
+            Ok(skin) => {
+                let tex = SkinTexture::upload(r, &skin);
+                let old = std::mem::replace(&mut ui.tex, tex);
+                old.free(r);
+                ui.skin = skin;
+                ui.scroll = 0;
+                ui.shown.clear();
+                ui.note = Some((format!("Skin: {}", e.name), std::time::Instant::now()));
+                options.saved.skin.clone_from(&e.name);
+                if let Some(p) = &options.settings_path
+                    && let Err(err) = std::fs::write(p, options.saved.to_text())
+                {
+                    log::warn!("couldn't save the skin choice: {err}");
+                }
+                return;
+            }
+            Err(err) => log::warn!("skin {}: {err}", e.name),
+        }
+        if name.eq_ignore_ascii_case(&current) {
+            return;
+        }
+    }
+}
+
+/// Draws the skinned start screen; returns the drifting starfield behind it.
+fn draw_skin_screen(
+    ls: &LoginScreen,
+    ui: &SkinUi,
+    r: &mut Renderer,
+) -> Option<crate::gfx::StarParams> {
+    let login = &ls.login;
+    let name = if login.name.is_empty() {
+        "(press P)"
+    } else {
+        login.name.as_str()
+    };
+    let now = std::time::Instant::now();
+    let info: String = match (&ui.note, &login.error) {
+        (Some((text, at)), _) if now.duration_since(*at) < NOTE_FOR => text.clone(),
+        (_, Some(err)) => err.clone(),
+        _ => ui
+            .hovered
+            .as_ref()
+            .map(skin_screen::help)
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| ls.browser.status.clone(), str::to_string),
+    };
+    let elapsed = ui.opened.elapsed();
+    let state = SkinState {
+        hovered: ui.hovered.clone(),
+        focused: ui
+            .show_focus
+            .then(|| skin_screen::FOCUS_ORDER[ui.focus % skin_screen::FOCUS_ORDER.len()].clone()),
+        ship: login.ship,
+        tick: skin_view::tick_at(elapsed.as_millis()),
+        // The skin format's four lines: profile, player name, macro set, key set.
+        profile_lines: ["Default", name, "Default", "Default"],
+        zones: &ls.browser.zones,
+        selected: (!ls.browser.zones.is_empty()).then_some(ls.browser.selected),
+        scroll: ui.scroll,
+        ping_graph: ui.ping_graph,
+        info: &info,
+    };
+    let size = r.size();
+    skin_view::draw_skin(r, &ui.tex, &ls.art, ls.atlas, &ui.skin, &state, size);
+    let t = elapsed.as_secs_f32();
+    Some(crate::gfx::StarParams {
+        camera: [t * 14.0, t * 5.0],
+        scale: skin_view::skin_scale(size, (ui.skin.layout.main.w, ui.skin.layout.main.h)) as f32,
+    })
+}
+
+/// The folders skins are looked for in.
+fn skin_folders(options: &Options, dir: &AssetDirs) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = dir
+        .roots()
+        .iter()
+        .rev()
+        .filter_map(|r| r.parent().map(|p| p.join("skins")))
+        .collect();
+    dirs.dedup();
+    let settings = options
+        .settings_path
+        .as_deref()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from);
+    if let Some(sd) = settings {
+        dirs.extend(crate::game::skin::skin_dirs(
+            None,
+            &sd,
+            options.continuum_dir.as_deref(),
+            &options.saved.skin_folders,
+        ));
+    } else {
+        dirs.extend(options.continuum_dir.iter().map(|c| c.join("skins")));
+        dirs.extend(options.saved.skin_folders.iter().cloned());
+    }
+    dirs
+}
+
+/// Loads the chosen skin (falling back to Dare, then to any that loads).
+fn load_skin_ui(options: &Options, dir: &AssetDirs, r: &mut Renderer) -> Option<Box<SkinUi>> {
+    let entries = crate::game::skin::find_skins(&skin_folders(options, dir));
+    let first = crate::game::skin::pick(&entries, &options.saved.skin)?.clone();
+    let order = std::iter::once(&first).chain(entries.iter().filter(|e| e.path != first.path));
+    for e in order {
+        match std::fs::read(&e.path)
+            .map_err(|err| err.to_string())
+            .and_then(|b| crate::game::skin::load_skin(&e.name, &b).map_err(|err| err.to_string()))
+        {
+            Ok(skin) => {
+                for w in &skin.layout.warnings {
+                    log::warn!("skin {}: {w}", e.name);
+                }
+                let tex = SkinTexture::upload(r, &skin);
+                let now = std::time::Instant::now();
+                return Some(Box::new(SkinUi {
+                    skin,
+                    tex,
+                    entries,
+                    hovered: None,
+                    focus: 0,
+                    show_focus: false,
+                    scroll: 0,
+                    ping_graph: false,
+                    note: None,
+                    opened: now,
+                    last_click: None,
+                    shown: String::new(),
+                    pending: Vec::new(),
+                }));
+            }
+            Err(err) => log::warn!("skin {} ({}): {err}", e.name, e.path.display()),
+        }
+    }
+    None
 }
 
 enum Screen {
@@ -444,6 +756,7 @@ impl App {
         };
         login.error = None;
         let (art, atlas) = load_art(&self.dir, &mut run.renderer)?;
+        let skin = load_skin_ui(&self.options, &self.dir, &mut run.renderer);
         run.screen = Screen::Login(Box::new(LoginScreen {
             login,
             art,
@@ -451,6 +764,7 @@ impl App {
             browser: crate::game::zones::ZoneBrowser::open(&self.options.directories),
             spots: Spots::default(),
             recall: Default::default(),
+            skin,
         }));
         run.window.set_title("Open SubSpace");
         self.settings = None;
@@ -575,6 +889,7 @@ impl ApplicationHandler for App {
                 if self.options.open_zones {
                     login.focus_zones();
                 }
+                let skin = load_skin_ui(&self.options, &self.dir, &mut renderer);
                 Screen::Login(Box::new(LoginScreen {
                     login,
                     art,
@@ -582,6 +897,7 @@ impl ApplicationHandler for App {
                     browser: crate::game::zones::ZoneBrowser::open(&self.options.directories),
                     spots: Spots::default(),
                     recall: Default::default(),
+                    skin,
                 }))
             }
         };
@@ -716,6 +1032,19 @@ impl ApplicationHandler for App {
                 let Some(run) = self.running.as_mut() else {
                     return;
                 };
+                if let Screen::Login(ls) = &mut run.screen
+                    && let Some(ui) = ls.skin.as_deref_mut()
+                {
+                    if let Some(a) = ui
+                        .hovered
+                        .as_ref()
+                        .and_then(|h| skin_screen::wheel(h, rows))
+                    {
+                        ui.pending.push(a);
+                        run.window.request_redraw();
+                    }
+                    return;
+                }
                 let size = run.renderer.size();
                 let cursor = self.cursor.map(|at| to_start_scale(at, size, run.scale));
                 if let Screen::Login(ls) = &mut run.screen
@@ -869,84 +1198,111 @@ impl App {
                 self.input.take_strokes()
             };
             self.input.take_edges();
-            // The list owns Up/Down and the rest of its keys while it has the focus.
-            // Whichever row it settles on fills in the Zone field, so the highlighted
-            // row and the address can never disagree; Enter and Esc belong to the
-            // screen, and the form below answers them.
-            if ls.login.focused() == crate::game::login::Field::Zones {
-                let picked = ls.browser.input(&strokes);
-                if let Some(crate::game::zones::BrowserChoice::Pick(address)) = picked {
-                    ls.login.server = address;
-                    ls.login.error = None;
-                } else if strokes.iter().any(|s| s.key.is_some())
-                    && let Some(z) = ls.browser.zones.get(ls.browser.selected)
-                {
-                    ls.login.server.clone_from(&z.address);
-                    ls.login.error = None;
+            let mut open_options = None;
+            let mut next_skin = false;
+            let choice = if let Some(ui) = ls.skin.as_deref_mut() {
+                let clicked = std::mem::take(&mut self.clicked) && self.settings.is_none();
+                let phys = cursor.map(|(x, y)| (x * run.scale as f32, y * run.scale as f32));
+                let out = skin_frame(
+                    ui,
+                    &mut ls.login,
+                    &mut ls.browser,
+                    run.renderer.size(),
+                    phys,
+                    clicked,
+                    &strokes,
+                    self.input.cmd() || self.input.ctrl(),
+                    self.input.shift(),
+                );
+                open_options = out.options;
+                next_skin = out.next_skin;
+                out.choice
+            } else {
+                // The list owns Up/Down and the rest of its keys while it has the focus.
+                // Whichever row it settles on fills in the Zone field, so the highlighted
+                // row and the address can never disagree; Enter and Esc belong to the
+                // screen, and the form below answers them.
+                if ls.login.focused() == crate::game::login::Field::Zones {
+                    let picked = ls.browser.input(&strokes);
+                    if let Some(crate::game::zones::BrowserChoice::Pick(address)) = picked {
+                        ls.login.server = address;
+                        ls.login.error = None;
+                    } else if strokes.iter().any(|s| s.key.is_some())
+                        && let Some(z) = ls.browser.zones.get(ls.browser.selected)
+                    {
+                        ls.login.server.clone_from(&z.address);
+                        ls.login.error = None;
+                    }
                 }
-            }
-            // A click, against the regions the last frame drew. The keyboard is
-            // untouched by this: clicking a field focuses it exactly as tabbing
-            // to it does, so everything that worked before still does.
-            let clicked = std::mem::take(&mut self.clicked);
-            let mut pointed = None;
-            if clicked && self.settings.is_none() {
-                let size = run.renderer.size();
-                pointed = cursor
-                    .map(|at| to_start_scale(at, size, run.scale))
-                    .and_then(|(mx, my)| ls.spots.at(mx, my));
+                // A click, against the regions the last frame drew. The keyboard is
+                // untouched by this: clicking a field focuses it exactly as tabbing
+                // to it does, so everything that worked before still does.
+                let clicked = std::mem::take(&mut self.clicked);
+                let mut pointed = None;
+                if clicked && self.settings.is_none() {
+                    let size = run.renderer.size();
+                    pointed = cursor
+                        .map(|at| to_start_scale(at, size, run.scale))
+                        .and_then(|(mx, my)| ls.spots.at(mx, my));
+                    match pointed {
+                        Some(Spot::Field(field)) => {
+                            ls.login.focus_on(field);
+                            if field == crate::game::login::Field::Remember {
+                                ls.login.toggle_remember();
+                            }
+                        }
+                        // Picking a ship takes the focus with it, so that choosing
+                        // the one you already have still shows something: the
+                        // heading's name turns yellow and its line lights up.
+                        // Without that, clicking Spectator while already
+                        // spectating set spectator to spectator and the screen
+                        // said nothing at all -- which is indistinguishable from a
+                        // click that missed.
+                        Some(Spot::Ship(kind)) => {
+                            ls.login.ship = kind;
+                            ls.login.focus_on(crate::game::login::Field::Ship);
+                        }
+                        Some(Spot::Spectate) => {
+                            ls.login.ship = oss_session::SPECTATOR;
+                            ls.login.focus_on(crate::game::login::Field::Ship);
+                        }
+                        Some(Spot::Zone(row)) => {
+                            ls.browser.select(row);
+                            ls.login.focus_zones();
+                            if let Some(z) = ls.browser.zones.get(row) {
+                                ls.login.server.clone_from(&z.address);
+                                ls.login.error = None;
+                            }
+                        }
+                        Some(Spot::RefreshZones)
+                        | Some(Spot::Play)
+                        | Some(Spot::Quit)
+                        | Some(Spot::Options)
+                        | Some(Spot::Sandbox)
+                        | None => {}
+                    }
+                }
                 match pointed {
-                    Some(Spot::Field(field)) => {
-                        ls.login.focus_on(field);
-                        if field == crate::game::login::Field::Remember {
-                            ls.login.toggle_remember();
-                        }
+                    // The four that are choices rather than changes go through the
+                    // same door the keys do, so neither can do something the other
+                    // cannot.
+                    Some(Spot::Play) => ls.login.play(),
+                    Some(Spot::Quit) => Some(Choice::Quit),
+                    Some(Spot::Options) => Some(Choice::Options),
+                    Some(Spot::Sandbox) => Some(Choice::Sandbox),
+                    Some(Spot::RefreshZones) => Some(Choice::RefreshZones),
+                    _ if self.input.cmd() || self.input.ctrl() => {
+                        crate::game::login::Login::shortcut(&strokes)
                     }
-                    // Picking a ship takes the focus with it, so that choosing
-                    // the one you already have still shows something: the
-                    // heading's name turns yellow and its line lights up.
-                    // Without that, clicking Spectator while already
-                    // spectating set spectator to spectator and the screen
-                    // said nothing at all -- which is indistinguishable from a
-                    // click that missed.
-                    Some(Spot::Ship(kind)) => {
-                        ls.login.ship = kind;
-                        ls.login.focus_on(crate::game::login::Field::Ship);
-                    }
-                    Some(Spot::Spectate) => {
-                        ls.login.ship = oss_session::SPECTATOR;
-                        ls.login.focus_on(crate::game::login::Field::Ship);
-                    }
-                    Some(Spot::Zone(row)) => {
-                        ls.browser.select(row);
-                        ls.login.focus_zones();
-                        if let Some(z) = ls.browser.zones.get(row) {
-                            ls.login.server.clone_from(&z.address);
-                            ls.login.error = None;
-                        }
-                    }
-                    Some(Spot::RefreshZones)
-                    | Some(Spot::Play)
-                    | Some(Spot::Quit)
-                    | Some(Spot::Options)
-                    | Some(Spot::Sandbox)
-                    | None => {}
+                    _ => ls.login.input(&strokes, self.input.shift()),
                 }
-            }
-            let choice = match pointed {
-                // The four that are choices rather than changes go through the
-                // same door the keys do, so neither can do something the other
-                // cannot.
-                Some(Spot::Play) => ls.login.play(),
-                Some(Spot::Quit) => Some(Choice::Quit),
-                Some(Spot::Options) => Some(Choice::Options),
-                Some(Spot::Sandbox) => Some(Choice::Sandbox),
-                Some(Spot::RefreshZones) => Some(Choice::RefreshZones),
-                _ if self.input.cmd() || self.input.ctrl() => {
-                    crate::game::login::Login::shortcut(&strokes)
-                }
-                _ => ls.login.input(&strokes, self.input.shift()),
             };
+            if let Some(section) = open_options {
+                self.settings = Some(SettingsUi::new_at(current_config(&self.options), section));
+            }
+            if next_skin {
+                cycle_skin(&mut self.options, ls, &mut run.renderer);
+            }
             match choice {
                 Some(Choice::Options) => {
                     self.settings = Some(SettingsUi::new(current_config(&self.options)));
@@ -999,8 +1355,15 @@ impl App {
                                 unreachable!()
                             };
                             let LoginScreen {
-                                login, art, atlas, ..
+                                login,
+                                art,
+                                atlas,
+                                skin,
+                                ..
                             } = *ls;
+                            if let Some(ui) = skin {
+                                ui.tex.free(&mut run.renderer);
+                            }
                             run.screen = Screen::Connecting(Box::new(Connecting {
                                 net,
                                 art,
@@ -1084,6 +1447,7 @@ impl App {
                 match (login, failed) {
                     (Some(mut login), err) => {
                         login.error = err.or(give_up);
+                        let skin = load_skin_ui(&self.options, &self.dir, &mut run.renderer);
                         run.screen = Screen::Login(Box::new(LoginScreen {
                             login,
                             art,
@@ -1093,6 +1457,7 @@ impl App {
                             ),
                             spots: Spots::default(),
                             recall: Default::default(),
+                            skin,
                         }));
                     }
                     (None, Some(err)) => return self.fail(event_loop, err),
@@ -1204,10 +1569,14 @@ impl App {
             }
             Screen::Connecting(_) | Screen::Login(_) if !draw => None,
             Screen::Login(ls) => {
-                let size = run.renderer.size();
-                let cursor = cursor.map(|at| to_start_scale(at, size, run.scale));
-                draw_start_screen(ls, &mut run.renderer, start_scale(size, run.scale), cursor);
-                None
+                if let Some(ui) = ls.skin.as_deref() {
+                    draw_skin_screen(ls, ui, &mut run.renderer)
+                } else {
+                    let size = run.renderer.size();
+                    let cursor = cursor.map(|at| to_start_scale(at, size, run.scale));
+                    draw_start_screen(ls, &mut run.renderer, start_scale(size, run.scale), cursor);
+                    None
+                }
             }
             Screen::Connecting(conn) => {
                 let c = Canvas::new(

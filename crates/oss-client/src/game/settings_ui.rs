@@ -482,6 +482,16 @@ impl SettingsUi {
         UiAction::None
     }
 
+    /// The options opened at `section`, as the start screen's Keys and Macros
+    /// buttons ask for.
+    pub fn new_at(cfg: Config, section: Option<Section>) -> Self {
+        let mut ui = Self::new(cfg);
+        if let Some(s) = section {
+            ui.open_section(s);
+        }
+        ui
+    }
+
     /// Shows a section, from its first line.
     fn open_section(&mut self, section: Section) {
         self.section = section;

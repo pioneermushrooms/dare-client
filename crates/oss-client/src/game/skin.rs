@@ -10,8 +10,6 @@
 //! Skin files are untrusted: anything this parser does not understand is skipped
 //! with a warning, never a panic.
 
-#![allow(dead_code)] // Used once the start screen is wired to skins (plan Task 5).
-
 use oss_assets::image::{Image, decode_image};
 
 /// How long one animation tick lasts.
@@ -428,6 +426,17 @@ pub fn pick<'a>(entries: &'a [SkinEntry], wanted: &str) -> Option<&'a SkinEntry>
         .or_else(|| entries.first())
 }
 
+/// The skin after `current` in the list, wrapping; the first if `current` is gone.
+pub fn next_skin<'a>(entries: &'a [SkinEntry], current: &str) -> Option<&'a SkinEntry> {
+    let at = entries
+        .iter()
+        .position(|e| e.name.eq_ignore_ascii_case(current));
+    match at {
+        Some(i) => entries.get((i + 1) % entries.len()),
+        None => entries.first(),
+    }
+}
+
 /// Loads a skin from the bytes of a `.skn` file.
 pub fn load_skin(name: &str, bytes: &[u8]) -> Result<Skin, SkinError> {
     if bytes.is_empty() {
@@ -519,6 +528,31 @@ mod tests {
         assert_eq!(names, vec!["Dare", "A", "b"]);
         assert_eq!(found[1].path, b.join("A.skn"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn next_skin_wraps() {
+        let e = |n: &str| SkinEntry {
+            name: n.into(),
+            path: n.into(),
+        };
+        let list = vec![e("Dare"), e("Dare Night"), e("Pipe Dreams")];
+        assert_eq!(next_skin(&list, "dare").unwrap().name, "Dare Night");
+        assert_eq!(next_skin(&list, "Pipe Dreams").unwrap().name, "Dare");
+        assert_eq!(next_skin(&list, "Gone").unwrap().name, "Dare");
+        assert!(next_skin(&[], "Dare").is_none());
+    }
+
+    #[test]
+    fn missing_skin_falls_back_to_dare() {
+        let e = |n: &str| SkinEntry {
+            name: n.into(),
+            path: n.into(),
+        };
+        assert_eq!(
+            pick(&[e("Dare Night"), e("Dare")], "Gone").unwrap().name,
+            "Dare"
+        );
     }
 
     #[test]
