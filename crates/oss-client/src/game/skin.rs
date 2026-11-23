@@ -758,6 +758,55 @@ mod tests {
     }
 
     #[test]
+    fn bundled_skins_load() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/skins");
+        for name in ["Dare", "Dare Night"] {
+            let bytes = std::fs::read(dir.join(format!("{name}.skn"))).expect(name);
+            let s = load_skin(name, &bytes).expect(name);
+            assert!(
+                s.layout.warnings.is_empty(),
+                "{name}: {:?}",
+                s.layout.warnings
+            );
+            assert_eq!((s.layout.main.w, s.layout.main.h), (640, 420), "{name}");
+            let mut need = vec![
+                HotSpot::Profile,
+                HotSpot::PrevProf,
+                HotSpot::NextProf,
+                HotSpot::ProfText,
+                HotSpot::ProfBox,
+                HotSpot::Spectate,
+                HotSpot::ShipBox,
+                HotSpot::Zones,
+                HotSpot::Trace,
+                HotSpot::ZoneText,
+                HotSpot::ZoneBox,
+                HotSpot::ZoneUp,
+                HotSpot::ZoneDown,
+                HotSpot::Ping,
+                HotSpot::InfoBox,
+                HotSpot::Options,
+                HotSpot::KeyDefs,
+                HotSpot::Macros,
+                HotSpot::Play,
+                HotSpot::Quit,
+            ];
+            need.extend((1..=8).map(HotSpot::Ship));
+            for h in &need {
+                assert!(s.layout.first_rect(h).is_some(), "{name} lacks {h:?}");
+            }
+            let pt = s.layout.first_rect(&HotSpot::ProfText).unwrap();
+            assert!(pt.w >= 184 && pt.h >= 64, "{name} proftext {pt:?}");
+            let c = &s.layout.colors;
+            assert!(c.zone.iter().all(Option::is_some), "{name}");
+            assert!(
+                c.zone_sel[0].is_some() && c.profile.iter().all(Option::is_some),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn load_skin_rejects_non_bmp_and_huge() {
         assert!(matches!(
             load_skin("t", b"PK\x03\x04"),
