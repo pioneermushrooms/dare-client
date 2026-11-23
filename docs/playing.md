@@ -24,8 +24,12 @@ rather than "the keys".
 | F1 | Help pages (F1 or Page Down turns the page, Page Up goes back, Esc closes). A zone that sends its own help pages, as some do inside their LVZ files, has them shown first, and this client's own page follows |
 | F2 | Cycle the stat box views |
 | Page Up / Page Down | Select a player in the stat box (and scroll the chat log while the menu is open) |
-| F3 | Zone browser (on the login screen) |
-| F5 | Offline sandbox (on the login screen) |
+| F3 / Cmd-R | Refresh the zone list (on the start screen) |
+| F5 / Cmd-S | Offline sandbox (on the start screen) |
+| F7 / Cmd-K | Next start-screen skin |
+| P / Cmd-P | Profile dialog: name, password, arena, zone address (on the start screen) |
+| Left / Right | Ship, then spectator, on the start screen; the wheel over the ships too |
+| Up / Down | Zone selection on the start screen; double-click a zone to play it |
 | F11 | Spectator mode on and off, as in Continuum (off goes back to the ship you last flew) |
 | Print Screen | Save a screenshot (a `screenshots` folder beside the settings file) |
 | F12 | Frame rate and ping; press again for the technical detail (pixel scale, how frames reach the screen, tick count), and again to hide it |
