@@ -15,6 +15,7 @@ pub mod palette;
 pub mod remember;
 pub mod sandbox;
 pub mod settings_ui;
+pub mod skin;
 pub mod start_spots;
 pub mod statbox;
 pub mod view;
