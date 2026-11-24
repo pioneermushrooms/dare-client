@@ -9,6 +9,31 @@ use crate::game::start_spots::Rect;
 use crate::game::view::{Canvas, color, ui_color};
 use crate::gfx::Renderer;
 
+/// A line in the dialog that opens a page on the site (browser build).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogLink {
+    Register,
+    Forgot,
+}
+
+/// What a clickable line of the dialog is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogSpot {
+    Field(Field),
+    Link(DialogLink),
+}
+
+const LINKS: [(DialogLink, &str); 2] = [
+    (DialogLink::Register, "Register a pilot name"),
+    (DialogLink::Forgot, "Forgot password"),
+];
+
+/// The site links under the fields: only in the browser, where Foundation's
+/// accounts are made on the site.
+pub fn dialog_links(browser: bool) -> &'static [(DialogLink, &'static str)] {
+    if browser { &LINKS } else { &[] }
+}
+
 /// Width of the label column and the whole panel, in characters.
 const LABEL_COLS: usize = 10;
 const COLS: usize = 46;
@@ -30,10 +55,16 @@ pub fn draw_profile_dialog(
     r: &mut Renderer,
     login: &Login,
     cursor: Option<(f32, f32)>,
-) -> Vec<(Rect, Field)> {
+) -> Vec<(Rect, DialogSpot)> {
     let fields = login.fields();
+    let links = dialog_links(cfg!(target_arch = "wasm32"));
     let w = COLS as f32 * 8.0;
-    let h = 20.0 + fields.len() as f32 * 14.0 + 8.0 + 14.0 + 10.0 + 14.0;
+    let link_h = if links.is_empty() {
+        0.0
+    } else {
+        6.0 + links.len() as f32 * 14.0
+    };
+    let h = 20.0 + fields.len() as f32 * 14.0 + link_h + 8.0 + 14.0 + 10.0 + 14.0;
     let x = ((c.view_w - w) / 2.0).floor();
     let top = ((c.view_h - h) / 2.0).floor().max(4.0);
     c.panel(r, x, top, w, h);
@@ -47,7 +78,7 @@ pub fn draw_profile_dialog(
     let mut y = top + 20.0;
     for &f in fields {
         let row = Rect::new(x + 2.0, y - 1.0, w - 4.0, 13.0);
-        spots.push((row, f));
+        spots.push((row, DialogSpot::Field(f)));
         if f == focus || cursor.is_some_and(|(mx, my)| row.holds(mx, my)) {
             c.color_rect(r, ui_color::HIGHLIGHT, row.x, row.y, row.w, row.h);
         }
@@ -86,6 +117,20 @@ pub fn draw_profile_dialog(
         c.text(r, value_x, y, color::WHITE, &shown);
         y += 14.0;
     }
+    if !links.is_empty() {
+        y += 6.0;
+        for &(link, text) in links {
+            let row = Rect::new(x + 2.0, y - 1.0, w - 4.0, 13.0);
+            let hot = cursor.is_some_and(|(mx, my)| row.holds(mx, my));
+            if hot {
+                c.color_rect(r, ui_color::HIGHLIGHT, row.x, row.y, row.w, row.h);
+            }
+            let lc = if hot { color::YELLOW } else { color::BLUE };
+            c.text(r, x + 4.0, y, lc, &format!("> {text}"));
+            spots.push((row, DialogSpot::Link(link)));
+            y += 14.0;
+        }
+    }
     y += 6.0;
     if let Some(err) = &login.error {
         let shown: String = err.chars().take(COLS - 1).collect();
@@ -101,4 +146,17 @@ pub fn draw_profile_dialog(
         "Enter = Play   Tab = Next   Esc = Close",
     );
     spots
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_only_in_the_browser() {
+        assert!(dialog_links(false).is_empty());
+        let links = dialog_links(true);
+        assert_eq!(links[0], (DialogLink::Register, "Register a pilot name"));
+        assert_eq!(links[1], (DialogLink::Forgot, "Forgot password"));
+    }
 }

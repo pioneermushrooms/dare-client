@@ -294,7 +294,7 @@ struct SkinUi {
     /// Actions from events between frames (the mouse wheel).
     pending: Vec<SkinAction>,
     /// The profile dialog's lines as last drawn, in its canvas's pixels.
-    dialog_spots: Vec<(Rect, crate::game::login::Field)>,
+    dialog_spots: Vec<(Rect, crate::game::profile_dialog::DialogSpot)>,
     /// Foundation's arenas, listed where the zones are (browser build).
     #[cfg(target_arch = "wasm32")]
     arenas: crate::game::arenas::ArenaList,
@@ -398,14 +398,26 @@ fn skin_frame(
         let mut out = SkinOutcome::default();
         if clicked
             && let Some((px, py)) = pointer
-            && let Some((_, f)) = ui
+            && let Some((_, spot)) = ui
                 .dialog_spots
                 .iter()
                 .find(|(r, _)| r.holds(px / s as f32, py / s as f32))
         {
-            login.focus_on(*f);
-            if *f == crate::game::login::Field::Remember {
-                login.toggle_remember();
+            use crate::game::profile_dialog::{DialogLink, DialogSpot};
+            match *spot {
+                DialogSpot::Field(f) => {
+                    login.focus_on(f);
+                    if f == crate::game::login::Field::Remember {
+                        login.toggle_remember();
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                DialogSpot::Link(link) => crate::web::open_foundation_page(match link {
+                    DialogLink::Register => crate::web::FoundationPage::Register,
+                    DialogLink::Forgot => crate::web::FoundationPage::Forgot,
+                }),
+                #[cfg(not(target_arch = "wasm32"))]
+                DialogSpot::Link(DialogLink::Register | DialogLink::Forgot) => {}
             }
         }
         if let Some(crate::game::login::DialogResult::Play(c)) = login.input_profile(strokes, shift)
