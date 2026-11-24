@@ -359,7 +359,11 @@ fn parse_region(s: &str) -> Option<SkinRegion> {
 }
 
 /// The skin used when none is chosen, or the chosen one is gone.
+#[cfg(not(target_arch = "wasm32"))]
 pub const DEFAULT_SKIN: &str = "Dare";
+/// The browser build plays on SubSpace Foundation, so it wears Foundation's skin.
+#[cfg(target_arch = "wasm32")]
+pub const DEFAULT_SKIN: &str = "Foundation";
 
 /// A skin file found on disk; named by its file stem.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -804,7 +808,7 @@ mod tests {
     #[test]
     fn bundled_skins_load() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/skins");
-        for name in ["Dare", "Dare Night"] {
+        for name in ["Dare", "Dare Night", "Foundation"] {
             let bytes = std::fs::read(dir.join(format!("{name}.skn"))).expect(name);
             let s = load_skin(name, &bytes).expect(name);
             assert!(

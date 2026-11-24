@@ -456,11 +456,14 @@ fn skin_frame(
 fn read_skin(entry: &SkinEntry) -> Result<std::borrow::Cow<'static, [u8]>, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::fs::read(&entry.path).map(Into::into).map_err(|error| error.to_string())
+        std::fs::read(&entry.path)
+            .map(Into::into)
+            .map_err(|error| error.to_string())
     }
     #[cfg(target_arch = "wasm32")]
     {
         let bytes: &'static [u8] = match entry.name.as_str() {
+            "Foundation" => include_bytes!("../../../assets/skins/Foundation.skn"),
             "Dare" => include_bytes!("../../../assets/skins/Dare.skn"),
             "Dare Night" => include_bytes!("../../../assets/skins/Dare Night.skn"),
             _ => return Err(format!("Skin {} unavailable", entry.name)),
@@ -611,10 +614,13 @@ fn load_skin_ui(options: &Options, dir: &AssetDirs, r: &mut Renderer) -> Option<
     #[cfg(target_arch = "wasm32")]
     let entries = {
         let _ = dir;
-        ["Dare", "Dare Night"].into_iter().map(|name| SkinEntry {
-            name: name.into(),
-            path: PathBuf::from(format!("{name}.skn")),
-        }).collect::<Vec<_>>()
+        ["Foundation", "Dare", "Dare Night"]
+            .into_iter()
+            .map(|name| SkinEntry {
+                name: name.into(),
+                path: PathBuf::from(format!("{name}.skn")),
+            })
+            .collect::<Vec<_>>()
     };
     let first = crate::game::skin::pick(&entries, &options.saved.skin)?.clone();
     let order = std::iter::once(&first).chain(entries.iter().filter(|e| e.path != first.path));
@@ -750,7 +756,9 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         Mode::Zone(_) | Mode::Login(_) | Mode::Replay(_) => Vec::new(),
     };
 
-    let event_loop = EventLoop::<AppEvent>::with_user_event().build().map_err(|e| e.to_string())?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event()
+        .build()
+        .map_err(|e| e.to_string())?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let gilrs = match gilrs::Gilrs::new() {
         Ok(g) => Some(g),
