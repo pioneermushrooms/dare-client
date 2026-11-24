@@ -6,7 +6,7 @@
 //! simulated here and reported to the server; other ships follow their position
 //! packets and their weapons are recreated locally.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use oss_assets::AssetDirs;
 use oss_proto::objects::layer;
@@ -238,8 +238,8 @@ const SOUNDS: &[&str] = &[
 const HEARING_RANGE: f32 = 1200.0;
 
 fn time_seed() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
         .unwrap_or(1)
 }
@@ -1482,12 +1482,9 @@ impl Sandbox {
                         );
                         self.tracking.record(&c);
                     }
-                    if let Some(w) = pos.weapon.and_then(remote_weapon) {
-                        self.world.fire_remote(i, &st, w, age, &mut sim_events);
-                    }
                 }
                 SessionEvent::PlayerFired { pid, at } => {
-                    // A late shot: fire it from where and when it left, leave the ship be.
+                    // Fire from the report snapshot independently of newer movement.
                     let Some(i) = self
                         .world
                         .ship_index(pid as u16)

@@ -14,7 +14,7 @@
 //! reports only once, at exit. The summary is cumulative either way, so a
 //! periodic run's last report and an `on` run's only report say the same thing.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// A stage of a frame, in the order a frame passes through them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

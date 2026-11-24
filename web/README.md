@@ -32,12 +32,10 @@ a new UDP source port, matching the native driver.
 
 The probe uses the shared Rust session in WASM and draws received player
 positions, tiles, and projectiles on a WebGPU canvas. Arrow keys steer and
-thrust, X fires, and Z drops bombs. Use a private test arena. The prototype
-builds against upstream oss-core; the desktop fork's local netcode-precision
-revision is needed to verify identical remote shot handling.
+thrust, X fires, and Z drops bombs. Use a private test arena. A blank arena name joins the server's default public arena.
 
-The build was verified with upstream `oss-core` commit
-`aad700a4cedb272c607050492b9db8b0f6c0149f` in the sibling checkout,
+The build was verified with the Dare `oss-core` commit
+`eae56a0016474ef9883eb74d47ba8864f019f5e8` in the sibling checkout,
 Rust 1.100.0, and wasm-bindgen CLI 0.2.130.
 
 ```sh

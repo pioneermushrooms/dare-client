@@ -2256,6 +2256,7 @@ dependencies = [
  "oss-sim",
  "png",
  "pollster",
+ "web-time",
  "wgpu",
  "winit",
 ]

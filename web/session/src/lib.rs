@@ -160,9 +160,8 @@ impl BrowserSession {
         let state = remote_state(&report);
         if move_ship {
             world.set_remote_state(index, &state, age);
-        }
-        if let Some(weapon) = report.weapon.and_then(remote_weapon) {
-            world.fire_remote(index, weapon, &mut Vec::new());
+        } else if let Some(weapon) = report.weapon.and_then(remote_weapon) {
+            world.fire_remote(index, &state, weapon, age, &mut Vec::new());
         }
     }
 

@@ -6,7 +6,7 @@
 //! [`crate::config::DEFAULT_DIRECTORIES`], so the browser has somewhere to ask;
 //! `servers = none` in the settings file turns that off.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use super::input::Stroke;
 use oss_session::directory::{DirectoryClient, ZoneInfo, ZonePinger};

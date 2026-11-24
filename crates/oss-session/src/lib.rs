@@ -437,9 +437,7 @@ pub enum SessionEvent {
     PlayerEntered(i16),
     PlayerLeft(i16),
     PlayerMoved(i16),
-    /// A weapon arrived in an update older than the player's latest position (a late
-    /// or reordered packet). The shot still happened; the position is stale, so it
-    /// fires from `at` without moving the ship.
+    /// A weapon report with the position at the time the weapon was fired.
     PlayerFired {
         pid: i16,
         at: RemotePosition,
@@ -1463,6 +1461,9 @@ impl Session {
             }
             p.position = Some(pos);
             self.events.push_back(SessionEvent::PlayerMoved(pid));
+            if pos.weapon.is_some() {
+                self.events.push_back(SessionEvent::PlayerFired { pid, at: pos });
+            }
         }
     }
 
@@ -2307,6 +2308,20 @@ mod tests {
         assert_eq!(
             s.player(9).and_then(|p| p.position).map(|p| p.x),
             Some(8100)
+        );
+        // A shot bracketed by movement keeps its own origin regardless of when
+        // the consumer drains the queue.
+        let shot = at(210, 8200, gun);
+        s.update_position(9, shot);
+        s.update_position(9, at(220, 8300, None));
+        let events: Vec<_> = std::iter::from_fn(|| s.poll_event()).collect();
+        assert_eq!(
+            events,
+            vec![
+                SessionEvent::PlayerMoved(9),
+                SessionEvent::PlayerFired { pid: 9, at: shot },
+                SessionEvent::PlayerMoved(9),
+            ]
         );
     }
 

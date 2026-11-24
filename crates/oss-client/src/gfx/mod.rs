@@ -336,20 +336,27 @@ pub enum FrameError {
 
 impl Renderer {
     pub fn new(window: Arc<Window>, vsync: bool) -> Result<Self, String> {
+        pollster::block_on(Self::new_async(window, vsync))
+    }
+
+    /// Initialize the shared renderer without blocking the platform event loop.
+    pub async fn new_async(window: Arc<Window>, vsync: bool) -> Result<Self, String> {
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| e.to_string())?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+            .map_err(|e| format!("no suitable GPU adapter: {e}"))?;
         if flag("OSS_GFX_ADAPTERS") {
-            for a in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
+            for a in instance.enumerate_adapters(wgpu::Backends::all()).await {
                 let info = a.get_info();
                 log::info!(
                     "adapter: {:?} backend, {:?}, {:?}, driver {:?} {:?}, presents here: {}",
@@ -363,13 +370,15 @@ impl Renderer {
             }
         }
         log::info!("GPU: {:?}", adapter.get_info());
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("oss-client"),
-            required_limits:
-                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
-            ..Default::default()
-        }))
-        .map_err(|e| e.to_string())?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("oss-client"),
+                required_limits:
+                    wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| e.to_string())?;
 
         let size = window.inner_size();
         let forced_px = forced_size();

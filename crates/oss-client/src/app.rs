@@ -285,9 +285,9 @@ struct SkinUi {
     scroll: usize,
     ping_graph: bool,
     /// A message that replaces the help text for a few seconds.
-    note: Option<(String, std::time::Instant)>,
-    opened: std::time::Instant,
-    last_click: Option<(std::time::Instant, usize)>,
+    note: Option<(String, web_time::Instant)>,
+    opened: web_time::Instant,
+    last_click: Option<(web_time::Instant, usize)>,
     /// The zone address the list last scrolled to show.
     shown: String,
     /// Actions from events between frames (the mouse wheel).
@@ -371,7 +371,7 @@ fn skin_frame(
     let mut actions = std::mem::take(&mut ui.pending);
     if clicked && let (Some(h), Some((x, y))) = (ui.hovered.clone(), at) {
         let row = skin_view::zone_row_at(layout, x, y, ui.scroll, browser.zones.len());
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let double = row.is_some()
             && ui
                 .last_click
@@ -447,7 +447,7 @@ fn skin_frame(
             SkinAction::TogglePing => ui.ping_graph = !ui.ping_graph,
             SkinAction::OpenProfile => login.open_profile(),
             SkinAction::NextSkin => out.next_skin = true,
-            SkinAction::Info(text) => ui.note = Some((text.into(), std::time::Instant::now())),
+            SkinAction::Info(text) => ui.note = Some((text.into(), web_time::Instant::now())),
         }
     }
     out
@@ -465,7 +465,7 @@ fn switch_skin(ui: &mut SkinUi, e: &SkinEntry, r: &mut Renderer) -> Result<(), S
     ui.skin = skin;
     ui.scroll = 0;
     ui.shown.clear();
-    ui.note = Some((format!("Skin: {}", e.name), std::time::Instant::now()));
+    ui.note = Some((format!("Skin: {}", e.name), web_time::Instant::now()));
     Ok(())
 }
 
@@ -515,7 +515,7 @@ fn draw_skin_screen(
     } else {
         login.name.as_str()
     };
-    let now = std::time::Instant::now();
+    let now = web_time::Instant::now();
     let info: String = match (&ui.note, &login.error) {
         (Some((text, at)), _) if now.duration_since(*at) < NOTE_FOR => text.clone(),
         (_, Some(err)) => err.clone(),
@@ -602,7 +602,7 @@ fn load_skin_ui(options: &Options, dir: &AssetDirs, r: &mut Renderer) -> Option<
                     log::warn!("skin {}: {w}", e.name);
                 }
                 let tex = SkinTexture::upload(r, &skin);
-                let now = std::time::Instant::now();
+                let now = web_time::Instant::now();
                 return Some(Box::new(SkinUi {
                     skin,
                     tex,
@@ -639,7 +639,7 @@ struct Running {
     renderer: Renderer,
     screen: Screen,
     scale: u32,
-    started: std::time::Instant,
+    started: web_time::Instant,
     captured: bool,
     /// The window can't be seen (minimised/covered); Windows then stops sending
     /// redraws, so the game is driven from `about_to_wait` without drawing.
@@ -960,7 +960,7 @@ impl ApplicationHandler for App {
             screen,
             front_end: None,
             scale,
-            started: std::time::Instant::now(),
+            started: web_time::Instant::now(),
             captured: false,
             occluded: false,
         });
@@ -1125,7 +1125,7 @@ impl ApplicationHandler for App {
             // Keep the simulation and connection alive, at a modest rate.
             self.frame(event_loop, false);
             event_loop.set_control_flow(ControlFlow::WaitUntil(
-                std::time::Instant::now() + std::time::Duration::from_millis(5),
+                web_time::Instant::now() + std::time::Duration::from_millis(5),
             ));
         } else {
             event_loop.set_control_flow(ControlFlow::Poll);
@@ -1136,7 +1136,7 @@ impl ApplicationHandler for App {
 impl App {
     /// One frame: input, network, simulation and (when `draw`) rendering.
     fn frame(&mut self, event_loop: &ActiveEventLoop, draw: bool) {
-        let frame_at = std::time::Instant::now();
+        let frame_at = web_time::Instant::now();
         if let Some(g) = self.gilrs.as_mut() {
             while let Some(ev) = g.next_event() {
                 let pressed = self.input.gamepad(ev.event);
@@ -1236,7 +1236,7 @@ impl App {
             ls.login.set_vault(self.vault.store().is_some());
             if let Some(store) = self.vault.store() {
                 ls.recall
-                    .tick(&mut ls.login, &store, std::time::Instant::now());
+                    .tick(&mut ls.login, &store, web_time::Instant::now());
                 if let Some(who) = ls.login.take_forget() {
                     crate::game::remember::forget(&store, who);
                 }
@@ -1633,7 +1633,7 @@ impl App {
                     }
                 }
                 draw.then(|| {
-                    let at = std::time::Instant::now();
+                    let at = web_time::Instant::now();
                     let stars = game.draw(&mut run.renderer);
                     let took = at.elapsed();
                     run.renderer.perf().record(crate::gfx::Stage::Draw, took);
@@ -1824,8 +1824,8 @@ fn screenshot_path(settings: Option<&std::path::Path>) -> std::io::Result<PathBu
         .and_then(std::path::Path::parent)
         .map_or_else(|| PathBuf::from("screenshots"), |d| d.join("screenshots"));
     std::fs::create_dir_all(&dir)?;
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let secs = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let stamp = utc_stamp(secs);
     for n in 0..100 {

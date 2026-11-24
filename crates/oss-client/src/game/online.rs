@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use web_time::Instant;
 
 use oss_session::map::{MapCache, default_cache_dir};
 use oss_session::replay::{Player as ReplayPlayer, Recorder};
@@ -215,8 +215,8 @@ impl Online {
             redirect_id,
             ..Default::default()
         };
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let seed = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
             .unwrap_or(1);
         let now = driver.now_ms();
@@ -251,8 +251,8 @@ impl Online {
         });
         let mut session = Session::with_handshake(cfg, now, handshake);
         if let Some(path) = &opts.record {
-            let started = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let started = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs())
                 .to_string();
             let meta = [
