@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use oss_assets::{AssetDirs, AssetSearch};
 use winit::application::ApplicationHandler;
+#[cfg(not(target_arch = "wasm32"))]
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
