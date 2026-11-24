@@ -12,4 +12,6 @@ export CARGO_TARGET_DIR="$target"
 cargo build --locked --release --target wasm32-unknown-unknown -p oss-client --lib
 wasm-bindgen --target web --out-dir "$output/pkg" \
   "$target/wasm32-unknown-unknown/release/oss_client.wasm"
+wasm_bytes="$(wc -c < "$output/pkg/oss_client_bg.wasm" | tr -d ' ')"
+printf '{"wasmBytes":%s}\n' "$wasm_bytes" > "$output/build.json"
 install -m 0644 web/client/index.html web/client/start.mjs web/transport.mjs "$output/"

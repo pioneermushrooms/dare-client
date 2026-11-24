@@ -866,7 +866,7 @@ impl App {
             recall: Default::default(),
             skin,
         }));
-        run.window.set_title("Open SubSpace");
+        set_title(&run.window, "Open SubSpace");
         self.settings = None;
         self.input.clear();
         run.window.request_redraw();
@@ -897,9 +897,17 @@ impl ApplicationHandler<AppEvent> for App {
             Mode::Login(_) => "Open SubSpace".to_string(),
             Mode::Replay(p) => format!("Open SubSpace — replay {}", p.display()),
         };
+        // In the browser the page owns the tab title and the canvas size: the
+        // canvas fills the window by CSS and the client follows it on resize.
+        #[cfg(not(target_arch = "wasm32"))]
         let mut attrs = Window::default_attributes()
             .with_title(title)
             .with_inner_size(LogicalSize::new(1280.0, 800.0));
+        #[cfg(target_arch = "wasm32")]
+        let mut attrs = {
+            let _ = title;
+            Window::default_attributes()
+        };
         if self.options.fullscreen {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
@@ -1510,8 +1518,7 @@ impl App {
                     );
                     match Online::connect(&opts, res, &self.options.supplied) {
                         Ok(net) => {
-                            run.window
-                                .set_title(&format!("Open SubSpace — {}", opts.server));
+                            set_title(&run.window, &format!("Open SubSpace — {}", opts.server));
                             let Screen::Login(ls) =
                                 std::mem::replace(&mut run.screen, Screen::Empty)
                             else {
@@ -1891,6 +1898,14 @@ impl App {
         }
         self.options.fullscreen = cfg.fullscreen;
     }
+}
+
+/// Names the window. In the browser the page keeps its own title.
+fn set_title(window: &Window, title: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    window.set_title(title);
+    #[cfg(target_arch = "wasm32")]
+    let _ = (window, title);
 }
 
 /// The pixel scale to run at: the one that was chosen, or the display's own
