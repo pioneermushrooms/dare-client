@@ -151,7 +151,9 @@ dependencies = [
 name = "dare-web-session"
 version = "0.1.0"
 dependencies = [
+ "oss-formats",
  "oss-session",
+ "oss-sim",
  "wasm-bindgen",
 ]
 

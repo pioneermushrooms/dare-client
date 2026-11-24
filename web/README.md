@@ -1,8 +1,8 @@
 # Foundation browser transport
 
 This prototype includes a fixed-destination WebTransport-to-UDP gateway,
-a browser adapter, and a WASM spectator probe with a WebGPU position plot.
-The desktop renderer and flight controls are outside this prototype.
+a browser adapter, and a WASM flight prototype with a WebGPU map and
+keyboard flight and weapons. It uses simplified visual geometry.
 
 ## Run against a test zone
 
@@ -28,10 +28,13 @@ Use an explicitly VIE-capable private test listener for the first integration.
 A future automatic cipher fallback must open a fresh gateway session so it gets
 a new UDP source port, matching the native driver.
 
-## Build the spectator probe
+## Build the flight prototype
 
 The probe uses the shared Rust session in WASM and draws received player
-positions on a WebGPU canvas. It enters as a spectator and has no flight controls.
+positions, tiles, and projectiles on a WebGPU canvas. Arrow keys steer and
+thrust, X fires, and Z drops bombs. Use a private test arena. The prototype
+builds against upstream oss-core; the desktop fork's local netcode-precision
+revision is needed to verify identical remote shot handling.
 
 The build was verified with upstream `oss-core` commit
 `aad700a4cedb272c607050492b9db8b0f6c0149f` in the sibling checkout,

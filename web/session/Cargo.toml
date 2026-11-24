@@ -12,3 +12,5 @@ crate-type = ["cdylib"]
 [dependencies]
 oss-session = { path = "../../crates/oss-session" }
 wasm-bindgen = "0.2"
+oss-sim = { path = "../../../oss-core/crates/oss-sim" }
+oss-formats = { path = "../../../oss-core/crates/oss-formats" }
