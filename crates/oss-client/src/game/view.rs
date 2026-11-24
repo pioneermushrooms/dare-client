@@ -48,6 +48,19 @@ const FALLBACK: [[f32; 4]; 5] = [
     [0.094, 0.224, 0.063, 1.0],
 ];
 
+/// A world coordinate in whole physical pixels (relative to the world origin).
+/// Everything drawn in the world, and the camera, snap here and only here: snapping
+/// anything to whole *game* pixels first moves it in steps of `scale` physical
+/// pixels while the camera moves in steps of one, so it wobbles against the map.
+fn phys(v: f32, scale: f32) -> f32 {
+    (v * scale).round()
+}
+
+/// Top-left of something `size` pixels across centred on `c`, unsnapped.
+fn centered(c: f32, size: u32) -> f32 {
+    c - size as f32 / 2.0
+}
+
 /// Maps game pixels to physical pixels for one frame.
 pub struct Canvas {
     pub atlas: TextureId,
@@ -97,8 +110,8 @@ impl Canvas {
 
     fn to_screen(&self, x: f32, y: f32) -> (f32, f32) {
         (
-            (x * self.scale).round() - self.cam_phys.0 + self.half.0,
-            (y * self.scale).round() - self.cam_phys.1 + self.half.1,
+            phys(x, self.scale) - self.cam_phys.0 + self.half.0,
+            phys(y, self.scale) - self.cam_phys.1 + self.half.1,
         )
     }
 
@@ -148,12 +161,7 @@ impl Canvas {
 
     /// Draws `region` centred on world pixel (x, y).
     pub fn world_centered(&self, r: &mut Renderer, region: Region, x: f32, y: f32) {
-        self.world(
-            r,
-            region,
-            (x - region.w as f32 / 2.0).round(),
-            (y - region.h as f32 / 2.0).round(),
-        );
+        self.world(r, region, centered(x, region.w), centered(y, region.h));
     }
 
     /// Draws `region` at UI position (game pixels from the top-left), optionally
@@ -559,13 +567,7 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
             };
             labels.push((ux, uy, col, label));
         }
-        c.world_tint(
-            r,
-            region,
-            (x - 18.0).round(),
-            (y - 18.0).round(),
-            [1.0, 1.0, 1.0, alpha_tint],
-        );
+        c.world_tint(r, region, x - 18.0, y - 18.0, [1.0, 1.0, 1.0, alpha_tint]);
     }
 
     for (ux, uy, col, label) in labels {
@@ -600,4 +602,25 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
     }
 
     s.lvz.draw(layer::AFTER_SHIPS, c, ui, r, t, &s.screen_refs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{centered, phys};
+
+    /// The camera follows your ship, so your ship must sit at the same screen spot
+    /// every frame however the camera's fraction of a pixel falls.
+    #[test]
+    fn a_ship_under_the_camera_holds_still_on_screen() {
+        for scale in [1.0, 2.0, 3.0] {
+            let offsets: Vec<f32> = (0..20)
+                .map(|i| 100.0 + i as f32 * 0.05)
+                .map(|cam| phys(centered(cam, 36), scale) - phys(cam, scale))
+                .collect();
+            assert!(
+                offsets.iter().all(|&o| o == -18.0 * scale),
+                "scale {scale}: {offsets:?}"
+            );
+        }
+    }
 }

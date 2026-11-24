@@ -40,6 +40,8 @@ mod menu;
 const TICK: Duration = Duration::from_millis(10);
 /// Most sim ticks run per frame before we give up catching up (e.g. after a stall).
 const MAX_TICKS_PER_FRAME: u32 = 25;
+/// How much a frame's clock is stretched or squeezed toward the server's.
+const SLEW_PER_FRAME: Duration = Duration::from_micros(500);
 
 /// Closest gap between two updates sent because your controls changed (20 ms).
 const MOTION_SEND_GAP: u32 = 2;
@@ -169,7 +171,8 @@ pub struct Sandbox {
     /// the drawing have to be the same string.
     pub(super) radar_line: String,
     /// World tick of the last clock correction (online).
-    slew_tick: u32,
+    /// Online: working off a small difference from the server's clock.
+    slewing: bool,
     /// Your motion (thrust, afterburner, turn) as last reported to the server, and
     /// the tick of the last report sent because it changed.
     sent_motion: Option<Motion>,
@@ -444,7 +447,7 @@ impl Sandbox {
                 .unwrap_or_default(),
             screen_refs: [(0.0, 0.0); 12],
             radar_line: String::new(),
-            slew_tick: 0,
+            slewing: false,
             sent_motion: None,
             motion_sent_tick: 0,
             tracking: Default::default(),
@@ -2265,9 +2268,11 @@ impl Sandbox {
         }
     }
 
-    /// Online, keeps the world's tick count on the server's clock: small drift is
-    /// corrected by stepping one tick more or less (at most every 10 ticks), a large
-    /// jump (a stall, or a clock resync) by moving the clock.
+    /// Online, keeps the world's tick count on the server's clock: a large jump (a
+    /// stall, or a clock resync) moves the clock; small drift is worked off by
+    /// running the clock half a millisecond a frame fast or slow (a few percent,
+    /// invisible) until it is back within a tick. Adding or dropping a whole 10 ms
+    /// tick at once made your ship hop on screen.
     fn sync_clock(&mut self) {
         let Some(net) = self.net.as_ref() else { return };
         let target = net.session.server_ticks(net.now_ms());
@@ -2277,12 +2282,15 @@ impl Sandbox {
             log::debug!("clock: moved {drift} ticks to the server's");
             self.world.tick = target;
             self.acc = Duration::ZERO;
-        } else if drift.abs() > 2 && self.world.tick.wrapping_sub(self.slew_tick) >= 10 {
-            self.slew_tick = self.world.tick;
-            if drift > 0 {
-                self.acc += TICK;
-            } else {
-                self.acc = self.acc.saturating_sub(TICK);
+        } else {
+            // Start past two ticks (one is just rounding), stop once within one.
+            self.slewing = drift.abs() > 2 || (self.slewing && drift.abs() > 1);
+            if self.slewing {
+                if drift > 0 {
+                    self.acc += SLEW_PER_FRAME;
+                } else {
+                    self.acc = self.acc.saturating_sub(SLEW_PER_FRAME);
+                }
             }
         }
     }
