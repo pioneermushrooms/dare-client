@@ -449,6 +449,8 @@ fn skin_frame(
             SkinAction::OpenProfile => login.open_profile(),
             SkinAction::NextSkin => out.next_skin = true,
             SkinAction::Info(text) => ui.note = Some((text.into(), web_time::Instant::now())),
+            // Handled with the arena list (browser build).
+            SkinAction::CreateArena => {}
         }
     }
     out
@@ -542,7 +544,7 @@ fn draw_skin_screen(
         _ => ui
             .hovered
             .as_ref()
-            .map(skin_screen::help)
+            .map(skin_screen::screen_help)
             .filter(|h| !h.is_empty())
             .map_or_else(|| browser.status.clone(), str::to_string),
     };
