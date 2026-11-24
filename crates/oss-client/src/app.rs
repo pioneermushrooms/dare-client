@@ -1340,6 +1340,11 @@ impl App {
                 if self.options.open_zones {
                     login.focus_zones();
                 }
+                // Opened for one arena (the builder's "Fly in it"): start with it chosen.
+                #[cfg(target_arch = "wasm32")]
+                if let Some(arena) = crate::web::start_arena() {
+                    login.arena = arena;
+                }
                 let skin = load_skin_ui(&self.options, &self.dir, &mut renderer);
                 if matches!(self.options.open_screen, Some(StartScreen::Profile)) {
                     login.open_profile();

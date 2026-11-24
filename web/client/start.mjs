@@ -70,7 +70,10 @@ async function fetchArenas() {
 }
 globalThis.foundationArenas = () => arenaFeed;
 globalThis.refreshFoundationArenas = () => void fetchArenas();
-const FOUNDATION_PAGES = new Set(["/arena/", "/account/signup", "/account/forgot"]);
+const FOUNDATION_PAGES = new Set(["/build.html", "/account/signup", "/account/forgot"]);
+// /play/?arena=%23name (the builder's "Fly in it") starts the game with that arena filled in.
+const startArena = new URLSearchParams(location.search).get("arena");
+globalThis.foundationStartArena = () => startArena ?? undefined;
 globalThis.openFoundationPage = (path) => {
   if (FOUNDATION_PAGES.has(path)) window.open(`https://subspacefoundation.com${path}`, "_blank", "noopener");
 };

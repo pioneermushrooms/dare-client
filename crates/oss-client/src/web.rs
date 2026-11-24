@@ -42,6 +42,9 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = globalThis, js_name = openFoundationPage, catch)]
     fn js_open_foundation_page(path: &str) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = foundationStartArena, catch)]
+    fn js_start_arena() -> Result<JsValue, JsValue>;
 }
 
 /// The latest arena list from the page: `None` before its first answer (the page
@@ -54,6 +57,19 @@ pub(crate) fn foundation_arenas() -> Option<Option<String>> {
     } else {
         Some(value.as_string())
     }
+}
+
+/// The arena the page was opened for (`/play/?arena=...`, e.g. a draft from the
+/// builder's "Fly in it"), if any. Only arena-name characters are kept.
+pub(crate) fn start_arena() -> Option<String> {
+    let name = js_start_arena().ok()?.as_string()?;
+    let name: String = name
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '#')
+        .take(16)
+        .collect();
+    (!name.is_empty()).then_some(name.to_ascii_lowercase())
 }
 
 /// Asks the page to fetch the arena list now.
@@ -72,7 +88,7 @@ pub(crate) enum FoundationPage {
 impl FoundationPage {
     fn path(self) -> &'static str {
         match self {
-            FoundationPage::Apply => "/arena/",
+            FoundationPage::Apply => "/build.html",
             FoundationPage::Register => "/account/signup",
             FoundationPage::Forgot => "/account/forgot",
         }

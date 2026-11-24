@@ -40,7 +40,7 @@ pub const IN_BROWSER: bool = cfg!(target_arch = "wasm32");
 /// The confirmation "+ CREATE" shows before it opens a tab.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub const CREATE_CONFIRM: &str =
-    "Open the arena application in a new tab? Enter to confirm, Esc to cancel.";
+    "Open the arena builder in a new tab? Enter to confirm, Esc to cancel.";
 
 /// What the `trace` hot spot does: "+ CREATE" in the browser, a note elsewhere.
 pub fn trace_action(browser: bool) -> SkinAction {
@@ -256,7 +256,9 @@ pub fn screen_help(spot: &HotSpot) -> &'static str {
 pub fn help_for(spot: &HotSpot, browser: bool) -> &'static str {
     if browser {
         match spot {
-            HotSpot::Trace => return "+ Create: apply for your own Foundation arena.",
+            HotSpot::Trace => {
+                return "+ Create: build your own arena, private until you publish it.";
+            }
             HotSpot::Ping => return "Sort arenas by pilots or by name.",
             HotSpot::Zones => return "Refresh the arena list. (F3, Cmd-R)",
             HotSpot::ZoneText | HotSpot::ZoneBox => {
@@ -368,6 +370,14 @@ mod tests {
     }
 
     #[test]
+    fn create_confirm_names_the_builder() {
+        assert_eq!(
+            CREATE_CONFIRM,
+            "Open the arena builder in a new tab? Enter to confirm, Esc to cancel."
+        );
+    }
+
+    #[test]
     fn confirm_key_reads_enter_and_escape() {
         assert_eq!(confirm_key(&press(KeyCode::Enter)), Some(true));
         assert_eq!(confirm_key(&press(KeyCode::NumpadEnter)), Some(true));
@@ -395,7 +405,7 @@ mod tests {
         assert!(matches!(trace_action(false), SkinAction::Info(_)));
         assert_eq!(
             help_for(&HotSpot::Trace, true),
-            "+ Create: apply for your own Foundation arena."
+            "+ Create: build your own arena, private until you publish it."
         );
         assert_eq!(
             help_for(&HotSpot::Ping, true),
