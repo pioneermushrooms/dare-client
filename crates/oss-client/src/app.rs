@@ -295,6 +295,40 @@ struct SkinUi {
     pending: Vec<SkinAction>,
     /// The profile dialog's lines as last drawn, in its canvas's pixels.
     dialog_spots: Vec<(Rect, crate::game::login::Field)>,
+    /// Foundation's arenas, listed where the zones are (browser build).
+    #[cfg(target_arch = "wasm32")]
+    arenas: crate::game::arenas::ArenaList,
+    /// The arena feed as last taken from the page, to notice a new one.
+    #[cfg(target_arch = "wasm32")]
+    last_feed: Option<Option<String>>,
+    /// "+ CREATE" is waiting for Enter or Esc.
+    #[cfg(target_arch = "wasm32")]
+    confirm_create: bool,
+}
+
+/// Takes a new arena feed from the page, if there is one, into the list the
+/// start screen draws (browser build).
+#[cfg(target_arch = "wasm32")]
+fn pump_arenas(ui: &mut SkinUi, browser: &mut crate::game::zones::ZoneBrowser) {
+    let feed = crate::web::foundation_arenas();
+    if !browser.zones.is_empty() && (feed.is_none() || feed == ui.last_feed) {
+        return;
+    }
+    if let Some(text) = &feed {
+        ui.arenas.set_feed(text.as_deref());
+    }
+    browser.zones = ui.arenas.as_zones();
+    browser.status = if ui.arenas.unavailable {
+        "Arena list unavailable".into()
+    } else if feed.is_none() {
+        "Loading arenas...".into()
+    } else {
+        match browser.zones.len() {
+            1 => "1 arena".into(),
+            n => format!("{n} arenas"),
+        }
+    };
+    ui.last_feed = feed;
 }
 
 /// What one frame of the skinned start screen asks the app to do.
@@ -324,6 +358,8 @@ fn skin_frame(
     cmd: bool,
     shift: bool,
 ) -> SkinOutcome {
+    #[cfg(target_arch = "wasm32")]
+    pump_arenas(ui, browser);
     let layout = &ui.skin.layout;
     let main = (layout.main.w, layout.main.h);
     let s = skin_view::skin_scale(window, main);
@@ -334,13 +370,23 @@ fn skin_frame(
 
     // The selection follows the zone address, so a remembered zone shows
     // selected once the list arrives, and a refresh keeps it.
-    if let Some(i) = skin_screen::keep_selection(Some(&login.server), &browser.zones)
-        && browser.zones[i].address == login.server
-    {
+    // In the browser the list is arenas, and the selection follows the arena.
+    #[cfg(not(target_arch = "wasm32"))]
+    let (chosen, found) = (
+        &login.server,
+        skin_screen::keep_selection(Some(&login.server), &browser.zones)
+            .filter(|&i| browser.zones[i].address == login.server),
+    );
+    #[cfg(target_arch = "wasm32")]
+    let (chosen, found) = (
+        &login.arena,
+        skin_screen::keep_arena_selection(&login.arena, &browser.zones),
+    );
+    if let Some(i) = found {
         browser.selected = i;
-        if ui.shown != login.server {
+        if &ui.shown != chosen {
             ui.scroll = skin_screen::scroll_to_show(i, ui.scroll, rows);
-            ui.shown.clone_from(&login.server);
+            ui.shown.clone_from(chosen);
         }
     }
     ui.scroll = skin_screen::clamp_scroll(ui.scroll, browser.zones.len(), rows);
@@ -369,6 +415,19 @@ fn skin_frame(
         return out;
     }
 
+    // "+ CREATE" asked; Enter opens the application, Esc cancels. The answering
+    // key does nothing else (Enter is also Play, Esc also Quit).
+    #[cfg(target_arch = "wasm32")]
+    if ui.confirm_create
+        && let Some(yes) = skin_screen::confirm_key(strokes)
+    {
+        ui.confirm_create = false;
+        if yes {
+            crate::web::open_foundation_page(crate::web::FoundationPage::Apply);
+        }
+        return SkinOutcome::default();
+    }
+
     let mut actions = std::mem::take(&mut ui.pending);
     if clicked && let (Some(h), Some((x, y))) = (ui.hovered.clone(), at) {
         let row = skin_view::zone_row_at(layout, x, y, ui.scroll, browser.zones.len());
@@ -392,7 +451,12 @@ fn skin_frame(
     let select = |browser: &mut crate::game::zones::ZoneBrowser, login: &mut Login, i: usize| {
         browser.select(i);
         if let Some(z) = browser.zones.get(i) {
+            #[cfg(not(target_arch = "wasm32"))]
             login.server.clone_from(&z.address);
+            #[cfg(target_arch = "wasm32")]
+            {
+                login.arena = crate::game::arenas::arena_for_login(&z.name);
+            }
             login.error = None;
         }
     };
@@ -405,7 +469,10 @@ fn skin_frame(
             SkinAction::Play => out.choice = login.play(),
             SkinAction::Quit => out.choice = Some(Choice::Quit),
             SkinAction::Sandbox => out.choice = Some(Choice::Sandbox),
+            #[cfg(not(target_arch = "wasm32"))]
             SkinAction::RefreshZones => out.choice = Some(Choice::RefreshZones),
+            #[cfg(target_arch = "wasm32")]
+            SkinAction::RefreshZones => crate::web::refresh_foundation_arenas(),
             SkinAction::OpenOptions(section) => out.options = Some(section),
             SkinAction::SelectShip(k) => login.ship = k,
             SkinAction::CycleShip(d) => {
@@ -442,15 +509,27 @@ fn skin_frame(
                     let i = (browser.selected as i64 + i64::from(d)).clamp(0, last) as usize;
                     select(browser, login, i);
                     ui.scroll = skin_screen::scroll_to_show(i, ui.scroll, rows);
+                    #[cfg(not(target_arch = "wasm32"))]
                     ui.shown.clone_from(&login.server);
+                    #[cfg(target_arch = "wasm32")]
+                    ui.shown.clone_from(&login.arena);
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             SkinAction::TogglePing => ui.ping_graph = !ui.ping_graph,
+            // SORT, in the browser.
+            #[cfg(target_arch = "wasm32")]
+            SkinAction::TogglePing => {
+                ui.arenas.sort = ui.arenas.sort.next();
+                browser.zones = ui.arenas.as_zones();
+            }
             SkinAction::OpenProfile => login.open_profile(),
             SkinAction::NextSkin => out.next_skin = true,
             SkinAction::Info(text) => ui.note = Some((text.into(), web_time::Instant::now())),
-            // Handled with the arena list (browser build).
+            #[cfg(not(target_arch = "wasm32"))]
             SkinAction::CreateArena => {}
+            #[cfg(target_arch = "wasm32")]
+            SkinAction::CreateArena => ui.confirm_create = true,
         }
     }
     out
@@ -537,8 +616,22 @@ fn draw_skin_screen(
     } else {
         login.name.as_str()
     };
+    // The Foundation skin labels the third line ARENA; the desktop skins, MACROS.
+    #[cfg(target_arch = "wasm32")]
+    let third_line = if login.arena.is_empty() {
+        crate::game::arenas::PUBLIC
+    } else {
+        login.arena.as_str()
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let third_line = "Default";
+    #[cfg(target_arch = "wasm32")]
+    let confirming = ui.confirm_create;
+    #[cfg(not(target_arch = "wasm32"))]
+    let confirming = false;
     let now = web_time::Instant::now();
     let info: String = match (&ui.note, &login.error) {
+        _ if confirming => skin_screen::CREATE_CONFIRM.to_string(),
         (Some((text, at)), _) if now.duration_since(*at) < NOTE_FOR => text.clone(),
         (_, Some(err)) => err.clone(),
         _ => ui
@@ -557,11 +650,12 @@ fn draw_skin_screen(
         ship: login.ship,
         tick: skin_view::tick_at(elapsed.as_millis()),
         // The skin format's four lines: profile, player name, macro set, key set.
-        profile_lines: ["Default", name, "Default", "Default"],
+        profile_lines: ["Default", name, third_line, "Default"],
         zones: &browser.zones,
         selected: (!browser.zones.is_empty()).then_some(browser.selected),
         scroll: ui.scroll,
         ping_graph: ui.ping_graph,
+        arena_list: skin_screen::IN_BROWSER,
         info: &info,
     };
     let size = r.size();
@@ -652,6 +746,12 @@ fn load_skin_ui(options: &Options, dir: &AssetDirs, r: &mut Renderer) -> Option<
                     shown: String::new(),
                     pending: Vec::new(),
                     dialog_spots: Vec::new(),
+                    #[cfg(target_arch = "wasm32")]
+                    arenas: Default::default(),
+                    #[cfg(target_arch = "wasm32")]
+                    last_feed: None,
+                    #[cfg(target_arch = "wasm32")]
+                    confirm_create: false,
                 }));
             }
             Err(err) => log::warn!("skin {} ({}): {err}", e.name, e.path.display()),
@@ -1339,6 +1439,7 @@ impl App {
 
         // Login: wait for a choice.
         if let Screen::Login(ls) = &mut run.screen {
+            #[cfg(not(target_arch = "wasm32"))]
             ls.browser.pump();
             // The Remember line appears once the store has said it is there.
             self.vault.poll();

@@ -98,6 +98,12 @@ pub fn zone_line(name: &str, players: u32, ping_ms: Option<u32>, chars: usize) -
     format!("{ping} {name:<field$} {:>3}", players.min(999))
 }
 
+/// An arena row: as [`zone_line`], with the ping column left blank.
+pub fn arena_line(name: &str, players: u32, chars: usize) -> String {
+    let line = zone_line(name, players, None, chars);
+    format!("   {}", &line[3..])
+}
+
 /// Splits `text` into lines of at most `width` characters, at spaces where it can.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
@@ -181,6 +187,8 @@ pub struct SkinState<'a> {
     pub selected: Option<usize>,
     pub scroll: usize,
     pub ping_graph: bool,
+    /// The list holds arenas (browser build): no ping column.
+    pub arena_list: bool,
     pub info: &'a str,
 }
 
@@ -352,6 +360,8 @@ pub fn draw_skin(
                 fill(r, art, atlas, at(b.x, y), (b.w as f32 * sf, 13.0 * sf), sel);
             }
             let band = match z.ping_ms {
+                // Arenas have no ping; they take the list's first colour.
+                _ if st.arena_list => 0,
                 Some(p) if p <= 100 => 0,
                 Some(p) if p <= 250 => 1,
                 Some(_) => 2,
@@ -359,7 +369,11 @@ pub fn draw_skin(
             };
             let fallback = [[74, 222, 128], [250, 204, 21], [248, 113, 113]];
             let col = l.colors.zone[band].unwrap_or(fallback[band]);
-            let line = zone_line(&z.name, z.players, z.ping_ms, chars);
+            let line = if st.arena_list {
+                arena_line(&z.name, z.players, chars)
+            } else {
+                zone_line(&z.name, z.players, z.ping_ms, chars)
+            };
             if st.ping_graph {
                 let len = z.ping_ms.map_or(0, |p| (p.min(500) * 22 / 500).max(1));
                 fill(
@@ -542,6 +556,12 @@ mod tests {
             "--- A very l 123"
         );
         assert_eq!(zone_line("Z", 5000, Some(1500), 12), "999 Z    999");
+    }
+
+    #[test]
+    fn arena_line_has_no_ping() {
+        assert_eq!(arena_line("duel", 3, 16), "    duel       3");
+        assert_eq!(arena_line("x", 1500, 12), "    x    999");
     }
 
     #[test]

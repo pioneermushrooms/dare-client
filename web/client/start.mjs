@@ -45,6 +45,38 @@ globalThis.openDareGateway = () => {
   return bridge;
 };
 
+// Foundation's arenas for the game's start screen, as "name<TAB>players" lines.
+// undefined until the first answer, null after a failed fetch.
+let arenaFeed;
+let arenaFetching = false;
+async function fetchArenas() {
+  if (arenaFetching) return;
+  arenaFetching = true;
+  try {
+    const response = await fetch("/arena/api/public", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error();
+    const data = await response.json();
+    const clean = (name) => String(name ?? "").replace(/[\t\r\n]/g, " ").trim();
+    const lines = (data.arenas ?? [])
+      .filter((arena) => arena.status === "Active" && clean(arena.name))
+      .map((arena) => `${clean(arena.name)}\t${Number.isInteger(arena.players) ? arena.players : ""}`);
+    if (Number.isInteger(data.publicPlayers)) lines.unshift(`public\t${data.publicPlayers}`);
+    arenaFeed = lines.join("\n");
+  } catch {
+    arenaFeed = null;
+  } finally {
+    arenaFetching = false;
+  }
+}
+globalThis.foundationArenas = () => arenaFeed;
+globalThis.refreshFoundationArenas = () => void fetchArenas();
+const FOUNDATION_PAGES = new Set(["/arena/", "/account/signup", "/account/forgot"]);
+globalThis.openFoundationPage = (path) => {
+  if (FOUNDATION_PAGES.has(path)) window.open(`https://subspacefoundation.com${path}`, "_blank", "noopener");
+};
+void fetchArenas();
+setInterval(() => void fetchArenas(), 30000);
+
 function say(text, isError = false) {
   status.textContent = text;
   status.classList.toggle("error", isError);

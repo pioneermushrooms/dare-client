@@ -1,7 +1,7 @@
 //! Browser platform entry point and bridge to the WebTransport datagram driver.
 use std::io;
-use web_time::Instant;
 use wasm_bindgen::prelude::*;
+use web_time::Instant;
 
 #[wasm_bindgen]
 extern "C" {
@@ -33,6 +33,55 @@ extern "C" {
 
     #[wasm_bindgen(method)]
     fn close(this: &Link);
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = foundationArenas, catch)]
+    fn js_foundation_arenas() -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = refreshFoundationArenas, catch)]
+    fn js_refresh_foundation_arenas() -> Result<(), JsValue>;
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = openFoundationPage, catch)]
+    fn js_open_foundation_page(path: &str) -> Result<(), JsValue>;
+}
+
+/// The latest arena list from the page: `None` before its first answer (the page
+/// gives `undefined`), `Some(None)` when the last fetch failed (`null`), else the
+/// `name<TAB>players` lines, which may be empty.
+pub(crate) fn foundation_arenas() -> Option<Option<String>> {
+    let value = js_foundation_arenas().ok()?;
+    if value.is_undefined() {
+        None
+    } else {
+        Some(value.as_string())
+    }
+}
+
+/// Asks the page to fetch the arena list now.
+pub(crate) fn refresh_foundation_arenas() {
+    let _ = js_refresh_foundation_arenas();
+}
+
+/// A Foundation site page the game may open in a new tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoundationPage {
+    Apply,
+    Register,
+    Forgot,
+}
+
+impl FoundationPage {
+    fn path(self) -> &'static str {
+        match self {
+            FoundationPage::Apply => "/arena/",
+            FoundationPage::Register => "/account/signup",
+            FoundationPage::Forgot => "/account/forgot",
+        }
+    }
+}
+
+/// Opens `page` in a new tab. Only from a click or key the player made.
+pub(crate) fn open_foundation_page(page: FoundationPage) {
+    let _ = js_open_foundation_page(page.path());
 }
 
 struct BrowserLog;
@@ -84,7 +133,11 @@ impl WebDriver {
         }
         let link = open_gateway()
             .map_err(|error| io::Error::other(format!("browser transport: {error:?}")))?;
-        Ok(Self { link, started: Instant::now(), reported_endpoint: false })
+        Ok(Self {
+            link,
+            started: Instant::now(),
+            reported_endpoint: false,
+        })
     }
 
     pub fn now_ms(&self) -> u64 {

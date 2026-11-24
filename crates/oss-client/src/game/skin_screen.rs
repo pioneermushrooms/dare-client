@@ -195,6 +195,7 @@ pub fn scroll_to_show(selected: usize, scroll: usize, rows: usize) -> usize {
 }
 
 /// Where the zone that was selected is now, after the list changed.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn keep_selection(old_address: Option<&str>, zones: &[ZoneInfo]) -> Option<usize> {
     if zones.is_empty() {
         return None;
@@ -206,8 +207,18 @@ pub fn keep_selection(old_address: Option<&str>, zones: &[ZoneInfo]) -> Option<u
     )
 }
 
-/// The info box's text for a hot spot.
-/// The help line for `spot` on this build's start screen.
+/// Where the login form's arena is in the arena list (`""` is `public`), if listed.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn keep_arena_selection(arena: &str, zones: &[ZoneInfo]) -> Option<usize> {
+    let want = if arena.is_empty() {
+        crate::game::arenas::PUBLIC
+    } else {
+        arena
+    };
+    zones.iter().position(|z| z.address == want)
+}
+
+/// The info box's text for a hot spot on this build's start screen.
 pub fn screen_help(spot: &HotSpot) -> &'static str {
     help_for(spot, IN_BROWSER)
 }
@@ -231,7 +242,7 @@ pub fn help_for(spot: &HotSpot, browser: bool) -> &'static str {
     help(spot)
 }
 
-/// The desktop help line for `spot`.
+/// The info box's text for a hot spot (the desktop wording).
 pub fn help(spot: &HotSpot) -> &'static str {
     match spot {
         HotSpot::Play => "Play: join the selected zone. (Enter)",
@@ -371,6 +382,22 @@ mod tests {
         );
         assert_eq!(help_for(&HotSpot::Ping, false), help(&HotSpot::Ping));
         assert_eq!(help_for(&HotSpot::Play, true), help(&HotSpot::Play));
+    }
+
+    #[test]
+    fn selection_follows_arena_name() {
+        let zone = |n: &str| ZoneInfo {
+            name: n.into(),
+            description: String::new(),
+            address: n.into(),
+            players: 0,
+            ping_ms: None,
+        };
+        let rows = [zone("public"), zone("duel"), zone("race")];
+        assert_eq!(keep_arena_selection("race", &rows), Some(2));
+        assert_eq!(keep_arena_selection("", &rows), Some(0));
+        assert_eq!(keep_arena_selection("gone", &rows), None);
+        assert_eq!(keep_arena_selection("duel", &[]), None);
     }
 
     #[test]
