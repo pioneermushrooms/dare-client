@@ -3,6 +3,7 @@
 //! Pure tables from input to [`SkinAction`]; `app.rs` carries the actions out with
 //! the same handling the old start screen used.
 
+use super::login::ProfileCmd;
 use crate::game::input::Stroke;
 use crate::game::settings_ui::Section;
 use crate::game::skin::HotSpot;
@@ -28,6 +29,8 @@ pub enum SkinAction {
     MoveSelection(i32),
     TogglePing,
     OpenProfile,
+    /// The arrows beside the profile: switch to the previous or next saved profile.
+    Profile(ProfileCmd),
     NextSkin,
     Info(&'static str),
 }
@@ -57,6 +60,8 @@ pub fn click(spot: &HotSpot, zone_row: Option<usize>, double: bool) -> Option<Sk
         HotSpot::Zones => A::RefreshZones,
         HotSpot::Ping => A::TogglePing,
         HotSpot::Profile | HotSpot::ProfText | HotSpot::ProfBox => A::OpenProfile,
+        HotSpot::PrevProf => A::Profile(ProfileCmd::Prev),
+        HotSpot::NextProf => A::Profile(ProfileCmd::Next),
         HotSpot::ZoneUp => A::ScrollZones(-1),
         HotSpot::ZoneDown => A::ScrollZones(1),
         HotSpot::Trace => A::Info("Trace is coming in a later update."),
@@ -182,7 +187,7 @@ pub fn help(spot: &HotSpot) -> &'static str {
             "Profile: your name, password, arena and zone address. (P)"
         }
         HotSpot::PrevProf | HotSpot::NextProf => {
-            "Switch profile. More profiles are coming in a later update."
+            "Switch to the previous or next saved profile. (PgUp, PgDn in the profile)"
         }
         HotSpot::Ship(_) | HotSpot::ShipBox => "Pick the ship you enter in. (Left/Right, wheel)",
         HotSpot::Spectate => "Enter as a spectator, watching the game.",
@@ -265,7 +270,14 @@ mod tests {
             click(&HotSpot::Trace, None, false),
             Some(SkinAction::Info(_))
         ));
-        assert_eq!(click(&HotSpot::PrevProf, None, false), None);
+        assert_eq!(
+            click(&HotSpot::PrevProf, None, false),
+            Some(SkinAction::Profile(ProfileCmd::Prev))
+        );
+        assert_eq!(
+            click(&HotSpot::NextProf, None, false),
+            Some(SkinAction::Profile(ProfileCmd::Next))
+        );
         assert_eq!(click(&HotSpot::Other("user1".into()), None, false), None);
     }
 

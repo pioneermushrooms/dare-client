@@ -14,9 +14,11 @@
 //! arena and ship (never the password) are remembered in `login.ini` beside the
 //! settings.
 //!
-//! The password is remembered only if the player ticks "Remember", and then only
-//! in the operating system's own password store (see `oss-credstore`). The line
-//! is not drawn at all on a machine with no such store.
+//! The password is remembered per profile (a name on a zone) in the client's own
+//! profiles file, once the zone has accepted the login (see
+//! [`super::profiles`] and [`super::remember`]). That file is plain text, readable
+//! by anyone who can read this user account's files, as Continuum's profiles are;
+//! the client never uses the operating system's password store.
 
 use std::fmt;
 use std::path::Path;
@@ -84,6 +86,19 @@ impl Field {
     }
 }
 
+/// A change to the list of profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileCmd {
+    /// The next saved profile (PageDown).
+    Next,
+    /// The previous one (PageUp).
+    Prev,
+    /// A blank profile to type a new name into (F6).
+    New,
+    /// Delete the profile on screen (F8).
+    Delete,
+}
+
 /// What the player chose.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Choice {
@@ -115,14 +130,14 @@ pub struct Login {
     /// "Remember password" is ticked. Unticked to begin with: remembering a
     /// password is the player's choice.
     pub remember: bool,
-    /// This machine has a password store, so the Remember line is on the form.
+    /// The Remember line is on the form.
     vault: bool,
-    /// The account whose saved password the player has just unticked, for the
-    /// screen to delete at once.
-    forget: Option<String>,
-    /// Remember was just ticked on; the screen reads it once, to say what the
-    /// system's prompt will be before it appears.
-    ticked: bool,
+    /// The name and zone whose saved password the player has just unticked, for
+    /// the screen to delete at once.
+    forget: Option<(String, String)>,
+    /// A profile switch, add or delete the player just asked for, for the screen
+    /// to carry out (it owns the profiles file).
+    profile_cmd: Option<ProfileCmd>,
     /// Everything the command line asked for that this form does not own.
     ///
     /// [`Self::submit`] lays its own five fields over this rather than building a
@@ -197,7 +212,7 @@ impl Default for Login {
             remember: false,
             vault: false,
             forget: None,
-            ticked: false,
+            profile_cmd: None,
             profile: false,
             base: Box::new(ServerOptions {
                 server: String::new(),
@@ -274,6 +289,8 @@ impl Login {
         if let Some(v) = l.base.arena.as_deref().and_then(field) {
             l.arena = v;
         }
+        // Passwords are kept in the profile unless the player unticks this.
+        l.remember = true;
         // Start where there's something to type.
         l.focus = usize::from(!l.name.is_empty());
         l
@@ -462,25 +479,23 @@ impl Login {
             return;
         }
         self.remember = !self.remember;
-        self.ticked |= self.remember;
         if !self.remember && !self.name.trim().is_empty() {
-            self.forget = Some(oss_credstore::account(&self.name, &self.server));
+            self.forget = Some((self.name.clone(), self.server.clone()));
         }
     }
 
-    /// Whether the Remember line is on the form, which is whether this machine
-    /// has a password store.
-    pub fn vault_shown(&self) -> bool {
-        self.vault
+    /// Asks for a profile change, as the keys do (the skin's arrows use it).
+    pub fn ask_profile(&mut self, cmd: ProfileCmd) {
+        self.profile_cmd = Some(cmd);
     }
 
-    /// Whether Remember was ticked on since last asked, once.
-    pub fn take_ticked(&mut self) -> bool {
-        std::mem::take(&mut self.ticked)
+    /// The profile change the player asked for, once.
+    pub fn take_profile_cmd(&mut self) -> Option<ProfileCmd> {
+        self.profile_cmd.take()
     }
 
-    /// The account whose saved password should be deleted now, once.
-    pub fn take_forget(&mut self) -> Option<String> {
+    /// The name and zone whose saved password should be deleted now, once.
+    pub fn take_forget(&mut self) -> Option<(String, String)> {
         self.forget.take()
     }
 
@@ -584,6 +599,14 @@ impl Login {
                 {
                     self.toggle_remember();
                 }
+                Some(KeyCode::PageDown) if self.focused() != Field::Zones => {
+                    self.profile_cmd = Some(ProfileCmd::Next);
+                }
+                Some(KeyCode::PageUp) if self.focused() != Field::Zones => {
+                    self.profile_cmd = Some(ProfileCmd::Prev);
+                }
+                Some(KeyCode::F6) => self.profile_cmd = Some(ProfileCmd::New),
+                Some(KeyCode::F8) => self.profile_cmd = Some(ProfileCmd::Delete),
                 Some(KeyCode::Escape) => return Some(Choice::Quit),
                 Some(KeyCode::F2) => return Some(Choice::Options),
                 Some(KeyCode::F3) => return Some(Choice::RefreshZones),
@@ -1169,5 +1192,26 @@ mod tests {
         assert_eq!(l.link(), None);
         l.error = None;
         assert_eq!(l.link(), None);
+    }
+
+    /// The keys that switch, add and delete profiles ask the screen to do it, and
+    /// do not move off the form; the zone list keeps PageUp and PageDown.
+    #[test]
+    fn profile_keys_ask_for_a_profile_change() {
+        let mut l = Login::load(None, Some("Ace"), Box::new(Login::default().into_base()));
+        assert!(l.remember, "a profile keeps its password unless unticked");
+        for (key, cmd) in [
+            (KeyCode::PageDown, ProfileCmd::Next),
+            (KeyCode::PageUp, ProfileCmd::Prev),
+            (KeyCode::F6, ProfileCmd::New),
+            (KeyCode::F8, ProfileCmd::Delete),
+        ] {
+            assert_eq!(l.input(&strokes(&[key], ""), false), None);
+            assert_eq!(l.take_profile_cmd(), Some(cmd));
+            assert_eq!(l.take_profile_cmd(), None, "once");
+        }
+        l.focus_on(Field::Zones);
+        l.input(&strokes(&[KeyCode::PageDown], ""), false);
+        assert_eq!(l.take_profile_cmd(), None);
     }
 }

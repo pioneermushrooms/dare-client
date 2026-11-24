@@ -99,11 +99,6 @@ pub fn init_logging() {
     let mut logger = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=off,naga=warn"),
     );
-    // The password store's libraries log the credentials they handle. What they
-    // print is theirs to change, so they print nothing here at any log level.
-    for module in oss_credstore::QUIET_MODULES {
-        logger.filter_module(module, log::LevelFilter::Off);
-    }
     logger.init();
 }
 

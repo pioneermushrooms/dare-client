@@ -33,7 +33,7 @@ pub fn draw_profile_dialog(
 ) -> Vec<(Rect, Field)> {
     let fields = login.fields();
     let w = COLS as f32 * 8.0;
-    let h = 20.0 + fields.len() as f32 * 14.0 + 8.0 + 14.0 + 10.0 + 14.0;
+    let h = 20.0 + fields.len() as f32 * 14.0 + 8.0 + 14.0 + 10.0 + 14.0 + 14.0;
     let x = ((c.view_w - w) / 2.0).floor();
     let top = ((c.view_h - h) / 2.0).floor().max(4.0);
     c.panel(r, x, top, w, h);
@@ -60,9 +60,9 @@ pub fn draw_profile_dialog(
         let value: String = match f {
             Field::Password => "*".repeat(login.password.chars().count()),
             Field::Remember => if login.remember {
-                "[x] save in this Mac's keychain"
+                "[x] keep password in this profile"
             } else {
-                "[ ] save in this Mac's keychain"
+                "[ ] keep password in this profile"
             }
             .into(),
             Field::Name => login.name.clone(),
@@ -99,6 +99,13 @@ pub fn draw_profile_dialog(
         y + 6.0,
         color::YELLOW,
         "Enter = Play   Tab = Next   Esc = Close",
+    );
+    c.text_center(
+        r,
+        x + w / 2.0,
+        y + 20.0,
+        color::YELLOW,
+        "PgUp/PgDn = Switch   F6 = New   F8 = Delete",
     );
     spots
 }

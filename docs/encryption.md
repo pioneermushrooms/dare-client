@@ -61,18 +61,20 @@ offer off entirely.
 
 ## Remembered passwords
 
-The start-up screen has a **Remember** line under the password. It starts unticked. Tick it,
-and once the zone has accepted the password it is kept in your operating system's own
-password store: **Windows Credential Manager** on Windows, the **Keychain** on macOS. Each
-entry is filed under `Open SubSpace` as `name@zone:port`, so you can see it and delete it there
-with the tools you already have. Next time, the same name and zone fill the password in for
-you. Untick the line to delete the saved password straight away. The password is never written
-to the settings file, `login.ini` or any file of the client's own, and never to a log.
+The client keeps **profiles**: a name on a zone, and the password last used with it. They
+are in `profiles.txt` in the client's settings folder, most recently used first. On the
+start-up screen, PgUp and PgDn switch between profiles, F6 starts a new one and F8 deletes
+the one on screen. The password is written only after the zone has accepted the login, so a
+mistyped one is never kept, and a refused login leaves the stored one alone. The **Remember**
+line (ticked to begin with) can be unticked to keep a profile's name without its password;
+unticking deletes the saved password straight away.
 
-**On Linux** the password goes to your desktop's own keyring through the Secret Service (GNOME
-Keyring, or KWallet), encrypted on its way there. A system with no such keyring, such as a
-server or a minimal desktop, has nowhere safe to keep it, so the password is not stored at
-all and the Remember line is not shown.
+**The passwords in that file are plain text.** The file is created readable by its owner only
+(mode 0600 on Unix), but anyone who can read your user account's files can read it, and
+scrambling the contents would not change that, so they are not scrambled. This is how
+Continuum keeps its profiles. The client never uses the operating system's own password store
+(Keychain, Credential Manager, a desktop keyring), so it never makes the system ask for
+anything. The password is never written to `login.ini` or the settings file, or to a log.
 
 ## Continuum's encryption
 

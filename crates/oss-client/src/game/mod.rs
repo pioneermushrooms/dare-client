@@ -14,6 +14,7 @@ pub mod lvz;
 pub mod online;
 pub mod palette;
 pub mod profile_dialog;
+pub mod profiles;
 pub mod remember;
 pub mod sandbox;
 pub mod settings_ui;

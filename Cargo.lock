@@ -2248,7 +2248,6 @@ dependencies = [
  "jiff",
  "log",
  "oss-assets",
- "oss-credstore",
  "oss-formats",
  "oss-net",
  "oss-proto",

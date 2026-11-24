@@ -409,6 +409,7 @@ fn skin_frame(
             SkinAction::Sandbox => out.choice = Some(Choice::Sandbox),
             SkinAction::RefreshZones => out.choice = Some(Choice::RefreshZones),
             SkinAction::OpenOptions(section) => out.options = Some(section),
+            SkinAction::Profile(cmd) => login.ask_profile(cmd),
             SkinAction::SelectShip(k) => login.ship = k,
             SkinAction::CycleShip(d) => {
                 // Ships 0-7, then spectator, round again.
@@ -672,11 +673,9 @@ struct App {
     /// rather than acted on in the event, so a click is read against the same
     /// regions, in the same place in the frame, as a key is.
     clicked: bool,
-    /// This machine's password store, if it has one, for "Remember password".
-    vault: crate::game::remember::Vault,
-    /// Which accounts have a saved password, so the store is asked about those
-    /// only (see [`crate::game::remember`]).
-    ledger: crate::game::remember::Ledger,
+    /// The saved profiles (names and the password last used with each), in the
+    /// client's own settings folder; never the operating system's password store.
+    profiles: crate::game::profiles::Profiles,
 }
 
 pub fn run(options: Options) -> Result<(), String> {
@@ -734,11 +733,11 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
     let mut input = InputState::new(options.bindings.clone());
     input.set_pad_bindings(options.pad.clone());
     // Beside the login file, so a test run with no login file keeps nothing.
-    let ledger_path = options
+    let profiles_path = options
         .login_file
         .as_deref()
         .and_then(Path::parent)
-        .map(|d| d.join("remembered.txt"));
+        .map(|d| d.join("profiles.txt"));
     let mut app = App {
         options,
         dir,
@@ -752,8 +751,7 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         pointed: 0,
         clicked: false,
         cursor: None,
-        vault: crate::game::remember::Vault::probe(),
-        ledger: crate::game::remember::Ledger::load(ledger_path),
+        profiles: crate::game::profiles::Profiles::new(profiles_path),
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     match app.error {
@@ -1246,30 +1244,16 @@ impl App {
         // Login: wait for a choice.
         if let Screen::Login(ls) = &mut run.screen {
             ls.browser.pump();
-            // The Remember line appears once the store has said it is there.
-            self.vault.poll();
-            ls.login.set_vault(self.vault.store().is_some());
-            if let Some(store) = self.vault.store() {
-                ls.recall.tick(
-                    &mut ls.login,
-                    &store,
-                    &self.ledger,
-                    std::time::Instant::now(),
-                );
-                if let Some(who) = ls.login.take_forget() {
-                    crate::game::remember::forget_if_kept(&store, &mut self.ledger, who);
-                }
+            // The Remember line is always on the form: profiles are the client's own.
+            ls.login.set_vault(true);
+            ls.recall
+                .tick(&mut ls.login, &self.profiles, std::time::Instant::now());
+            if let Some((name, zone)) = ls.login.take_forget() {
+                crate::game::remember::forget(&self.profiles, &name, &zone);
             }
-            // The first time Remember is ticked, say what the system's password
-            // prompt will be before it appears (it comes when the login is
-            // accepted and the password is saved).
-            if ls.login.take_ticked()
-                && ls.popup.is_none()
-                && !self.ledger.notice_seen()
-                && let Some(text) = crate::game::remember::keychain_notice()
-            {
-                self.ledger.mark_notice_seen();
-                ls.popup = Some(Prompt::notice("-= Remember password =-", text, None));
+            if let Some(cmd) = ls.login.take_profile_cmd() {
+                crate::game::remember::apply(cmd, &self.profiles, &mut ls.login);
+                ls.recall.adopt(&ls.login);
             }
             // While the options are up they have the keyboard; the screen underneath
             // would otherwise take every character into whichever field has focus.
@@ -1626,10 +1610,8 @@ impl App {
             let conn = *conn;
             // The zone has let us in, so the password was right: now, and only
             // now, it is remembered (or a remembered one forgotten).
-            if let Some(login) = &conn.login
-                && let Some(store) = self.vault.store()
-            {
-                crate::game::remember::settle(&store, &mut self.ledger, login);
+            if let Some(login) = &conn.login {
+                crate::game::remember::settle(&self.profiles, login);
             }
             run.front_end = conn.login;
             let audio = if audio_wanted {
