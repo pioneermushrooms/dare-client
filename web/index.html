@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Foundation browser connection test</title>
+<style>
+body { color: #e5f5ff; background: #091321; font: 1rem system-ui; margin: 2rem auto; max-width: 45rem; padding: 0 1rem; }
+form { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; }
+label { display: grid; gap: .4rem; }
+input,button { font: inherit; padding: .45rem; }
+canvas { width: min(100%, 32rem); aspect-ratio: 1; border: 1px solid #43637d; background: #030914; }
+</style>
+<script type="module" src="probe.mjs"></script>
+</head>
+<body>
+<h1>Foundation browser connection test</h1>
+<p>This test enters an arena as a spectator and plots player positions.</p>
+<form id="login">
+<label>Pilot name <input name="pilot" required maxlength="23" autocomplete="username"></label>
+<label>Password <input name="password" type="password" required maxlength="31" autocomplete="current-password"></label>
+<label>Arena <input name="arena" maxlength="15"></label>
+<button>Connect</button>
+</form>
+<button id="disconnect" type="button" disabled>Disconnect</button>
+<p id="status" role="status">Loading browser test.</p>
+<canvas width="512" height="512" aria-label="Plot of arena player positions"></canvas>
+</body>
+</html>

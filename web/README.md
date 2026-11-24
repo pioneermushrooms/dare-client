@@ -1,8 +1,8 @@
 # Foundation browser transport
 
-This is the transport slice of the Dare browser port. It is a fixed-destination
-WebTransport-to-UDP gateway and a browser adapter. The WASM client and WebGPU
-canvas still need to be integrated.
+This prototype includes a fixed-destination WebTransport-to-UDP gateway,
+a browser adapter, and a WASM spectator probe with a WebGPU position plot.
+The desktop renderer and flight controls are outside this prototype.
 
 ## Run against a test zone
 
@@ -27,3 +27,26 @@ Drive `tick` with the monotonic clock and drain `poll_transmit` into the adapter
 Use an explicitly VIE-capable private test listener for the first integration.
 A future automatic cipher fallback must open a fresh gateway session so it gets
 a new UDP source port, matching the native driver.
+
+## Build the spectator probe
+
+The probe uses the shared Rust session in WASM and draws received player
+positions on a WebGPU canvas. It enters as a spectator and has no flight controls.
+
+The build was verified with upstream `oss-core` commit
+`aad700a4cedb272c607050492b9db8b0f6c0149f` in the sibling checkout,
+Rust 1.100.0, and wasm-bindgen CLI 0.2.130.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.130 --locked
+CARGO_TARGET_DIR=web/session/target cargo build --locked --release \
+  --target wasm32-unknown-unknown --manifest-path web/session/Cargo.toml
+wasm-bindgen --target web --out-dir web/pkg \
+  web/session/target/wasm32-unknown-unknown/release/dare_web_session.wasm
+```
+
+Serve `index.html`, `probe.mjs`, `transport.mjs`, and `pkg/` over HTTPS. The
+probe expects `https://subspacefoundation.com:4443/play/transport`. The current
+loopback-only gateway and its test certificate are suitable for on-host checks,
+and a browser on another host needs a reachable endpoint and trusted certificate.

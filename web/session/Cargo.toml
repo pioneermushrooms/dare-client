@@ -1,0 +1,14 @@
+[workspace]
+
+[package]
+name = "dare-web-session"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oss-session = { path = "../../crates/oss-session" }
+wasm-bindgen = "0.2"
