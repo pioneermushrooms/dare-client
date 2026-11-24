@@ -120,6 +120,9 @@ pub struct Login {
     /// The account whose saved password the player has just unticked, for the
     /// screen to delete at once.
     forget: Option<String>,
+    /// Remember was just ticked on; the screen reads it once, to say what the
+    /// system's prompt will be before it appears.
+    ticked: bool,
     /// Everything the command line asked for that this form does not own.
     ///
     /// [`Self::submit`] lays its own five fields over this rather than building a
@@ -194,6 +197,7 @@ impl Default for Login {
             remember: false,
             vault: false,
             forget: None,
+            ticked: false,
             profile: false,
             base: Box::new(ServerOptions {
                 server: String::new(),
@@ -458,6 +462,7 @@ impl Login {
             return;
         }
         self.remember = !self.remember;
+        self.ticked |= self.remember;
         if !self.remember && !self.name.trim().is_empty() {
             self.forget = Some(oss_credstore::account(&self.name, &self.server));
         }
@@ -467,6 +472,11 @@ impl Login {
     /// has a password store.
     pub fn vault_shown(&self) -> bool {
         self.vault
+    }
+
+    /// Whether Remember was ticked on since last asked, once.
+    pub fn take_ticked(&mut self) -> bool {
+        std::mem::take(&mut self.ticked)
     }
 
     /// The account whose saved password should be deleted now, once.
@@ -1148,6 +1158,7 @@ mod tests {
         let link = Link {
             url: "https://example.invalid/x",
             label: "Go",
+            key: "F4 = Go",
         };
         let mut l = Login::default();
         assert_eq!(l.link(), None);

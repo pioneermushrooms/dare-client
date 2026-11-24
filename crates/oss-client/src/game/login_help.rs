@@ -24,6 +24,8 @@ pub struct Link {
     pub url: &'static str,
     /// What the button says.
     pub label: &'static str,
+    /// The same on a foot line, with its key: "F4 = Register".
+    pub key: &'static str,
 }
 
 /// Whether `server` (`host` or `host:port`) is the Foundation zone.
@@ -52,6 +54,7 @@ pub fn explain(server: &str, code: u8) -> Option<(&'static str, Option<Link>)> {
             Some(Link {
                 url: SIGN_UP,
                 label: "Register",
+                key: "F4 = Register",
             }),
         )),
         login_code::BAD_PASSWORD => Some((
@@ -59,6 +62,7 @@ pub fn explain(server: &str, code: u8) -> Option<(&'static str, Option<Link>)> {
             Some(Link {
                 url: FORGOT,
                 label: "Reset password",
+                key: "F4 = Reset password",
             }),
         )),
         login_code::LOCKED => Some(("Too many tries. Wait 10 minutes, then try again.", None)),

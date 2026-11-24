@@ -1,7 +1,7 @@
 //! Window/event loop glue: owns the window, renderer, input devices and the current
 //! screen (connecting to a zone, or in the game).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use oss_assets::{AssetDirs, AssetSearch};
@@ -270,6 +270,9 @@ struct LoginScreen {
     recall: crate::game::remember::Recall,
     /// The skinned screen; `None` falls back to the plain drawn one.
     skin: Option<Box<SkinUi>>,
+    /// A message over the screen that has to be read first: a refused login, or
+    /// what the system's password prompt is about to ask.
+    popup: Option<Prompt>,
 }
 
 /// The skinned start screen's state.
@@ -671,6 +674,9 @@ struct App {
     clicked: bool,
     /// This machine's password store, if it has one, for "Remember password".
     vault: crate::game::remember::Vault,
+    /// Which accounts have a saved password, so the store is asked about those
+    /// only (see [`crate::game::remember`]).
+    ledger: crate::game::remember::Ledger,
 }
 
 pub fn run(options: Options) -> Result<(), String> {
@@ -727,6 +733,12 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
     };
     let mut input = InputState::new(options.bindings.clone());
     input.set_pad_bindings(options.pad.clone());
+    // Beside the login file, so a test run with no login file keeps nothing.
+    let ledger_path = options
+        .login_file
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|d| d.join("remembered.txt"));
     let mut app = App {
         options,
         dir,
@@ -741,6 +753,7 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         clicked: false,
         cursor: None,
         vault: crate::game::remember::Vault::probe(),
+        ledger: crate::game::remember::Ledger::load(ledger_path),
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     match app.error {
@@ -814,6 +827,7 @@ impl App {
             spots: Spots::default(),
             recall: Default::default(),
             skin,
+            popup: None,
         }));
         run.window.set_title("Open SubSpace");
         self.settings = None;
@@ -950,6 +964,7 @@ impl ApplicationHandler for App {
                     spots: Spots::default(),
                     recall: Default::default(),
                     skin,
+                    popup: None,
                 }))
             }
         };
@@ -1235,21 +1250,54 @@ impl App {
             self.vault.poll();
             ls.login.set_vault(self.vault.store().is_some());
             if let Some(store) = self.vault.store() {
-                ls.recall
-                    .tick(&mut ls.login, &store, std::time::Instant::now());
+                ls.recall.tick(
+                    &mut ls.login,
+                    &store,
+                    &self.ledger,
+                    std::time::Instant::now(),
+                );
                 if let Some(who) = ls.login.take_forget() {
-                    crate::game::remember::forget(&store, who);
+                    crate::game::remember::forget_if_kept(&store, &mut self.ledger, who);
                 }
+            }
+            // The first time Remember is ticked, say what the system's password
+            // prompt will be before it appears (it comes when the login is
+            // accepted and the password is saved).
+            if ls.login.take_ticked()
+                && ls.popup.is_none()
+                && !self.ledger.notice_seen()
+                && let Some(text) = crate::game::remember::keychain_notice()
+            {
+                self.ledger.mark_notice_seen();
+                ls.popup = Some(Prompt::notice("-= Remember password =-", text, None));
             }
             // While the options are up they have the keyboard; the screen underneath
             // would otherwise take every character into whichever field has focus.
-            let strokes = if self.settings.is_some() {
+            let mut strokes = if self.settings.is_some() {
                 self.input.drop_strokes();
                 Vec::new()
             } else {
                 self.input.take_strokes()
             };
             self.input.take_edges();
+            // A message over the screen has the keyboard and the pointer to
+            // itself until it is closed: nothing underneath hears either.
+            if let Some(popup) = ls.popup.as_mut() {
+                let own = std::mem::take(&mut strokes);
+                let clicked = std::mem::take(&mut self.clicked) && self.settings.is_none();
+                let mut answer = popup.input(&own, self.input.shift());
+                if answer.is_none()
+                    && clicked
+                    && let Some((mx, my)) = cursor
+                {
+                    answer = popup.click(mx, my);
+                }
+                match answer {
+                    Some(Answer::Dismiss) => ls.popup = None,
+                    Some(Answer::OpenLink(url)) => crate::game::login_help::open_in_browser(url),
+                    _ => {}
+                }
+            }
             // F4 opens the page a refusal points to, on either start-up screen.
             if strokes.iter().any(|s| s.first_press() == Some(KeyCode::F4))
                 && let Some(link) = ls.login.link()
@@ -1505,7 +1553,8 @@ impl App {
                     Some(Answer::Disconnect) => {
                         give_up = Some("Disconnected from the zone.".to_string());
                     }
-                    None => {}
+                    // Notices belong to the start-up screen.
+                    Some(Answer::Dismiss | Answer::OpenLink(_)) | None => {}
                 }
             } else if strokes
                 .iter()
@@ -1515,6 +1564,7 @@ impl App {
             }
             let failed = conn.net.error.clone();
             let failed_link = conn.net.error_link;
+            let failed_text = failed.clone();
             if give_up.is_some() || failed.is_some() {
                 // Say so to the zone. Dropping the session sends nothing, and a
                 // zone holding a login open for an answer would otherwise wait
@@ -1535,6 +1585,12 @@ impl App {
                         login.error = err.or(give_up);
                         login.error_link =
                             failed_link.zip(login.error.clone()).map(|(l, t)| (t, l));
+                        // Every refusal is a popup that has to be read, with the page
+                        // that fixes it when there is one; the line under the form
+                        // keeps the words too. Giving up on purpose is not a refusal.
+                        let popup = failed_text
+                            .as_deref()
+                            .map(|t| Prompt::notice("-= Cannot log in =-", t, failed_link));
                         let skin = load_skin_ui(&self.options, &self.dir, &mut run.renderer);
                         run.screen = Screen::Login(Box::new(LoginScreen {
                             login,
@@ -1546,6 +1602,7 @@ impl App {
                             spots: Spots::default(),
                             recall: Default::default(),
                             skin,
+                            popup,
                         }));
                     }
                     (None, Some(err)) => return self.fail(event_loop, err),
@@ -1572,7 +1629,7 @@ impl App {
             if let Some(login) = &conn.login
                 && let Some(store) = self.vault.store()
             {
-                crate::game::remember::settle(&store, login);
+                crate::game::remember::settle(&store, &mut self.ledger, login);
             }
             run.front_end = conn.login;
             let audio = if audio_wanted {
@@ -1657,7 +1714,7 @@ impl App {
             }
             Screen::Connecting(_) | Screen::Login(_) if !draw => None,
             Screen::Login(ls) => {
-                if ls.skin.is_some() {
+                let stars = if ls.skin.is_some() {
                     let phys = cursor.map(|(x, y)| (x * run.scale as f32, y * run.scale as f32));
                     draw_skin_screen(ls, &mut run.renderer, phys)
                 } else {
@@ -1665,7 +1722,19 @@ impl App {
                     let cursor = cursor.map(|at| to_start_scale(at, size, run.scale));
                     draw_start_screen(ls, &mut run.renderer, start_scale(size, run.scale), cursor);
                     None
+                };
+                // The popup is drawn last, over everything.
+                if let Some(popup) = ls.popup.as_mut() {
+                    let c = Canvas::new(
+                        &ls.art,
+                        ls.atlas,
+                        run.renderer.size(),
+                        run.scale,
+                        (0.0, 0.0),
+                    );
+                    popup.draw(&c, &mut run.renderer, cursor);
                 }
+                stars
             }
             Screen::Connecting(conn) => {
                 let c = Canvas::new(

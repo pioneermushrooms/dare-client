@@ -49,6 +49,10 @@ pub enum Answer {
     Send(RegistrationForm),
     /// Do not send the form: leave the zone.
     Disconnect,
+    /// A notice was read: close it.
+    Dismiss,
+    /// A notice's button: open this page in the browser (the notice stays up).
+    OpenLink(&'static str),
 }
 
 /// Which question the box is asking.
@@ -56,6 +60,9 @@ pub enum Answer {
 enum Kind {
     NewAccount,
     Registration,
+    /// A message that has to be read and dismissed: a refused login, or what a
+    /// system prompt is about to ask.
+    Notice,
 }
 
 /// Something in the box a pointer can be over.
@@ -162,6 +169,9 @@ const NEW_USER_QUESTION: &str =
 /// lines.
 const NEW_USER_COLUMNS: usize = 52;
 
+/// How wide a notice is, in characters.
+const NOTICE_COLUMNS: usize = 56;
+
 /// How wide the registration form is, in characters: a label, a field and the
 /// "(required)" after the e-mail.
 const FORM_COLUMNS: usize = 62;
@@ -212,6 +222,8 @@ pub struct Prompt {
     /// The two keys on the foot line, as they are drawn.
     yes: &'static str,
     no: &'static str,
+    /// A notice's button: the page that fixes what it says.
+    link: Option<super::login_help::Link>,
     /// What went wrong with the last answer, in red under the lines.
     pub error: Option<String>,
     /// Where everything was drawn last frame, so a click finds it.
@@ -264,6 +276,25 @@ impl Prompt {
             focus: 0,
             yes: "Enter = Yes",
             no: "Esc = No",
+            link: None,
+            error: None,
+            spots: Vec::new(),
+        }
+    }
+
+    /// A message the player cannot miss: it covers the screen until it is read
+    /// and dismissed (Enter, Esc or a click on OK). With a `link` it has a second
+    /// button, F4, that opens the page which fixes what it says.
+    pub fn notice(title: &'static str, text: &str, link: Option<super::login_help::Link>) -> Self {
+        Self {
+            kind: Kind::Notice,
+            title,
+            columns: NOTICE_COLUMNS,
+            lines: notes(text, NOTICE_COLUMNS - 2, color::WHITE, false),
+            focus: 0,
+            yes: "Enter = OK",
+            no: link.map_or("Esc = Close", |l| l.key),
+            link,
             error: None,
             spots: Vec::new(),
         }
@@ -306,6 +337,7 @@ impl Prompt {
             focus: 0,
             yes: "Enter = Submit Information",
             no: "Esc = Disconnect from server",
+            link: None,
             error: None,
             spots: Vec::new(),
         };
@@ -373,6 +405,16 @@ impl Prompt {
     /// buttons of the Windows message box it copies do.
     pub fn input(&mut self, strokes: &[Stroke], shift: bool) -> Option<Answer> {
         for stroke in strokes {
+            if self.kind == Kind::Notice {
+                match (stroke.first_press(), self.link) {
+                    (Some(KeyCode::F4), Some(link)) => return Some(Answer::OpenLink(link.url)),
+                    (Some(KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Escape), _) => {
+                        return Some(Answer::Dismiss);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             if self.kind == Kind::NewAccount && !stroke.repeat {
                 match stroke.text.map(|c| c.to_ascii_lowercase()) {
                     Some('y') => return self.yes(),
@@ -448,7 +490,10 @@ impl Prompt {
                 None
             }
             Spot::Yes => self.yes(),
-            Spot::No => Some(self.no()),
+            Spot::No => match (self.kind, self.link) {
+                (Kind::Notice, Some(link)) => Some(Answer::OpenLink(link.url)),
+                _ => Some(self.no()),
+            },
         }
     }
 
@@ -456,6 +501,7 @@ impl Prompt {
         match self.kind {
             Kind::NewAccount => Answer::Cancel,
             Kind::Registration => Answer::Disconnect,
+            Kind::Notice => Answer::Dismiss,
         }
     }
 
@@ -464,6 +510,7 @@ impl Prompt {
         match self.kind {
             Kind::NewAccount => Some(Answer::Create),
             Kind::Registration => self.send(),
+            Kind::Notice => Some(Answer::Dismiss),
         }
     }
 
@@ -1101,5 +1148,40 @@ mod tests {
             sex: Some(Sex::Female),
         });
         assert!(!format!("{form:?}").contains("ovelace"));
+    }
+
+    /// A notice has to be read and answered: it shows the words, ignores typing,
+    /// and closes only on Enter or Esc; with a page to open, F4 opens it and the
+    /// notice stays.
+    #[test]
+    fn a_notice_is_dismissed_and_its_button_opens_its_page() {
+        let link = super::super::login_help::Link {
+            url: "https://example.invalid/p",
+            label: "Register",
+            key: "F4 = Register",
+        };
+        let mut p = Prompt::notice("-= Cannot log in =-", "Wrong password.", Some(link));
+        assert!(note_text(&p).contains("Wrong password."));
+        assert_eq!(p.input(&typed("yn q"), false), None, "typing does nothing");
+        assert_eq!(
+            p.input(&keys(&[KeyCode::F4]), false),
+            Some(Answer::OpenLink("https://example.invalid/p"))
+        );
+        assert_eq!(
+            p.input(&keys(&[KeyCode::Enter]), false),
+            Some(Answer::Dismiss)
+        );
+        assert_eq!(
+            p.input(&keys(&[KeyCode::Escape]), false),
+            Some(Answer::Dismiss)
+        );
+
+        // With no page, F4 does nothing and OK is the only way out.
+        let mut p = Prompt::notice("-= Remember password =-", "Text.", None);
+        assert_eq!(p.input(&keys(&[KeyCode::F4]), false), None);
+        assert_eq!(
+            p.input(&keys(&[KeyCode::Enter]), false),
+            Some(Answer::Dismiss)
+        );
     }
 }

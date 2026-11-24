@@ -17,8 +17,18 @@
 //!   deletes any saved one if it is not.
 //! * **Unticking** deletes the saved password at once.
 //!
+//! **The store is only touched for a password the player asked to keep.** Reading
+//! or deleting an entry can make the operating system put up its own prompt (on
+//! a Mac, one asking for the Mac's login password), so the client keeps a short
+//! [`Ledger`] of the accounts it has saved a password for, in a plain file beside
+//! the login file, and asks the store about those and no others. A player who has
+//! never ticked Remember never sees the prompt, and the first time they do, the
+//! screen says what the prompt will be before it appears.
+//!
 //! Log lines name the entry (`pilot@zone:5000`) and never the password.
 
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -102,6 +112,102 @@ impl Vault {
     }
 }
 
+/// Which accounts have a saved password, and whether the player has been told
+/// what the system's prompt will be. Names and zones only, never a password.
+/// Kept in a small text file; without a path it lives for the run only.
+#[derive(Debug, Default)]
+pub struct Ledger {
+    path: Option<PathBuf>,
+    accounts: BTreeSet<String>,
+    notice_seen: bool,
+}
+
+/// The line that records the notice has been shown. An account line always has
+/// an `@`, so the two cannot be mistaken.
+const NOTICE_LINE: &str = "#notice-shown";
+
+impl Ledger {
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let mut l = Ledger {
+            path,
+            ..Ledger::default()
+        };
+        if let Some(text) = l
+            .path
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+        {
+            for line in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                if line == NOTICE_LINE {
+                    l.notice_seen = true;
+                } else if line.contains('@') {
+                    l.accounts.insert(line.to_string());
+                }
+            }
+        }
+        l
+    }
+
+    /// Whether a password was saved for this account (see [`account`]).
+    pub fn has(&self, who: &str) -> bool {
+        self.accounts.contains(who)
+    }
+
+    pub fn add(&mut self, who: &str) {
+        if self.accounts.insert(who.to_string()) {
+            self.write();
+        }
+    }
+
+    pub fn remove(&mut self, who: &str) {
+        if self.accounts.remove(who) {
+            self.write();
+        }
+    }
+
+    /// Whether the player has been told what the system's prompt is.
+    pub fn notice_seen(&self) -> bool {
+        self.notice_seen
+    }
+
+    pub fn mark_notice_seen(&mut self) {
+        if !self.notice_seen {
+            self.notice_seen = true;
+            self.write();
+        }
+    }
+
+    fn write(&self) {
+        let Some(path) = &self.path else { return };
+        let mut text = String::new();
+        if self.notice_seen {
+            text.push_str(NOTICE_LINE);
+            text.push('\n');
+        }
+        for a in &self.accounts {
+            text.push_str(a);
+            text.push('\n');
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(path, text) {
+            log::warn!("couldn't write {}: {e}", path.display());
+        }
+    }
+}
+
+/// What to tell a player before the system asks them anything about the saved
+/// password, or `None` where the store asks nothing worth explaining.
+pub fn keychain_notice() -> Option<&'static str> {
+    cfg!(target_os = "macos").then_some(
+        "Dare keeps your Foundation password in your Mac's Keychain. macOS may now ask \
+         for your Mac login password: that is your Mac's password, not your Foundation \
+         one, and it only lets Dare use the Keychain. Choose \"Always Allow\" so it \
+         does not ask again.",
+    )
+}
+
 /// A job for the store, run off the drawing thread.
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -151,8 +257,22 @@ fn in_background(
     finished
 }
 
+/// Unticking Remember: deletes the saved password, if one was ever saved. A
+/// player who never kept one never has the store touched.
+pub fn forget_if_kept(
+    store: &Arc<dyn PasswordStore>,
+    ledger: &mut Ledger,
+    who: String,
+) -> Option<Receiver<()>> {
+    if !ledger.has(&who) {
+        return None;
+    }
+    ledger.remove(&who);
+    Some(forget(store, who))
+}
+
 /// Deletes the saved password for `who`, as unticking Remember asks.
-pub fn forget(store: &Arc<dyn PasswordStore>, who: String) -> Receiver<()> {
+fn forget(store: &Arc<dyn PasswordStore>, who: String) -> Receiver<()> {
     in_background(store, move |s| match s.forget(&who) {
         Ok(()) => log::info!("forgot the saved password for {who}"),
         Err(e) => log::warn!("couldn't forget the saved password for {who}: {e}"),
@@ -161,13 +281,18 @@ pub fn forget(store: &Arc<dyn PasswordStore>, who: String) -> Receiver<()> {
 
 /// The zone has accepted the login made from `login`: keep the password if
 /// Remember is ticked, and delete any kept one if it is not.
-pub fn settle(store: &Arc<dyn PasswordStore>, login: &Login) -> Option<Receiver<()>> {
+pub fn settle(
+    store: &Arc<dyn PasswordStore>,
+    ledger: &mut Ledger,
+    login: &Login,
+) -> Option<Receiver<()>> {
     if !login.vault_shown() || login.name.trim().is_empty() {
         return None;
     }
     let who = account(&login.name, &login.server);
     if login.remember && !login.password.is_empty() {
         let password = login.password.clone();
+        ledger.add(&who);
         Some(in_background(store, move |s| {
             match s.save(&who, &password) {
                 Ok(()) => log::info!("saved the password for {who}"),
@@ -175,7 +300,7 @@ pub fn settle(store: &Arc<dyn PasswordStore>, login: &Login) -> Option<Receiver<
             }
         }))
     } else {
-        Some(forget(store, who))
+        forget_if_kept(store, ledger, who)
     }
 }
 
@@ -196,7 +321,13 @@ pub struct Recall {
 impl Recall {
     /// One frame's worth: notices a new name or zone, asks once it has stopped
     /// changing, and fills the box when the answer comes.
-    pub fn tick(&mut self, login: &mut Login, store: &Arc<dyn PasswordStore>, now: Instant) {
+    pub fn tick(
+        &mut self,
+        login: &mut Login,
+        store: &Arc<dyn PasswordStore>,
+        ledger: &Ledger,
+        now: Instant,
+    ) {
         let who = (!login.name.trim().is_empty() && login.server.contains(':'))
             .then(|| account(&login.name, &login.server));
 
@@ -242,6 +373,9 @@ impl Recall {
             || self.asked.as_ref() == Some(&who)
             || self.pending.is_some()
             || !login.password.is_empty()
+            // Nothing was ever kept for this account: do not ask the store, which
+            // could put the system's prompt up for nothing.
+            || !ledger.has(&who)
         {
             return;
         }
@@ -282,13 +416,14 @@ mod tests {
         recall: &mut Recall,
         l: &mut Login,
         store: &Arc<dyn PasswordStore>,
+        ledger: &Ledger,
         done: impl Fn(&Login) -> bool,
     ) {
         let start = Instant::now();
         let mut now = start;
         while !done(l) && start.elapsed() < Duration::from_secs(5) {
             now += SETTLE;
-            recall.tick(l, store, now);
+            recall.tick(l, store, ledger, now);
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -312,19 +447,23 @@ mod tests {
         let mem = Arc::new(MemoryStore::default());
         let store: Arc<dyn PasswordStore> = mem.clone();
         let who = account("Pilot", "zone.example:5000");
+        let mut ledger = Ledger::default();
 
         let mut l = form(true);
         l.password = SECRET.into();
         assert!(!l.remember, "unticked to begin with");
-        join(settle(&store, &l));
+        assert!(
+            settle(&store, &mut ledger, &l).is_none(),
+            "nothing was kept, so nothing is deleted"
+        );
         assert_eq!(kept(&mem, &who), None);
 
         l.remember = true;
-        join(settle(&store, &l));
+        join(settle(&store, &mut ledger, &l));
         assert_eq!(kept(&mem, &who).as_deref(), Some(SECRET));
 
         l.remember = false;
-        join(settle(&store, &l));
+        join(settle(&store, &mut ledger, &l));
         assert_eq!(kept(&mem, &who), None);
     }
 
@@ -340,8 +479,11 @@ mod tests {
         l.toggle_remember();
         let asked = l.take_forget().expect("asked to forget");
         assert_eq!(asked, who);
-        join(Some(forget(&store, asked)));
+        let mut ledger = Ledger::default();
+        ledger.add(&who);
+        join(forget_if_kept(&store, &mut ledger, asked));
         assert_eq!(kept(&mem, &who), None);
+        assert!(!ledger.has(&who));
     }
 
     /// A saved password fills an empty box and ticks Remember; it never writes
@@ -352,16 +494,20 @@ mod tests {
         let store: Arc<dyn PasswordStore> = mem.clone();
         mem.save(&account("Pilot", "zone.example:5000"), SECRET)
             .expect("saved");
+        let mut ledger = Ledger::default();
+        ledger.add(&account("Pilot", "zone.example:5000"));
 
         let mut l = form(true);
         let mut recall = Recall::default();
-        tick_until(&mut recall, &mut l, &store, |l| !l.password.is_empty());
+        tick_until(&mut recall, &mut l, &store, &ledger, |l| {
+            !l.password.is_empty()
+        });
         assert_eq!(l.password, SECRET);
         assert!(l.remember);
 
         // The name changes: that password was someone else's.
         l.name = "Another".into();
-        recall.tick(&mut l, &store, Instant::now());
+        recall.tick(&mut l, &store, &ledger, Instant::now());
         assert!(l.password.is_empty());
         assert!(!l.remember);
 
@@ -371,7 +517,7 @@ mod tests {
         let mut recall = Recall::default();
         let start = Instant::now();
         for i in 1..20u32 {
-            recall.tick(&mut l, &store, start + SETTLE * i);
+            recall.tick(&mut l, &store, &ledger, start + SETTLE * i);
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(l.password, "typed");
@@ -395,5 +541,87 @@ mod tests {
         let fields = l.fields();
         let at = fields.iter().position(|f| *f == Field::Remember);
         assert_eq!(at, Some(2), "under the password");
+    }
+
+    /// A store that counts how often it is touched.
+    #[derive(Default)]
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl PasswordStore for Counting {
+        fn save(&self, _: &str, _: &str) -> Result<(), oss_credstore::StoreError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn load(&self, _: &str) -> Result<Option<String>, oss_credstore::StoreError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+        fn forget(&self, _: &str) -> Result<(), oss_credstore::StoreError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A player who never asked to remember a password never has the store
+    /// touched: no read while typing a name, no delete after a login.
+    #[test]
+    fn the_store_is_not_touched_unless_a_password_was_kept() {
+        let counting = Arc::new(Counting::default());
+        let store: Arc<dyn PasswordStore> = counting.clone();
+        let mut ledger = Ledger::default();
+
+        let mut l = form(true);
+        let mut recall = Recall::default();
+        let start = Instant::now();
+        for i in 1..20u32 {
+            recall.tick(&mut l, &store, &ledger, start + SETTLE * i);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        l.password = SECRET.into();
+        assert!(
+            settle(&store, &mut ledger, &l).is_none(),
+            "unticked: no delete"
+        );
+        l.remember = true;
+        l.toggle_remember();
+        let asked = l.take_forget().expect("asked to forget");
+        assert!(forget_if_kept(&store, &mut ledger, asked).is_none());
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Ticked and accepted: now it is touched, once, and remembered as kept.
+        l.remember = true;
+        join(settle(&store, &mut ledger, &l));
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(ledger.has(&account("Pilot", "zone.example:5000")));
+    }
+
+    /// The ledger survives a restart, holds names and never a password, and
+    /// remembers that the notice was shown.
+    #[test]
+    fn the_ledger_round_trips_without_secrets() {
+        let dir = std::env::temp_dir().join(format!("oss-ledger-{}", std::process::id()));
+        let path = dir.join("remembered.txt");
+        let mut a = Ledger::load(Some(path.clone()));
+        assert!(!a.notice_seen());
+        a.add("pilot@zone.example:5000");
+        a.mark_notice_seen();
+        let b = Ledger::load(Some(path.clone()));
+        assert!(b.has("pilot@zone.example:5000"));
+        assert!(b.notice_seen());
+        let text = std::fs::read_to_string(&path).expect("written");
+        assert!(!text.contains(SECRET));
+        let mut b = b;
+        b.remove("pilot@zone.example:5000");
+        assert!(!Ledger::load(Some(path)).has("pilot@zone.example:5000"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_notice_says_whose_password_the_system_asks_for() {
+        if let Some(text) = keychain_notice() {
+            assert!(text.contains("Keychain"));
+            assert!(text.contains("not your Foundation"));
+            assert!(text.contains("Always Allow"));
+        }
     }
 }
