@@ -429,15 +429,23 @@ fn skin_frame(
 
     // "+ CREATE" asked; Enter opens the application, Esc cancels. The answering
     // key does nothing else (Enter is also Play, Esc also Quit).
+    // Any other key or click cancels it and then acts as usual.
     #[cfg(target_arch = "wasm32")]
-    if ui.confirm_create
-        && let Some(yes) = skin_screen::confirm_key(strokes)
-    {
-        ui.confirm_create = false;
-        if yes {
-            crate::web::open_foundation_page(crate::web::FoundationPage::Apply);
+    if ui.confirm_create {
+        use skin_screen::ConfirmStep;
+        match skin_screen::confirm_step(strokes, clicked) {
+            ConfirmStep::Yes => {
+                ui.confirm_create = false;
+                crate::web::open_foundation_page(crate::web::FoundationPage::Apply);
+                return SkinOutcome::default();
+            }
+            ConfirmStep::No => {
+                ui.confirm_create = false;
+                return SkinOutcome::default();
+            }
+            ConfirmStep::Cancel => ui.confirm_create = false,
+            ConfirmStep::Wait => {}
         }
-        return SkinOutcome::default();
     }
 
     let mut actions = std::mem::take(&mut ui.pending);
@@ -664,7 +672,12 @@ fn draw_skin_screen(
         // The skin format's four lines: profile, player name, macro set, key set.
         profile_lines: ["Default", name, third_line, "Default"],
         zones: &browser.zones,
+        // In the browser the highlight is the arena Play will join, or none when
+        // that arena is not listed.
+        #[cfg(not(target_arch = "wasm32"))]
         selected: (!browser.zones.is_empty()).then_some(browser.selected),
+        #[cfg(target_arch = "wasm32")]
+        selected: skin_screen::keep_arena_selection(&login.arena, &browser.zones),
         scroll: ui.scroll,
         ping_graph: ui.ping_graph,
         arena_list: skin_screen::IN_BROWSER,

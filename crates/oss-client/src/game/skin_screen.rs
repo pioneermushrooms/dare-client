@@ -215,7 +215,36 @@ pub fn keep_arena_selection(arena: &str, zones: &[ZoneInfo]) -> Option<usize> {
     } else {
         arena
     };
-    zones.iter().position(|z| z.address == want)
+    // Arena names are case-insensitive on the server.
+    zones
+        .iter()
+        .position(|z| z.address.eq_ignore_ascii_case(want))
+}
+
+/// What this frame does to a pending confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmStep {
+    /// Enter: go ahead.
+    Yes,
+    /// Esc: drop it.
+    No,
+    /// Something else was pressed or clicked: drop it, and let that act.
+    Cancel,
+    /// No input this frame.
+    Wait,
+}
+
+/// A pending confirmation against this frame's keys and click: Enter answers yes,
+/// Esc no, and any other key or a click quietly cancels it, so a later Enter
+/// cannot act on a question the player has moved on from.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn confirm_step(strokes: &[Stroke], clicked: bool) -> ConfirmStep {
+    match confirm_key(strokes) {
+        Some(true) => ConfirmStep::Yes,
+        Some(false) => ConfirmStep::No,
+        None if clicked || strokes.iter().any(|s| !s.repeat) => ConfirmStep::Cancel,
+        None => ConfirmStep::Wait,
+    }
 }
 
 /// The info box's text for a hot spot on this build's start screen.
@@ -398,6 +427,35 @@ mod tests {
         assert_eq!(keep_arena_selection("", &rows), Some(0));
         assert_eq!(keep_arena_selection("gone", &rows), None);
         assert_eq!(keep_arena_selection("duel", &[]), None);
+    }
+
+    #[test]
+    fn arena_selection_ignores_case() {
+        let zone = |n: &str| ZoneInfo {
+            name: n.into(),
+            description: String::new(),
+            address: n.into(),
+            players: 0,
+            ping_ms: None,
+        };
+        let rows = [zone("public"), zone("duel")];
+        assert_eq!(keep_arena_selection("Duel", &rows), Some(1));
+        assert_eq!(keep_arena_selection("Public", &rows), Some(0));
+    }
+
+    #[test]
+    fn any_other_input_cancels_a_pending_confirmation() {
+        assert_eq!(
+            confirm_step(&press(KeyCode::Enter), false),
+            ConfirmStep::Yes
+        );
+        assert_eq!(confirm_step(&press(KeyCode::Escape), true), ConfirmStep::No);
+        assert_eq!(
+            confirm_step(&press(KeyCode::KeyP), false),
+            ConfirmStep::Cancel
+        );
+        assert_eq!(confirm_step(&[], true), ConfirmStep::Cancel);
+        assert_eq!(confirm_step(&[], false), ConfirmStep::Wait);
     }
 
     #[test]
