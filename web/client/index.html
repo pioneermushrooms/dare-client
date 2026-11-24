@@ -44,6 +44,30 @@ h1 em { font-style: normal; color: var(--cyan); }
 .help li + li { margin-top: 6px; }
 .help strong { color: var(--ink); font-weight: 600; }
 footer { color: var(--muted); font-size: .8rem; }
+
+.stage { align-self: center; display: grid; grid-template-columns: minmax(0, 460px) minmax(0, 440px); justify-content: space-between; align-items: center; gap: 32px clamp(24px, 5vw, 72px); }
+.card { width: auto; }
+#zones { display: flex; flex-direction: column; max-height: min(72vh, 620px); background: #08111ee8; border: 1px solid var(--line); border-top-color: #537a92; border-radius: 4px; backdrop-filter: blur(6px); }
+#zones header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 16px 18px 10px; }
+#zones h2 { margin: 0; font: 700 .8rem/1.2 Inter, system-ui, sans-serif; letter-spacing: .16em; color: var(--cyan); }
+#zones .meta { color: var(--muted); font-size: .8rem; }
+#zones label { display: flex; align-items: center; gap: 8px; padding: 0 18px 10px; color: var(--muted); font-size: .85rem; cursor: pointer; }
+#zones input { accent-color: var(--cyan); }
+#zone-list { list-style: none; margin: 0; padding: 0 8px 8px; overflow-y: auto; border-top: 1px solid var(--line); }
+#zone-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 10px; border-bottom: 1px solid #16212f; }
+#zone-list li:last-child { border-bottom: 0; }
+#zone-list .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#zone-list .desc { grid-column: 1; color: var(--muted); font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#zone-list .side { grid-row: 1 / span 2; grid-column: 2; display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+#zone-list .pilots { color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; }
+.tag { font-size: .72rem; font-weight: 700; letter-spacing: .04em; padding: 3px 8px; border-radius: 3px; white-space: nowrap; }
+.tag.desktop { color: var(--muted); border: 1px solid #344762; }
+button.tag.browser { font-family: inherit; cursor: pointer; color: #07131e; background: var(--cyan); border: 1px solid var(--cyan); }
+button.tag.browser:hover:not(:disabled) { background: #b5f4ff; }
+button.tag.browser:disabled { cursor: default; color: var(--cyan); background: transparent; }
+#zone-list li.playable { background: #71e4fa12; border-radius: 3px; }
+#zone-list .note { display: block; padding: 14px 10px; color: var(--muted); font-size: .9rem; }
+@media (max-width: 900px) { .stage { grid-template-columns: minmax(0, 1fr); align-self: start; } #zones { max-height: none; } #zone-list { overflow: visible; } }
 @media (max-width: 600px) { #entry { background-position: center, center, 55% center, center; } }
 @media (prefers-reduced-motion: reduce) { .progress span { transition: none; } }
 </style>
@@ -52,6 +76,7 @@ footer { color: var(--muted); font-size: .8rem; }
 <body>
 <div id="entry">
   <a class="brand" href="/"><span class="logo" aria-hidden="true">◈</span> SUBSPACE FOUNDATION</a>
+  <div class="stage">
   <main class="card">
     <p class="eyebrow">FOUNDATION ZONE · BROWSER CLIENT</p>
     <h1>Enter the<br><em>zone.</em></h1>
@@ -65,6 +90,12 @@ footer { color: var(--muted); font-size: .8rem; }
       <li>Plays in desktop Chrome and Edge.</li>
     </ul>
   </main>
+  <aside id="zones" aria-labelledby="zones-title">
+    <header><h2 id="zones-title">ZONE DIRECTORY</h2><span class="meta" id="zones-meta"></span></header>
+    <label><input type="checkbox" id="browser-only"> Only zones you can play in the browser</label>
+    <ul id="zone-list" aria-live="polite"><li><span class="note">Loading zones…</span></li></ul>
+  </aside>
+  </div>
   <footer>Built with Open SubSpace and SubspaceServer .NET.</footer>
 </div>
 </body>

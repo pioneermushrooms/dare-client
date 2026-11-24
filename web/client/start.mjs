@@ -106,6 +106,87 @@ async function download() {
   return bytes;
 }
 
+// The zone directory: every zone the public directory servers list, by name.
+// Only zones marked `browser` can be joined from this page.
+const zoneList = document.querySelector("#zone-list");
+const zonesMeta = document.querySelector("#zones-meta");
+const browserOnly = document.querySelector("#browser-only");
+const FOUNDATION = { name: "SubSpace Foundation", description: "The shared zone with player-owned arenas.", players: null, browser: true };
+let zones = null;
+let ready = false;
+
+function node(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text != null) element.textContent = text;
+  return element;
+}
+
+function pilots(count) {
+  return count == null ? "" : `${count} ${count === 1 ? "pilot" : "pilots"}`;
+}
+
+function renderZones() {
+  if (!zones) return;
+  const shown = browserOnly.checked ? zones.filter((zone) => zone.browser) : zones;
+  const rows = shown.map((zone) => {
+    const row = node("li", zone.browser ? "playable" : "");
+    row.append(node("span", "name", zone.name), node("span", "desc", zone.description || ""));
+    const side = node("span", "side");
+    if (zone.browser) {
+      const play = node("button", "tag browser", ready ? "Play in browser" : "Browser · loading");
+      play.type = "button";
+      play.disabled = !ready;
+      play.setAttribute("aria-label", `Play ${zone.name} in the browser`);
+      play.addEventListener("click", () => button.click());
+      side.append(play);
+    } else {
+      side.append(node("span", "tag desktop", "Desktop client"));
+    }
+    side.append(node("span", "pilots", pilots(zone.players)));
+    row.append(side);
+    return row;
+  });
+  if (rows.length === 0) {
+    const empty = node("li");
+    empty.append(node("span", "note", "No zones to show."));
+    rows.push(empty);
+  }
+  zoneList.replaceChildren(...rows);
+}
+
+async function loadZones() {
+  try {
+    const response = await fetch("/arena/api/zones", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error();
+    const data = await response.json();
+    zones = (data.zones ?? []).map((zone) => ({
+      name: String(zone.name ?? ""),
+      description: String(zone.description ?? ""),
+      players: Number.isFinite(zone.players) ? zone.players : null,
+      browser: zone.browser === true,
+    }));
+    // The server fills its list a moment after its first request; ask again shortly.
+    if (zones.length === 0 && data.at == null) {
+      zonesMeta.textContent = "Asking the directory servers…";
+      setTimeout(loadZones, 3000);
+    } else {
+      const playable = zones.filter((zone) => zone.browser).length;
+      zonesMeta.textContent = `${zones.length} ${zones.length === 1 ? "zone" : "zones"} · ${playable} in browser`;
+    }
+  } catch {
+    zones = [];
+    zonesMeta.textContent = "Directory unavailable";
+  }
+  // Foundation is always playable here, listed or not.
+  if (!zones.some((zone) => zone.browser)) zones = [FOUNDATION, ...zones];
+  renderZones();
+}
+
+browserOnly.addEventListener("change", renderZones);
+void loadZones();
+setInterval(() => { if (!entry.hidden) void loadZones(); }, 60000);
+
 function enter() {
   try {
     entry.hidden = true;
@@ -134,6 +215,8 @@ try {
   progress.hidden = true;
   say("Ready.");
   button.disabled = false;
+  ready = true;
+  renderZones();
   button.focus();
   button.addEventListener("click", enter, { once: true });
 } catch (error) {
