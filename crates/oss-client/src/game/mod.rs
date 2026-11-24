@@ -9,6 +9,7 @@ pub mod flags;
 pub mod hud;
 pub mod input;
 pub mod login;
+pub mod login_help;
 pub mod lvz;
 pub mod online;
 pub mod palette;

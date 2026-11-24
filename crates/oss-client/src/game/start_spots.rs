@@ -64,6 +64,8 @@ pub enum Spot {
     RefreshZones,
     /// The offline sandbox, which is ours and has no skin name either.
     Sandbox,
+    /// The button a refusal offers: opens the page that fixes it.
+    ErrorLink,
 }
 
 impl Spot {
@@ -88,6 +90,7 @@ impl Spot {
             Spot::Options => "Settings: keys, sound, display.",
             Spot::RefreshZones => "Ask the directory servers again.",
             Spot::Sandbox => "Fly offline, with no zone.",
+            Spot::ErrorLink => "Open the page in your browser. (F4)",
         }
     }
 }

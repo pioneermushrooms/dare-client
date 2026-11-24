@@ -126,6 +126,8 @@ pub struct Online {
     pub status: String,
     /// Set when the session failed or closed.
     pub error: Option<String>,
+    /// A page that helps with `error`, offered on the login screen.
+    pub error_link: Option<super::login_help::Link>,
     /// The zone does not know the name and offers to create it: the name, and
     /// anything the zone said with the offer. The connection is still open,
     /// waiting for [`Online::create_account`] or a disconnect. Held here rather
@@ -275,6 +277,7 @@ impl Online {
             seeds: None,
             status: format!("Connecting to {}...", opts.server),
             error: None,
+            error_link: None,
             new_account: None,
             registration: false,
             freq: opts.freq,
@@ -320,6 +323,7 @@ impl Online {
                 secs % 60
             ),
             error: None,
+            error_link: None,
             new_account: None,
             registration: false,
             freq: None,
@@ -451,9 +455,15 @@ impl Online {
                     // they say why and for how long, which a code cannot. Ours
                     // would only talk over them -- "busy" beside "try again in a
                     // few hours" -- so they are shown alone.
-                    self.error = Some(match zone_text {
-                        Some(text) => format!("The zone refused the login: {text}"),
-                        None => message.to_string(),
+                    // The Foundation zone gives each refusal its own code, so it can be
+                    // told plainly, with the page that fixes it; any other zone keeps
+                    // the generic wording and no links.
+                    let plain = super::login_help::explain(&self.server, *code);
+                    self.error_link = plain.and_then(|(_, link)| link);
+                    self.error = Some(match (zone_text, plain) {
+                        (Some(text), _) => format!("The zone refused the login: {text}"),
+                        (None, Some((text, _))) => text.to_string(),
+                        (None, None) => message.to_string(),
                     });
                 }
                 SessionEvent::MapNeeded { name, .. } => {

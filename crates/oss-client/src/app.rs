@@ -1250,6 +1250,12 @@ impl App {
                 self.input.take_strokes()
             };
             self.input.take_edges();
+            // F4 opens the page a refusal points to, on either start-up screen.
+            if strokes.iter().any(|s| s.first_press() == Some(KeyCode::F4))
+                && let Some(link) = ls.login.link()
+            {
+                crate::game::login_help::open_in_browser(link.url);
+            }
             let mut open_options = None;
             let mut next_skin = false;
             let choice = if let Some(ui) = ls.skin.as_deref_mut() {
@@ -1331,8 +1337,14 @@ impl App {
                         | Some(Spot::Quit)
                         | Some(Spot::Options)
                         | Some(Spot::Sandbox)
+                        | Some(Spot::ErrorLink)
                         | None => {}
                     }
+                }
+                if pointed == Some(Spot::ErrorLink)
+                    && let Some(link) = ls.login.link()
+                {
+                    crate::game::login_help::open_in_browser(link.url);
                 }
                 match pointed {
                     // The four that are choices rather than changes go through the
@@ -1502,6 +1514,7 @@ impl App {
                 give_up = Some("Cancelled".to_string());
             }
             let failed = conn.net.error.clone();
+            let failed_link = conn.net.error_link;
             if give_up.is_some() || failed.is_some() {
                 // Say so to the zone. Dropping the session sends nothing, and a
                 // zone holding a login open for an answer would otherwise wait
@@ -1520,6 +1533,8 @@ impl App {
                 match (login, failed) {
                     (Some(mut login), err) => {
                         login.error = err.or(give_up);
+                        login.error_link =
+                            failed_link.zip(login.error.clone()).map(|(l, t)| (t, l));
                         let skin = load_skin_ui(&self.options, &self.dir, &mut run.renderer);
                         run.screen = Screen::Login(Box::new(LoginScreen {
                             login,
@@ -2129,13 +2144,19 @@ fn draw_start_screen(
     // and `options` are visible buttons on its own start-up screen; ours were a
     // line of footer text, which is why the options could be in the client for a
     // week without the person who asked for them finding them.
-    let lines: [&[(&str, Option<Spot>)]; 2] = [
-        &[
-            ("Enter = Play", Some(Spot::Play)),
-            ("Tab/arrows = Move", None),
-            ("F2/Cmd-O = Options", Some(Spot::Options)),
-        ],
-        &[
+    let link_label = login.link().map(|l| format!("F4 = {}", l.label));
+    let mut first: Vec<(&str, Option<Spot>)> = vec![
+        ("Enter = Play", Some(Spot::Play)),
+        ("Tab/arrows = Move", None),
+        ("F2/Cmd-O = Options", Some(Spot::Options)),
+    ];
+    // The page a refusal points to, as a button beside the others.
+    if let Some(label) = &link_label {
+        first.push((label, Some(Spot::ErrorLink)));
+    }
+    let lines: [Vec<(&str, Option<Spot>)>; 2] = [
+        first,
+        vec![
             ("F3/Cmd-R = Zone Refresh", Some(Spot::RefreshZones)),
             ("F5/Cmd-S = Sandbox", Some(Spot::Sandbox)),
             ("Esc = Quit", Some(Spot::Quit)),

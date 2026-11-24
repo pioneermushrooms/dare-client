@@ -109,6 +109,9 @@ pub struct Login {
     pub focus: usize,
     /// Shown under the form (a failed connection, a missing field).
     pub error: Option<String>,
+    /// A page that fixes one particular `error` text (see [`super::login_help`]),
+    /// kept with that text so that a later, unrelated error never offers it.
+    pub error_link: Option<(String, super::login_help::Link)>,
     /// "Remember password" is ticked. Unticked to begin with: remembering a
     /// password is the player's choice.
     pub remember: bool,
@@ -187,6 +190,7 @@ impl Default for Login {
             ship: SPECTATOR,
             focus: 0,
             error: None,
+            error_link: None,
             remember: false,
             vault: false,
             forget: None,
@@ -211,6 +215,14 @@ impl Default for Login {
 }
 
 impl Login {
+    /// The page that helps with the error on screen, if there is one.
+    pub fn link(&self) -> Option<super::login_help::Link> {
+        match (&self.error, &self.error_link) {
+            (Some(shown), Some((text, link))) if shown == text => Some(*link),
+            _ => None,
+        }
+    }
+
     /// The form filled from `login.ini` (if any), a name from the settings, and
     /// whatever the command line asked for.
     pub fn load(path: Option<&Path>, name: Option<&str>, base: Box<ServerOptions>) -> Login {
@@ -1126,5 +1138,25 @@ mod tests {
         );
         assert!(back.password.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The page a refusal points to belongs to that refusal's text alone: a later
+    /// message (a blank name, say) must not offer the old button.
+    #[test]
+    fn a_refusal_link_goes_with_its_own_error_only() {
+        use crate::game::login_help::Link;
+        let link = Link {
+            url: "https://example.invalid/x",
+            label: "Go",
+        };
+        let mut l = Login::default();
+        assert_eq!(l.link(), None);
+        l.error = Some("Wrong password.".into());
+        l.error_link = Some(("Wrong password.".into(), link));
+        assert_eq!(l.link(), Some(link));
+        l.error = Some("Enter a name".into());
+        assert_eq!(l.link(), None);
+        l.error = None;
+        assert_eq!(l.link(), None);
     }
 }
