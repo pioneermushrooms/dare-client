@@ -500,7 +500,7 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
                 .iter()
                 .find(|sh| sh.id == pid as u16 && sh.is_alive())
                 .map(|sh| {
-                    let (x, y) = lerp_pos(sh.prev_pos, sh.pos, alpha);
+                    let (x, y) = lerp_pos(sh.prev_drawn(), sh.drawn(), alpha);
                     let radius = world.settings.ships[sh.kind as usize % 8].radius_pixels();
                     (x, y, sh.direction(), radius)
                 })
@@ -544,7 +544,7 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
         if cloaked && !is_me && !xradar {
             continue;
         }
-        let (x, y) = lerp_pos(ship.prev_pos, ship.pos, alpha);
+        let (x, y) = lerp_pos(ship.prev_drawn(), ship.drawn(), alpha);
         let dir = lerp_direction(ship.prev_rotation, ship.rotation, alpha);
         let alpha_tint = if cloaked { 0.35 } else { 1.0 };
         let region = a.ship(ship.kind, dir);

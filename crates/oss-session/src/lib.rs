@@ -437,6 +437,13 @@ pub enum SessionEvent {
     PlayerEntered(i16),
     PlayerLeft(i16),
     PlayerMoved(i16),
+    /// A weapon arrived in an update older than the player's latest position (a late
+    /// or reordered packet). The shot still happened; the position is stale, so it
+    /// fires from `at` without moving the ship.
+    PlayerFired {
+        pid: i16,
+        at: RemotePosition,
+    },
     ShipChanged {
         pid: i16,
         ship: u8,
@@ -1311,7 +1318,7 @@ impl Session {
                         status: p.status,
                         bounty: p.bounty as u16,
                         energy,
-                        server_ticks: extend_ticks(now_ticks, p.time),
+                        server_ticks: report_ticks(now_ticks, p.time, p.c2s_latency),
                         weapon: None,
                     },
                 );
@@ -1330,7 +1337,7 @@ impl Session {
                         status: w.status,
                         bounty: w.bounty,
                         energy: None,
-                        server_ticks: extend_ticks(now_ticks, w.time),
+                        server_ticks: report_ticks(now_ticks, w.time, w.c2s_latency),
                         weapon: (w.weapon.kind() != 0).then_some(w.weapon),
                     },
                 );
@@ -1444,10 +1451,14 @@ impl Session {
 
     fn update_position(&mut self, pid: i16, pos: RemotePosition) {
         if let Some(p) = self.players.get_mut(&pid) {
-            // Drop out-of-order updates.
+            // Out-of-order updates don't move the ship, but a shot in one still counts.
             if let Some(old) = p.position
                 && (pos.server_ticks.wrapping_sub(old.server_ticks) as i32) < 0
             {
+                if pos.weapon.is_some() {
+                    self.events
+                        .push_back(SessionEvent::PlayerFired { pid, at: pos });
+                }
                 return;
             }
             p.position = Some(pos);
@@ -1856,7 +1867,15 @@ impl Session {
 
     /// Sends your position (also used to fire weapons: set `pos.weapon`).
     pub fn send_position(&mut self, now_ms: u64, pos: &OwnPosition) {
-        let mut time = self.server_ticks(now_ms);
+        self.send_position_at(now_ms, now_ms, pos);
+    }
+
+    /// Sends your position as it was at `state_ms` (session time, at most `now_ms`):
+    /// the moment the simulation tick that produced `pos` stands for. A frame that
+    /// runs several ticks at once reports each from its own moment, so a shot fired
+    /// early in the frame is not stamped as if it left later.
+    pub fn send_position_at(&mut self, now_ms: u64, state_ms: u64, pos: &OwnPosition) {
+        let mut time = self.server_ticks(state_ms.min(now_ms));
         // The server drops updates that aren't newer than the last one.
         if let Some(last) = self.last_position_ticks
             && (time.wrapping_sub(last) as i32) <= 0
@@ -2000,6 +2019,13 @@ impl Session {
     pub fn set_freq(&mut self, freq: i16) {
         self.send(&SetFreq { freq }, true);
     }
+}
+
+/// When a forwarded position was true, in full server ticks. The server stamps 0x28
+/// and 0x05 with the tick it *received* the update and carries the sender's
+/// upstream latency separately, so the state itself is that much older.
+fn report_ticks(now: u32, time: u16, c2s_latency: u8) -> u32 {
+    extend_ticks(now, time).wrapping_sub(c2s_latency as u32)
 }
 
 /// Extends a 16-bit server timestamp to the full tick count nearest `now`.
@@ -2226,6 +2252,62 @@ mod tests {
         assert_eq!(s.ms_since_data(1_500), 500);
         s.handle_datagram(1_600, &[0, 0]);
         assert_eq!(s.ms_since_data(1_650), 50);
+    }
+
+    #[test]
+    fn a_report_is_as_old_as_its_senders_latency() {
+        // Received by the server at tick 0x1_2345, 12 ticks after the sender sent it.
+        assert_eq!(report_ticks(0x1_2350, 0x2345, 12), 0x1_2345 - 12);
+        // Across the 16-bit wrap.
+        assert_eq!(report_ticks(0x2_0003, 0x0002, 5), 0x1_FFFD);
+    }
+
+    #[test]
+    fn a_late_shot_still_fires_without_moving_the_ship() {
+        let mut s = Session::new(SessionConfig::default(), 0, 1);
+        s.players.insert(
+            9,
+            Player {
+                pid: 9,
+                name: "other".into(),
+                squad: String::new(),
+                ship: 0,
+                freq: 1,
+                kill_points: 0,
+                flag_points: 0,
+                wins: 0,
+                losses: 0,
+                flags: 0,
+                position: None,
+            },
+        );
+        let at = |ticks, x, weapon| RemotePosition {
+            x,
+            y: 8000,
+            server_ticks: ticks,
+            weapon,
+            ..Default::default()
+        };
+        s.update_position(9, at(200, 8100, None));
+        // Older than the update above, carrying a bullet.
+        let gun = Some(WeaponInfo(1));
+        s.update_position(9, at(190, 8000, gun));
+        s.update_position(9, at(180, 7900, None));
+        let events: Vec<_> = std::iter::from_fn(|| s.poll_event()).collect();
+        assert_eq!(
+            events,
+            vec![
+                SessionEvent::PlayerMoved(9),
+                SessionEvent::PlayerFired {
+                    pid: 9,
+                    at: at(190, 8000, gun)
+                },
+            ]
+        );
+        assert_eq!(
+            s.player(9).and_then(|p| p.position).map(|p| p.x),
+            Some(8100)
+        );
     }
 
     #[test]

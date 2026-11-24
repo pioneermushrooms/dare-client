@@ -40,6 +40,26 @@ mod menu;
 const TICK: Duration = Duration::from_millis(10);
 /// Most sim ticks run per frame before we give up catching up (e.g. after a stall).
 const MAX_TICKS_PER_FRAME: u32 = 25;
+
+/// Closest gap between two updates sent because your controls changed (20 ms).
+const MOTION_SEND_GAP: u32 = 2;
+
+/// What other clients can't predict between updates: whether you thrust (and which
+/// way), burn afterburners, or turn. Between updates every client carries your ship
+/// on at its last velocity, so a change here is exactly where they go wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Motion {
+    thrust: i8,
+    afterburner: bool,
+    turn: i8,
+}
+
+/// The session time a simulated state stands for: the world runs in fixed ticks that
+/// a frame catches up all at once, so the newest tick is `behind` real time (the
+/// time still in the accumulator) and anything reported from it is that much older.
+fn state_ms(now_ms: u64, behind: Duration) -> u64 {
+    now_ms.saturating_sub(behind.as_millis() as u64)
+}
 /// Spectator camera speed, pixels per second.
 const SPEC_SPEED: f32 = 1200.0;
 
@@ -150,6 +170,12 @@ pub struct Sandbox {
     pub(super) radar_line: String,
     /// World tick of the last clock correction (online).
     slew_tick: u32,
+    /// Your motion (thrust, afterburner, turn) as last reported to the server, and
+    /// the tick of the last report sent because it changed.
+    sent_motion: Option<Motion>,
+    motion_sent_tick: u32,
+    /// Online: how well other ships are being tracked (logged every 10 s).
+    tracking: super::tracking::Tracking,
     brick_count: usize,
     last: Instant,
     acc: Duration,
@@ -419,6 +445,9 @@ impl Sandbox {
             screen_refs: [(0.0, 0.0); 12],
             radar_line: String::new(),
             slew_tick: 0,
+            sent_motion: None,
+            motion_sent_tick: 0,
+            tracking: Default::default(),
             brick_count: 0,
             last: Instant::now(),
             acc: Duration::ZERO,
@@ -496,7 +525,7 @@ impl Sandbox {
     fn camera(&self, alpha: f32) -> (f32, f32) {
         if self.spectating {
             if let Some(ship) = self.followed() {
-                return view::lerp_pos(ship.prev_pos, ship.pos, alpha);
+                return view::lerp_pos(ship.prev_drawn(), ship.drawn(), alpha);
             }
             return self.spec_cam;
         }
@@ -853,6 +882,7 @@ impl Sandbox {
             self.step_balls();
             self.handle_events(&events);
             self.report(&events);
+            self.report_motion_change(ship_input);
             self.spawn_exhaust();
             let bricks = self.world.bricks().count();
             if bricks != self.brick_count {
@@ -867,6 +897,11 @@ impl Sandbox {
             }
         }
         self.send_position_if_due();
+        if self.net.as_ref().is_some_and(|n| !n.is_replay())
+            && let Some(line) = self.tracking.summary(self.world.tick)
+        {
+            log::info!("{line}");
+        }
         self.check_flags();
         if self.world.tick / 100 != (self.world.tick.wrapping_sub(ticks)) / 100 {
             let me = self.me();
@@ -1434,9 +1469,38 @@ impl Sandbox {
                         }
                         continue;
                     }
-                    self.world.set_remote_state(i, &remote_state(&pos), age);
+                    let st = remote_state(&pos);
+                    if let Some(c) = self.world.set_remote_state(i, &st, age) {
+                        log::debug!(
+                            "track {pid}: age {age} predicted off {:.1} px, drawn off {:.1} px{}",
+                            c.predicted_px,
+                            c.shown_px,
+                            if c.snapped { ", jumped" } else { "" }
+                        );
+                        self.tracking.record(&c);
+                    }
                     if let Some(w) = pos.weapon.and_then(remote_weapon) {
-                        self.world.fire_remote(i, w, &mut sim_events);
+                        self.world.fire_remote(i, &st, w, age, &mut sim_events);
+                    }
+                }
+                SessionEvent::PlayerFired { pid, at } => {
+                    // A late shot: fire it from where and when it left, leave the ship be.
+                    let Some(i) = self
+                        .world
+                        .ship_index(pid as u16)
+                        .filter(|_| pid as u16 != self.me_id)
+                        .filter(|&i| self.world.ships[i].is_alive())
+                    else {
+                        continue;
+                    };
+                    if at.x < 0 || at.y < 0 {
+                        continue;
+                    }
+                    let age = now_ticks.wrapping_sub(at.server_ticks);
+                    let age = if (age as i32) < 0 { 0 } else { age };
+                    if let Some(w) = at.weapon.and_then(remote_weapon) {
+                        self.world
+                            .fire_remote(i, &remote_state(&at), w, age, &mut sim_events);
                     }
                 }
                 SessionEvent::Kill {
@@ -2223,15 +2287,68 @@ impl Sandbox {
         }
     }
 
+    /// Sends an extra position update the tick your motion changes (start or stop
+    /// thrusting, afterburners, turning), on top of the regular timed ones, so every
+    /// other client corrects its prediction of your ship at once instead of up to
+    /// `SendPositionDelay` later. At most one per [`MOTION_SEND_GAP`]; a change inside
+    /// the gap goes out when it ends, if it still stands.
+    fn report_motion_change(&mut self, input: ShipInput) {
+        if self.spectating {
+            return;
+        }
+        let Some(i) = self.world.ship_index(self.me_id) else {
+            return;
+        };
+        let ship = &self.world.ships[i];
+        if !ship.is_alive() {
+            self.sent_motion = None;
+            return;
+        }
+        let motion = Motion {
+            thrust: ship.thrusting,
+            afterburner: ship.afterburning,
+            turn: i8::from(input.right) - i8::from(input.left),
+        };
+        let Some(sent) = self.sent_motion else {
+            // First tick alive: the regular update covers it.
+            self.sent_motion = Some(motion);
+            return;
+        };
+        if motion == sent || self.world.tick.wrapping_sub(self.motion_sent_tick) < MOTION_SEND_GAP {
+            return;
+        }
+        let behind = self.acc.saturating_sub(TICK);
+        let Some(net) = self.net.as_mut().filter(|n| !n.is_replay()) else {
+            return;
+        };
+        if net.session.state() != oss_session::State::Playing {
+            return;
+        }
+        let now = net.now_ms();
+        // A regular update is going out at the end of this frame anyway, with this
+        // change in it.
+        if !net.session.position_due(now) {
+            net.session
+                .send_position_at(now, state_ms(now, behind), &own_position(ship, None));
+        }
+        self.sent_motion = Some(motion);
+        self.motion_sent_tick = self.world.tick;
+    }
+
     /// Reports what your ship did this tick (weapons, death) to the server.
     fn report(&mut self, events: &[Event]) {
+        // Called inside the tick loop before this tick's TICK leaves the accumulator,
+        // so the time still unsimulated after this tick is `acc - TICK`.
+        let behind = self.acc.saturating_sub(TICK);
         let Some(net) = self.net.as_mut() else { return };
         let i = self.world.ship_index(self.me_id).unwrap_or(0);
         let me = &self.world.ships[i];
         let now = net.now_ms();
+        let at = state_ms(now, behind);
         for e in events {
             if let Some(w) = weapon_for(e, me) {
-                net.session.send_position(now, &own_position(me, Some(w)));
+                net.session
+                    .send_position_at(now, at, &own_position(me, Some(w)));
             }
             if let Event::GreenTaken { ship, x, y, prize } = e
                 && *ship == self.me_id
@@ -2265,11 +2382,15 @@ impl Sandbox {
             return;
         }
         let i = self.me_index();
+        let behind = self.acc;
         let Some(net) = self.net.as_mut() else { return };
         let now = net.now_ms();
         if net.session.position_due(now) {
-            net.session
-                .send_position(now, &own_position(&self.world.ships[i], None));
+            net.session.send_position_at(
+                now,
+                state_ms(now, behind),
+                &own_position(&self.world.ships[i], None),
+            );
         }
     }
 
