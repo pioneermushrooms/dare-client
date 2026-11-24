@@ -335,6 +335,7 @@ pub enum FrameError {
 }
 
 impl Renderer {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(window: Arc<Window>, vsync: bool) -> Result<Self, String> {
         pollster::block_on(Self::new_async(window, vsync))
     }

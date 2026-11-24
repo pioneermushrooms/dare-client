@@ -51,3 +51,19 @@ Serve `index.html`, `probe.mjs`, `transport.mjs`, and `pkg/` over HTTPS. The
 probe expects `https://subspacefoundation.com:4443/play/transport`. The current
 loopback-only gateway and its test certificate are suitable for on-host checks,
 and a browser on another host needs a reachable endpoint and trusted certificate.
+
+## Build the shared Dare client
+
+Run `web/build-client.sh <output-directory>` with the same `oss-core` revision,
+Rust WASM target, and wasm-bindgen CLI listed above. The output uses Dare's
+winit input, shared renderer, asset decoders, bundled skins, and audio mixer.
+Serve only that output at `/play/`; `web/index.html` is the older test probe.
+The browser client uses the Foundation gateway on UDP 4443. Leave the arena
+field empty on the Dare login screen to join the public arena.
+
+`web/install-foundation.sh <output-directory>` is an initial installer for the
+Foundation host. It expects the staged Python gateway, the IP on a local
+interface, and the current Foundation TLS certificate in Caddy's storage.
+The public listener uses the host IP, leaving the separate loopback listener
+available for testing. UDP 4443 must be permitted by the host and provider
+firewalls. Restart the public gateway when Caddy renews its TLS certificate.

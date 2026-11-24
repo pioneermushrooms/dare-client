@@ -453,9 +453,25 @@ fn skin_frame(
     out
 }
 
+fn read_skin(entry: &SkinEntry) -> Result<std::borrow::Cow<'static, [u8]>, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::fs::read(&entry.path).map(Into::into).map_err(|error| error.to_string())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let bytes: &'static [u8] = match entry.name.as_str() {
+            "Dare" => include_bytes!("../../../assets/skins/Dare.skn"),
+            "Dare Night" => include_bytes!("../../../assets/skins/Dare Night.skn"),
+            _ => return Err(format!("Skin {} unavailable", entry.name)),
+        };
+        Ok(bytes.into())
+    }
+}
+
 /// Shows `e` in place of the current skin.
 fn switch_skin(ui: &mut SkinUi, e: &SkinEntry, r: &mut Renderer) -> Result<(), String> {
-    let bytes = std::fs::read(&e.path).map_err(|err| err.to_string())?;
+    let bytes = read_skin(e)?;
     let skin = crate::game::skin::load_skin(&e.name, &bytes).map_err(|err| err.to_string())?;
     for w in &skin.layout.warnings {
         log::warn!("skin {}: {w}", e.name);
@@ -560,6 +576,7 @@ fn draw_skin_screen(
 }
 
 /// The folders skins are looked for in.
+#[cfg(not(target_arch = "wasm32"))]
 fn skin_folders(options: &Options, dir: &AssetDirs) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = dir
         .roots()
@@ -589,12 +606,20 @@ fn skin_folders(options: &Options, dir: &AssetDirs) -> Vec<PathBuf> {
 
 /// Loads the chosen skin (falling back to Dare, then to any that loads).
 fn load_skin_ui(options: &Options, dir: &AssetDirs, r: &mut Renderer) -> Option<Box<SkinUi>> {
+    #[cfg(not(target_arch = "wasm32"))]
     let entries = crate::game::skin::find_skins(&skin_folders(options, dir));
+    #[cfg(target_arch = "wasm32")]
+    let entries = {
+        let _ = dir;
+        ["Dare", "Dare Night"].into_iter().map(|name| SkinEntry {
+            name: name.into(),
+            path: PathBuf::from(format!("{name}.skn")),
+        }).collect::<Vec<_>>()
+    };
     let first = crate::game::skin::pick(&entries, &options.saved.skin)?.clone();
     let order = std::iter::once(&first).chain(entries.iter().filter(|e| e.path != first.path));
     for e in order {
-        match std::fs::read(&e.path)
-            .map_err(|err| err.to_string())
+        match read_skin(e)
             .and_then(|b| crate::game::skin::load_skin(&e.name, &b).map_err(|err| err.to_string()))
         {
             Ok(skin) => {
@@ -649,7 +674,16 @@ struct Running {
     front_end: Option<Login>,
 }
 
+enum AppEvent {
+    #[cfg(target_arch = "wasm32")]
+    GraphicsReady(Arc<Window>, Result<Renderer, String>),
+}
+
 struct App {
+    #[cfg(target_arch = "wasm32")]
+    proxy: winit::event_loop::EventLoopProxy<AppEvent>,
+    #[cfg(target_arch = "wasm32")]
+    initializing_graphics: bool,
     options: Options,
     dir: AssetDirs,
     level: Vec<u8>,
@@ -716,7 +750,7 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         Mode::Zone(_) | Mode::Login(_) | Mode::Replay(_) => Vec::new(),
     };
 
-    let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build().map_err(|e| e.to_string())?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let gilrs = match gilrs::Gilrs::new() {
         Ok(g) => Some(g),
@@ -727,7 +761,11 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
     };
     let mut input = InputState::new(options.bindings.clone());
     input.set_pad_bindings(options.pad.clone());
-    let mut app = App {
+    let app = App {
+        #[cfg(target_arch = "wasm32")]
+        proxy: event_loop.create_proxy(),
+        #[cfg(target_arch = "wasm32")]
+        initializing_graphics: false,
         options,
         dir,
         level,
@@ -740,12 +778,25 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         pointed: 0,
         clicked: false,
         cursor: None,
+        #[cfg(not(target_arch = "wasm32"))]
         vault: crate::game::remember::Vault::probe(),
+        #[cfg(target_arch = "wasm32")]
+        vault: crate::game::remember::Vault::None,
     };
-    event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
-    match app.error {
-        Some(e) => Err(e),
-        None => Ok(()),
+    #[cfg(target_arch = "wasm32")]
+    {
+        use winit::platform::web::EventLoopExtWebSys;
+        event_loop.spawn_app(app);
+        Ok(())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut app = app;
+        event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
+        match app.error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -831,8 +882,12 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_arch = "wasm32")]
+        if self.initializing_graphics {
+            return;
+        }
         if self.running.is_some() {
             return;
         }
@@ -848,122 +903,37 @@ impl ApplicationHandler for App {
         if self.options.fullscreen {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            use winit::platform::web::WindowAttributesExtWebSys;
+            attrs = attrs.with_append(true).with_prevent_default(true);
+        }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => return self.fail(event_loop, format!("window: {e}")),
         };
-        let mut renderer = match Renderer::new(window.clone(), self.options.vsync) {
-            Ok(r) => r,
-            Err(e) => return self.fail(event_loop, format!("graphics: {e}")),
-        };
-        let scale = wanted_scale(self.options.scale, window.scale_factor());
-        let screen = match &self.options.mode {
-            Mode::Sandbox { ship, .. } => {
-                match Sandbox::new(
-                    &mut renderer,
-                    &self.dir,
-                    &self.level,
-                    *ship,
-                    scale,
-                    self.audio(),
-                ) {
-                    Ok(mut s) => {
-                        s.aim_bot = self.options.autopilot;
-                        s.scripted = self.options.send.clone();
-                        s.open_settings = self.options.open_settings;
-                        s.open_screen(self.options.open_screen);
-                        for path in &self.options.lvz {
-                            match oss_assets::locate::read_file(path) {
-                                Ok(data) => s.load_lvz(&path.display().to_string(), &data),
-                                Err(e) => log::warn!("{e}"),
-                            }
-                        }
-                        s.macros = self.options.macros.clone();
-                        s.palette = self.options.palette;
-                        s.ui_scale_extra = self.options.ui_scale;
-                        Screen::Game(Box::new(s))
-                    }
-                    Err(e) => return self.fail(event_loop, e),
-                }
-            }
-            Mode::Zone(z) => {
-                let mut z = (**z).clone();
-                apply_settings(&self.options, &mut z);
-                let z = &z;
-                let size = window.inner_size();
-                let res = ((size.width / scale) as u16, (size.height / scale) as u16);
-                let net = match Online::connect(z, res, &self.options.supplied) {
-                    Ok(n) => n,
-                    Err(e) => return self.fail(event_loop, e),
-                };
-                let (art, atlas) = match load_art(&self.dir, &mut renderer) {
-                    Ok(a) => a,
-                    Err(e) => return self.fail(event_loop, e),
-                };
-                Screen::Connecting(Box::new(Connecting {
-                    net,
-                    art,
-                    atlas,
-                    login: None,
-                    prompt: None,
-                }))
-            }
-            Mode::Replay(path) => {
-                let net = match Online::open_replay(path) {
-                    Ok(n) => n,
-                    Err(e) => return self.fail(event_loop, e),
-                };
-                let (art, atlas) = match load_art(&self.dir, &mut renderer) {
-                    Ok(a) => a,
-                    Err(e) => return self.fail(event_loop, e),
-                };
-                Screen::Connecting(Box::new(Connecting {
-                    net,
-                    art,
-                    atlas,
-                    login: None,
-                    prompt: None,
-                }))
-            }
-            Mode::Login(z) => {
-                let (art, atlas) = match load_art(&self.dir, &mut renderer) {
-                    Ok(a) => a,
-                    Err(e) => return self.fail(event_loop, e),
-                };
-                let mut login = Login::load(
-                    self.options.login_file.as_deref(),
-                    self.options.player_name.as_deref(),
-                    z.clone(),
-                );
-                if self.options.open_zones {
-                    login.focus_zones();
-                }
-                let skin = load_skin_ui(&self.options, &self.dir, &mut renderer);
-                if matches!(self.options.open_screen, Some(StartScreen::Profile)) {
-                    login.open_profile();
-                }
-                Screen::Login(Box::new(LoginScreen {
-                    login,
-                    art,
-                    atlas,
-                    browser: crate::game::zones::ZoneBrowser::open(&self.options.directories),
-                    spots: Spots::default(),
-                    recall: Default::default(),
-                    skin,
-                }))
-            }
-        };
-        window.request_redraw();
-        self.running = Some(Running {
-            window,
-            renderer,
-            screen,
-            front_end: None,
-            scale,
-            started: web_time::Instant::now(),
-            captured: false,
-            occluded: false,
-        });
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.initializing_graphics = true;
+            let proxy = self.proxy.clone();
+            let vsync = self.options.vsync;
+            wasm_bindgen_futures::spawn_local(async move {
+                let renderer = Renderer::new_async(window.clone(), vsync).await;
+                let _ = proxy.send_event(AppEvent::GraphicsReady(window, renderer));
+            });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let renderer = Renderer::new(window.clone(), self.options.vsync);
+            self.finish_resume(event_loop, window, renderer);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        let AppEvent::GraphicsReady(window, renderer) = event;
+        self.initializing_graphics = false;
+        self.finish_resume(event_loop, window, renderer);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1134,6 +1104,126 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn finish_resume(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window: Arc<Window>,
+        renderer: Result<Renderer, String>,
+    ) {
+        let mut renderer = match renderer {
+            Ok(renderer) => renderer,
+            Err(error) => return self.fail(event_loop, format!("graphics: {error}")),
+        };
+        let scale = wanted_scale(self.options.scale, window.scale_factor());
+        let screen = match &self.options.mode {
+            Mode::Sandbox { ship, .. } => {
+                match Sandbox::new(
+                    &mut renderer,
+                    &self.dir,
+                    &self.level,
+                    *ship,
+                    scale,
+                    self.audio(),
+                ) {
+                    Ok(mut s) => {
+                        s.aim_bot = self.options.autopilot;
+                        s.scripted = self.options.send.clone();
+                        s.open_settings = self.options.open_settings;
+                        s.open_screen(self.options.open_screen);
+                        for path in &self.options.lvz {
+                            match oss_assets::locate::read_file(path) {
+                                Ok(data) => s.load_lvz(&path.display().to_string(), &data),
+                                Err(e) => log::warn!("{e}"),
+                            }
+                        }
+                        s.macros = self.options.macros.clone();
+                        s.palette = self.options.palette;
+                        s.ui_scale_extra = self.options.ui_scale;
+                        Screen::Game(Box::new(s))
+                    }
+                    Err(e) => return self.fail(event_loop, e),
+                }
+            }
+            Mode::Zone(z) => {
+                let mut z = (**z).clone();
+                apply_settings(&self.options, &mut z);
+                let z = &z;
+                let size = window.inner_size();
+                let res = ((size.width / scale) as u16, (size.height / scale) as u16);
+                let net = match Online::connect(z, res, &self.options.supplied) {
+                    Ok(n) => n,
+                    Err(e) => return self.fail(event_loop, e),
+                };
+                let (art, atlas) = match load_art(&self.dir, &mut renderer) {
+                    Ok(a) => a,
+                    Err(e) => return self.fail(event_loop, e),
+                };
+                Screen::Connecting(Box::new(Connecting {
+                    net,
+                    art,
+                    atlas,
+                    login: None,
+                    prompt: None,
+                }))
+            }
+            Mode::Replay(path) => {
+                let net = match Online::open_replay(path) {
+                    Ok(n) => n,
+                    Err(e) => return self.fail(event_loop, e),
+                };
+                let (art, atlas) = match load_art(&self.dir, &mut renderer) {
+                    Ok(a) => a,
+                    Err(e) => return self.fail(event_loop, e),
+                };
+                Screen::Connecting(Box::new(Connecting {
+                    net,
+                    art,
+                    atlas,
+                    login: None,
+                    prompt: None,
+                }))
+            }
+            Mode::Login(z) => {
+                let (art, atlas) = match load_art(&self.dir, &mut renderer) {
+                    Ok(a) => a,
+                    Err(e) => return self.fail(event_loop, e),
+                };
+                let mut login = Login::load(
+                    self.options.login_file.as_deref(),
+                    self.options.player_name.as_deref(),
+                    z.clone(),
+                );
+                if self.options.open_zones {
+                    login.focus_zones();
+                }
+                let skin = load_skin_ui(&self.options, &self.dir, &mut renderer);
+                if matches!(self.options.open_screen, Some(StartScreen::Profile)) {
+                    login.open_profile();
+                }
+                Screen::Login(Box::new(LoginScreen {
+                    login,
+                    art,
+                    atlas,
+                    browser: crate::game::zones::ZoneBrowser::open(&self.options.directories),
+                    spots: Spots::default(),
+                    recall: Default::default(),
+                    skin,
+                }))
+            }
+        };
+        window.request_redraw();
+        self.running = Some(Running {
+            window,
+            renderer,
+            screen,
+            front_end: None,
+            scale,
+            started: web_time::Instant::now(),
+            captured: false,
+            occluded: false,
+        });
+    }
+
     /// One frame: input, network, simulation and (when `draw`) rendering.
     fn frame(&mut self, event_loop: &ActiveEventLoop, draw: bool) {
         let frame_at = web_time::Instant::now();
@@ -1567,6 +1657,7 @@ impl App {
             };
             match Sandbox::new_online(&mut run.renderer, &self.dir, conn.net, run.scale, audio) {
                 Ok(mut s) => {
+                    log::info!("entered arena and initialized game view");
                     s.aim_bot = self.options.autopilot;
                     s.scripted = self.options.send.clone();
                     s.open_screen(self.options.open_screen);
