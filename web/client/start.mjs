@@ -2,11 +2,15 @@
 // the pilot in (only if the site doesn't know them yet), gets a one-time game pass and
 // starts straight in the chosen arena. The page markup is the site's (/); this module is
 // served from /play/ and finds its parts by id.
-import init, { start_dare_in } from "./pkg/oss_client.js";
-import { connectZone } from "./transport.mjs";
+// The page loads this module as start.mjs?v=<version>; the same version goes on every file
+// it fetches, so a browser holding an older copy of any of them can't mix the two.
+const version = new URL(import.meta.url).searchParams.get("v") ?? "";
+const here = (path) => new URL(version ? `${path}?v=${encodeURIComponent(version)}` : path, import.meta.url);
+const { default: init, start_dare_in } = await import(here("pkg/oss_client.js"));
+const { connectZone } = await import(here("transport.mjs"));
 
-const WASM = new URL("pkg/oss_client_bg.wasm", import.meta.url);
-const BUILD = new URL("build.json", import.meta.url);
+const WASM = here("pkg/oss_client_bg.wasm");
+const BUILD = here("build.json");
 const ARENA_KEY = "foundation.arena";
 const HEADERS = { "Content-Type": "application/json", "X-Requested-With": "dare-arena" };
 
@@ -245,10 +249,13 @@ async function expectedSize() {
 }
 
 let percent = 0;
+// While the game downloads, the button says how far along it is (it can still be pressed).
 function progress(value) {
   percent = value;
   button.style.setProperty("--p", `${value}%`);
-  if (waiting) say(`Loading the game… ${value}%`);
+  button.classList.toggle("downloading", value < 100);
+  label.textContent = value < 100 ? `Loading ${value}%` : "Play";
+  if (waiting) say(`Starting as soon as the game has loaded… ${value}%`);
 }
 
 async function download() {
@@ -293,7 +300,7 @@ async function play() {
     if (percent < 100) {
       waiting = true;
       button.classList.add("loading");
-      say(`Loading the game… ${percent}%`);
+      say(`Starting as soon as the game has loaded… ${percent}%`);
       await gameReady;
       waiting = false;
     }
@@ -347,6 +354,7 @@ if (missing) {
   say(missing, true);
 } else {
   button.disabled = false;
+  progress(0);
   button.addEventListener("click", play);
   gameReady = (async () => {
     const bytes = await download();
