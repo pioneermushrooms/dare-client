@@ -392,7 +392,7 @@ async function play() {
       pass = await gamePass();
       if (!pass) throw new Error("Couldn't sign you in. Try again.");
     }
-    enter(pass.name, pass.pass, picker.value);
+    enter(pass.name, pass.pass, picker.value, pass.settings ?? "");
   } catch (error) {
     say(error?.message ?? String(error), true);
   } finally {
@@ -400,7 +400,7 @@ async function play() {
   }
 }
 
-function enter(name, pass, arena) {
+function enter(name, pass, arena, settings) {
   try {
     entry.hidden = true;
     document.body.classList.add("playing");
@@ -413,7 +413,7 @@ function enter(name, pass, arena) {
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
-    game.start_dare_in(name, pass, arena);
+    game.start_dare_in(name, pass, arena, settings);
   } catch (error) {
     entry.hidden = false;
     document.body.classList.remove("playing");

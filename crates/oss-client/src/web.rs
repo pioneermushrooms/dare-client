@@ -154,9 +154,16 @@ pub fn start_dare() -> Result<(), JsValue> {
 /// Starts the game straight in the Foundation zone, signed in as `name`, without the
 /// start-up screen: the page has already signed the pilot in, and `password` is what
 /// it was given to log in with. `arena` is the arena to enter, or empty for any
-/// public one. Leaving the zone opens the start-up screen as usual.
+/// public one. `settings` is the pilot's own keys and macros, as the `[keys]` and
+/// `[macros]` sections of the settings file (empty for the defaults); other
+/// sections in it are ignored. Leaving the zone goes back to the page.
 #[wasm_bindgen]
-pub fn start_dare_in(name: &str, password: &str, arena: &str) -> Result<(), JsValue> {
+pub fn start_dare_in(
+    name: &str,
+    password: &str,
+    arena: &str,
+    settings: &str,
+) -> Result<(), JsValue> {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
     }
@@ -184,6 +191,14 @@ pub fn start_dare_in(name: &str, password: &str, arena: &str) -> Result<(), JsVa
         .map_err(|error| JsValue::from_str(&error))?
         .ok_or_else(|| JsValue::from_str("Dare client options unavailable"))?;
     options.directories.clear();
+    if !settings.trim().is_empty() {
+        let (pilot, warnings) = crate::config::Config::parse(settings);
+        for warning in warnings {
+            log::warn!("pilot settings: {warning}");
+        }
+        options.bindings = pilot.bindings;
+        options.macros = pilot.macros;
+    }
     STARTED_FROM_PAGE.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::run(options).map_err(|error| JsValue::from_str(&error))
 }
