@@ -1,19 +1,36 @@
-//! `oss-bot`: a headless SubSpace client for tests and load swarms.
+//! `oss-bot`: a headless SubSpace client for tests, load swarms and arena bots.
 //!
 //! Connects (VIE), logs in, enters an arena, takes the settings and map (cached),
-//! answers security checks, and either sits in spectator mode or flies a simulated ship
-//! around, sending positions (and optionally firing). Many bots can run in one process.
+//! answers security checks, and either sits in spectator mode or flies a simulated
+//! ship. A flying bot keeps every other ship and every shot in the arena in its
+//! simulation, as the game does, so it is hit, dies and comes back like a player.
+//! Many bots can run in one process; a scripted bot (see `script`) flies one of
+//! the behaviours in `brain` and talks (`talk`).
+
+mod brain;
+mod nav;
+mod script;
+mod talk;
 
 use oss_session::security::{Identities, SecurityMode, client_handshake, fingerprint};
+use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use oss_proto::ClientSettings;
 use oss_session::map::{MapCache, default_cache_dir};
-use oss_session::sim::{arena_world, own_position, weapon_for};
+use oss_session::sim::{arena_world, own_position, remote_state, remote_weapon, weapon_for};
 use oss_session::udp::UdpDriver;
 use oss_session::{SPECTATOR, Session, SessionConfig, SessionEvent, State, chat_type};
 use oss_sim::fixed::Rng;
-use oss_sim::{ShipInput, World};
+use oss_sim::{Event, Pos, ShipInput, ShipState, VEL_SCALE, World, toggle};
+
+use brain::{Brain, Contact, View};
+use nav::Nav;
+use script::Script;
+use talk::Talk;
 
 const USAGE: &str = "\
 Usage: oss-bot --server <host:port> [options]
@@ -26,6 +43,11 @@ Options:
   --ship <1-8|spec>      Ship to fly (default spec)
   --count <n>            Run n bots (default 1)
   --fly                  Fly around (needs a ship): thrust, turn and shoot at random
+  --script <file|->      Run one scripted bot: name, ship, behaviour (idle, patrol,
+                         sentry, fighter) and chat, read from the file, or from
+                         standard input with -. With -, the bot leaves the zone
+                         when its standard input closes. Its settings override
+                         the options above; the README has the format
   --chat <text>          Say this in public chat once in the arena; :name:text
                          sends it privately to that player once they're here
   --new-user             Create the name when the zone offers to (it does not
@@ -59,6 +81,8 @@ struct Options {
     security: SecurityMode,
     identity: Option<PathBuf>,
     new_user: bool,
+    /// `-` for standard input.
+    script: Option<String>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
@@ -77,6 +101,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
         security: SecurityMode::Vie,
         identity: None,
         new_user: false,
+        script: None,
     };
     while let Some(a) = args.next() {
         let mut value = |n: &str| args.next().ok_or_else(|| format!("{n} needs a value"));
@@ -107,6 +132,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
                     .ok_or("--count must be 1-1000")?
             }
             "--fly" => o.fly = true,
+            "--script" => o.script = Some(value("--script")?),
             "--security" => {
                 o.security = SecurityMode::from_name(&value("--security")?)
                     .ok_or("--security must be vie, opensec, auto or none")?
@@ -127,10 +153,84 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
     if o.server.is_empty() {
         return Err("--server is required".into());
     }
+    if o.script.is_some() && o.count != 1 {
+        return Err("--script runs one bot; leave out --count".into());
+    }
     Ok(Some(o))
 }
 
-/// One bot: a session, its socket, and (when flying) a simulation of its ship.
+/// Reads a script from `source` (`-` for standard input, up to its `end` line).
+fn read_script(source: &str) -> Result<Script, String> {
+    let text = if source == "-" {
+        let mut text = String::new();
+        for line in std::io::stdin().lock().lines() {
+            let line = line.map_err(|e| format!("standard input: {e}"))?;
+            if line.trim() == "end" {
+                break;
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
+    } else {
+        std::fs::read_to_string(source).map_err(|e| format!("{source}: {e}"))?
+    };
+    script::parse(&text)
+}
+
+/// Sets `stop` once standard input reaches its end: the program that started the
+/// bot closed it, or went away.
+fn watch_stdin(stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        let mut input = std::io::stdin().lock();
+        while matches!(input.read_line(&mut sink), Ok(n) if n > 0) {
+            sink.clear();
+        }
+        stop.store(true, Ordering::Relaxed);
+    });
+}
+
+/// The square ships of `freq` spawn in: an arena spawn spot, or the edge of the
+/// team's half or quarter on a team radar, as the game picks it.
+fn spawn_area(cs: &ClientSettings, freq: u16) -> Option<((i32, i32), i32)> {
+    let set: Vec<_> = cs
+        .spawns
+        .iter()
+        .filter(|s| s.x() != 0 || s.y() != 0 || s.radius() != 0)
+        .collect();
+    if !set.is_empty() {
+        let sp = set[freq as usize % set.len()];
+        let middle = |v: u16| if v == 0 { 512 } else { v as i32 };
+        return Some(((middle(sp.x()), middle(sp.y())), sp.radius() as i32));
+    }
+    let side = |bit: u16| (bit & 1) as i32 * 0x300 + 0x80;
+    match cs.radar_mode() {
+        1 | 3 => Some(((side(freq), 0x180), 0x80)),
+        2 | 4 => Some(((side(freq), side(freq / 2)), 0x80)),
+        _ => None,
+    }
+}
+
+/// Pixels, from the simulation's position units.
+fn px(p: Pos) -> (f32, f32) {
+    p.to_f32()
+}
+
+/// Pixels per second, from the simulation's velocity units.
+fn per_second(v: oss_sim::Vel) -> (f32, f32) {
+    let k = VEL_SCALE as f32 * 10.0;
+    (v.x as f32 / k, v.y as f32 / k)
+}
+
+/// Whether `name` ends in `suffix`, ignoring case.
+fn ends_with(name: &str, suffix: &str) -> bool {
+    name.len() >= suffix.len()
+        && name.is_char_boundary(name.len() - suffix.len())
+        && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+}
+
+/// One bot: a session, its socket, and (when flying) a simulation of the arena.
 struct Bot {
     label: String,
     session: Session,
@@ -138,7 +238,20 @@ struct Bot {
     loud: bool,
     map: Option<Vec<u8>>,
     green_seed: u32,
+    doors: Option<(u32, u32)>,
+    /// The ship and freq it wants, and whether it already asked for the freq.
+    ship: u8,
+    freq: Option<i16>,
+    freq_asked: bool,
+    /// Fly at random (`--fly`) when there is no brain.
+    fly: bool,
     world: Option<World>,
+    nav: Option<Nav>,
+    me: u16,
+    brain: Option<Brain>,
+    talk: Option<Talk>,
+    /// Names ending in this belong to other bots: not greeted, answered or fought.
+    peer_suffix: Option<String>,
     rng: Rng,
     chatted: bool,
     last_step_ms: u64,
@@ -151,7 +264,23 @@ impl Bot {
         }
     }
 
-    fn handle_events(&mut self, opts: &Options, cache: &MapCache) {
+    fn name_of(&self, pid: i16) -> String {
+        self.session
+            .player(pid)
+            .map(|p| p.name.clone())
+            .unwrap_or_default()
+    }
+
+    fn is_peer(&self, name: &str) -> bool {
+        self.peer_suffix
+            .as_deref()
+            .is_some_and(|s| ends_with(name, s))
+    }
+
+    fn handle_events(&mut self, cache: &MapCache) {
+        let now = self.driver.now_ms();
+        let now_ticks = self.session.server_ticks(now);
+        let mut sim_events = Vec::new();
         while let Some(ev) = self.session.poll_event() {
             match ev {
                 SessionEvent::Connected => {
@@ -181,6 +310,8 @@ impl Bot {
                 }
                 SessionEvent::LoggedIn => self.log("logged in"),
                 SessionEvent::EnteredArena { pid } => {
+                    self.me = pid as u16;
+                    self.world = None;
                     self.log(format_args!("entering arena as pid {pid}"))
                 }
                 SessionEvent::MapNeeded { name, checksum } => {
@@ -204,52 +335,184 @@ impl Bot {
                     }
                     self.log(format_args!("map {name} ready ({} bytes)", data.len()));
                     self.map = Some(data);
+                    self.nav = None;
                 }
-                SessionEvent::Seeds { green_seed, .. } => self.green_seed = green_seed,
+                SessionEvent::Seeds {
+                    green_seed,
+                    door_seed,
+                    timestamp,
+                } => {
+                    self.green_seed = green_seed;
+                    self.doors = Some((door_seed, timestamp));
+                    if let Some(w) = self.world.as_mut() {
+                        w.sync_doors(door_seed, timestamp);
+                    }
+                }
                 SessionEvent::Playing => {
                     let n = self.session.players().count();
                     self.log(format_args!("in the arena with {n} player(s)"));
+                    self.enter_world(now);
+                    let present: Vec<String> = self
+                        .session
+                        .players()
+                        .filter(|p| p.pid as u16 != self.me)
+                        .map(|p| p.name.clone())
+                        .collect();
+                    for name in present {
+                        self.greet(&name, now);
+                    }
                     // Servers start you as a spectator; ask for the ship.
                     let current = self.session.me().map(|p| p.ship).unwrap_or(SPECTATOR);
-                    if opts.ship != SPECTATOR && current != opts.ship {
-                        self.session.set_ship(opts.ship);
-                    } else if opts.fly && opts.ship != SPECTATOR {
-                        self.start_flying(opts.ship);
+                    if self.ship != SPECTATOR && current != self.ship {
+                        self.session.set_ship(self.ship);
                     }
+                    self.ask_freq();
                 }
                 SessionEvent::PlayerEntered(pid) => {
-                    if let Some(p) = self.session.player(pid) {
-                        self.log(format_args!(
-                            "{} entered (ship {}, freq {})",
-                            p.name,
-                            p.ship + 1,
-                            p.freq
-                        ));
+                    let Some(p) = self.session.player(pid).cloned() else {
+                        continue;
+                    };
+                    self.log(format_args!(
+                        "{} entered (ship {}, freq {})",
+                        p.name,
+                        p.ship + 1,
+                        p.freq
+                    ));
+                    if pid as u16 != self.me {
+                        if let Some(w) = self.world.as_mut()
+                            && p.ship != SPECTATOR
+                        {
+                            w.add_remote_ship(pid as u16, p.ship, p.freq as u16);
+                        }
+                        self.greet(&p.name, now);
                     }
                 }
-                SessionEvent::PlayerLeft(pid) => self.log(format_args!("pid {pid} left")),
-                SessionEvent::ShipChanged { pid, ship, freq }
-                    if Some(pid) == self.session.pid() =>
-                {
-                    self.log(format_args!("now in ship {} on freq {freq}", ship + 1));
-                    if opts.fly && ship != SPECTATOR && self.world.is_none() {
-                        self.start_flying(ship);
+                SessionEvent::PlayerLeft(pid) => {
+                    self.log(format_args!("pid {pid} left"));
+                    if let Some(w) = self.world.as_mut()
+                        && pid as u16 != self.me
+                    {
+                        w.remove_ship(pid as u16);
+                    }
+                }
+                SessionEvent::ShipChanged { pid, ship, freq } => {
+                    if pid as u16 == self.me {
+                        self.log(format_args!("now in ship {} on freq {freq}", ship + 1));
+                        self.place_own_ship(ship, freq as u16);
+                        self.ask_freq();
+                    } else if let Some(w) = self.world.as_mut() {
+                        w.remove_ship(pid as u16);
+                        if ship != SPECTATOR {
+                            w.add_remote_ship(pid as u16, ship, freq as u16);
+                        }
+                    }
+                }
+                SessionEvent::FreqChanged { pid, freq } => {
+                    if pid as u16 == self.me {
+                        self.log(format_args!("now on freq {freq}"));
+                        let ship = self.session.me().map(|p| p.ship).unwrap_or(SPECTATOR);
+                        self.place_own_ship(ship, freq as u16);
+                    } else if let Some(w) = self.world.as_mut()
+                        && let Some(i) = w.ship_index(pid as u16)
+                    {
+                        w.ships[i].freq = freq as u16;
+                    }
+                }
+                SessionEvent::PlayerMoved(pid) if pid as u16 != self.me => {
+                    let Some(pos) = self.session.player(pid).and_then(|p| p.position) else {
+                        continue;
+                    };
+                    let Some(w) = self.world.as_mut() else {
+                        continue;
+                    };
+                    let Some(i) = w.ship_index(pid as u16) else {
+                        continue;
+                    };
+                    if pos.x < 0 || pos.y < 0 {
+                        // (-1, -1): dead or not yet spawned.
+                        if w.ships[i].is_alive() {
+                            w.ships[i].state = ShipState::Dead {
+                                respawn_tick: w.tick,
+                            };
+                        }
+                        continue;
+                    }
+                    let age = now_ticks.wrapping_sub(pos.server_ticks);
+                    let age = if (age as i32) < 0 { 0 } else { age };
+                    w.set_remote_state(i, &remote_state(&pos), age);
+                }
+                SessionEvent::PlayerFired { pid, at } if pid as u16 != self.me => {
+                    let Some(w) = self.world.as_mut() else {
+                        continue;
+                    };
+                    let Some(i) = w.ship_index(pid as u16).filter(|&i| w.ships[i].is_alive())
+                    else {
+                        continue;
+                    };
+                    if at.x < 0 || at.y < 0 {
+                        continue;
+                    }
+                    let age = now_ticks.wrapping_sub(at.server_ticks);
+                    let age = if (age as i32) < 0 { 0 } else { age };
+                    if let Some(weapon) = at.weapon.and_then(remote_weapon) {
+                        w.fire_remote(i, &remote_state(&at), weapon, age, &mut sim_events);
                     }
                 }
                 SessionEvent::Chat {
-                    kind, name, text, ..
+                    kind,
+                    pid,
+                    name,
+                    text,
+                    ..
                 } => {
-                    let who = name.unwrap_or_default();
+                    let who = name.clone().unwrap_or_else(|| self.name_of(pid));
                     self.log(format_args!("chat({kind}) {who}> {text}"));
+                    let asked = kind == chat_type::PUBLIC || kind == chat_type::PRIVATE;
+                    if asked
+                        && pid >= 0
+                        && pid as u16 != self.me
+                        && !self.is_peer(&who)
+                        && let Some(t) = self.talk.as_mut()
+                    {
+                        t.heard(pid, kind == chat_type::PRIVATE, &text, now);
+                    }
                 }
                 SessionEvent::Kill { killer, killed, .. } => {
-                    self.log(format_args!("{killer} killed {killed}"))
+                    let (kn, dn) = (self.name_of(killer), self.name_of(killed));
+                    self.log(format_args!("{dn} killed by {kn}"));
+                    // Your own death is your own simulation's to decide.
+                    if killed as u16 != self.me
+                        && let Some(w) = self.world.as_mut()
+                    {
+                        w.kill_ship(killed as u16, killer as u16, &mut sim_events);
+                    }
                 }
                 SessionEvent::ShipReset => {
                     if let Some(w) = self.world.as_mut()
-                        && !w.ships.is_empty()
+                        && let Some(i) = w.ship_index(self.me)
+                        && !w.ships[i].remote
+                        && w.ships[i].is_alive()
                     {
-                        w.respawn(0);
+                        w.respawn(i);
+                    }
+                }
+                SessionEvent::WarpTo { x, y } => {
+                    if let Some(w) = self.world.as_mut()
+                        && let Some(i) = w.ship_index(self.me)
+                    {
+                        let ship = &mut w.ships[i];
+                        ship.pos = Pos::from_pixels(x as i32 * 16 + 8, y as i32 * 16 + 8);
+                        ship.prev_pos = ship.pos;
+                        ship.vel = Default::default();
+                    }
+                }
+                SessionEvent::PrizeReceived { count, prize } => {
+                    if let Some(w) = self.world.as_mut()
+                        && let Some(i) = w.ship_index(self.me)
+                    {
+                        for _ in 0..count.clamp(0, 100) {
+                            w.apply_prize(i, prize as i32, &mut sim_events);
+                        }
                     }
                 }
                 SessionEvent::Closed(reason) => {
@@ -267,49 +530,242 @@ impl Bot {
         }
     }
 
-    fn start_flying(&mut self, ship: u8) {
+    fn greet(&mut self, name: &str, now: u64) {
+        if name.is_empty() || self.is_peer(name) {
+            return;
+        }
+        if let Some(t) = self.talk.as_mut() {
+            t.arrived(name, now);
+        }
+    }
+
+    /// Asks for the bot's own freq once it is in a ship.
+    fn ask_freq(&mut self) {
+        let Some(want) = self.freq else { return };
+        let Some(me) = self.session.me() else { return };
+        if self.freq_asked || me.ship == SPECTATOR || me.freq == want {
+            return;
+        }
+        self.freq_asked = true;
+        self.session.set_freq(want);
+    }
+
+    /// Builds the arena's simulation: its map, settings and the ships in it.
+    fn enter_world(&mut self, now: u64) {
         let (Some(map), Some(settings)) = (self.map.as_ref(), self.session.settings()) else {
             return;
         };
         let (mut world, _) = arena_world(map, settings, self.green_seed);
-        world.prize_seed = self.green_seed;
-        let pid = self.session.pid().unwrap_or(0) as u16;
-        let freq = self.session.me().map(|p| p.freq).unwrap_or(0) as u16;
-        world.add_ship(pid, ship, freq);
+        world.set_tick(self.session.server_ticks(now));
+        world.player_count = Some(self.session.players().count() as u32);
+        if let Some((seed, at)) = self.doors {
+            world.sync_doors(seed, at);
+        }
+        for p in self.session.players() {
+            if p.pid as u16 != self.me && p.ship != SPECTATOR {
+                world.add_remote_ship(p.pid as u16, p.ship, p.freq as u16);
+            }
+        }
         self.world = Some(world);
+        self.last_step_ms = now;
+        let (ship, freq) = self
+            .session
+            .me()
+            .map(|p| (p.ship, p.freq as u16))
+            .unwrap_or((SPECTATOR, 0));
+        self.place_own_ship(ship, freq);
     }
 
-    /// Advances the simulated ship to `now` and sends positions/weapons.
+    /// Puts the bot's own ship in the simulation (or takes it out, for spectator
+    /// mode), at a spawn point of its freq.
+    fn place_own_ship(&mut self, ship: u8, freq: u16) {
+        let area = self.session.settings().and_then(|cs| spawn_area(cs, freq));
+        let Some(w) = self.world.as_mut() else { return };
+        w.remove_ship(self.me);
+        if ship == SPECTATOR {
+            return;
+        }
+        (w.spawn_center, w.spawn_radius) = area.unwrap_or((
+            (512, 512),
+            w.settings.warp_radius_limit.clamp(3, 512) as i32,
+        ));
+        w.add_ship(self.me, ship, freq);
+        if self.brain.is_some() && self.nav.is_none() {
+            let radius = w.settings.ships[ship as usize % 8].radius_pixels();
+            self.nav = Some(Nav::new(&w.map, radius));
+        }
+        if let Some(b) = self.brain.as_mut() {
+            b.respawned();
+        }
+    }
+
+    /// Advances the simulation to `now`, flying the bot's ship, and reports what
+    /// it did (shots, death, prizes) to the zone.
     fn fly(&mut self, now: u64) {
         let Some(world) = self.world.as_mut() else {
             return;
         };
-        let mut fired = None;
+        let peers: Vec<u16> = match self.peer_suffix.as_deref() {
+            Some(sfx) => self
+                .session
+                .players()
+                .filter(|p| ends_with(&p.name, sfx))
+                .map(|p| p.pid as u16)
+                .collect(),
+            None => Vec::new(),
+        };
+        let (mut enemies, mut shots) = (Vec::new(), Vec::new());
+        let mut fired = false;
+        // Far behind (the machine was asleep, say): skip ahead rather than racing.
+        if now.saturating_sub(self.last_step_ms) > 2000 {
+            self.last_step_ms = now - 10;
+        }
         while self.last_step_ms + 10 <= now {
             self.last_step_ms += 10;
-            // Random walk: mostly thrust, turn in bursts, shoot now and then.
-            let r = self.rng.next_u32();
-            let t = world.tick;
-            let input = ShipInput {
-                forward: t % 400 < 300,
-                left: (t / 150) % 3 == 0,
-                right: (t / 150) % 3 == 1,
-                gun: r.is_multiple_of(40),
-                bomb: r % 600 == 1,
-                afterburner: t % 1000 < 100,
-                ..Default::default()
+            let me = world
+                .ship_index(self.me)
+                .filter(|&i| !world.ships[i].remote);
+            let input = match me {
+                Some(i) if world.ships[i].is_alive() => {
+                    if let (Some(brain), Some(nav)) = (self.brain.as_mut(), self.nav.as_mut()) {
+                        let v = view(world, i, &peers, &mut enemies, &mut shots);
+                        brain.think(&v, nav)
+                    } else if self.fly {
+                        random_walk(world.tick, self.rng.next_u32())
+                    } else {
+                        ShipInput::default()
+                    }
+                }
+                _ => ShipInput::default(),
             };
-            for ev in world.step(&[input]) {
-                if fired.is_none() {
-                    fired = weapon_for(&ev, &world.ships[0]);
+            let mut inputs = vec![ShipInput::default(); world.ships.len()];
+            if let Some(i) = me {
+                inputs[i] = input;
+            }
+            for ev in world.step(&inputs) {
+                let Some(i) = me.and_then(|_| world.ship_index(self.me)) else {
+                    continue;
+                };
+                let ship = &world.ships[i];
+                if let Some(w) = weapon_for(&ev, ship) {
+                    // Each shot goes out at once, from where it was fired.
+                    self.session
+                        .send_position(now, &own_position(ship, Some(w)));
+                    fired = true;
+                }
+                match ev {
+                    Event::ShipKilled {
+                        ship: id, killer, ..
+                    } if id == self.me => {
+                        let bounty = ship.bounty.min(u16::MAX as u32) as u16;
+                        self.session.send_death(killer as i16, bounty);
+                        if self.loud {
+                            log::info!("[{}] shot down", self.label);
+                        }
+                    }
+                    Event::Respawned { ship: id } if id == self.me => {
+                        if let Some(b) = self.brain.as_mut() {
+                            b.respawned();
+                        }
+                    }
+                    Event::GreenTaken {
+                        ship: id,
+                        x,
+                        y,
+                        prize,
+                    } if id == self.me => {
+                        self.session.send_take_green(now, x, y, prize);
+                    }
+                    _ => {}
                 }
             }
         }
-        let ship = &world.ships[0];
-        if fired.is_some() || self.session.position_due(now) {
-            let pos = own_position(ship, fired);
+        let Some(i) = world
+            .ship_index(self.me)
+            .filter(|&i| !world.ships[i].remote)
+        else {
+            return;
+        };
+        if !fired && self.session.position_due(now) {
+            let pos = own_position(&world.ships[i], None);
             self.session.send_position(now, &pos);
         }
+    }
+
+    fn own_ship_flying(&self) -> bool {
+        self.world
+            .as_ref()
+            .and_then(|w| w.ship_index(self.me).map(|i| !w.ships[i].remote))
+            .unwrap_or(false)
+    }
+}
+
+/// `--fly`: mostly thrust, turn in bursts, shoot now and then.
+fn random_walk(t: u32, r: u32) -> ShipInput {
+    ShipInput {
+        forward: t % 400 < 300,
+        left: (t / 150).is_multiple_of(3),
+        right: (t / 150) % 3 == 1,
+        gun: r.is_multiple_of(40),
+        bomb: r % 600 == 1,
+        afterburner: t % 1000 < 100,
+        ..Default::default()
+    }
+}
+
+/// What the brain sees this tick: the bot's ship `me`, the ships it may fight
+/// (alive, on another freq, out of safe zones, not one of `peers`) and the shots
+/// coming from other freqs.
+fn view<'a>(
+    world: &World,
+    me: usize,
+    peers: &[u16],
+    enemies: &'a mut Vec<Contact>,
+    shots: &'a mut Vec<Contact>,
+) -> View<'a> {
+    let ship = &world.ships[me];
+    let s = &world.settings.ships[ship.kind as usize % 8];
+    enemies.clear();
+    enemies.extend(
+        world
+            .ships
+            .iter()
+            .filter(|o| {
+                o.id != ship.id
+                    && o.is_alive()
+                    && o.freq != ship.freq
+                    && o.toggles & toggle::SAFETY == 0
+                    && !peers.contains(&o.id)
+            })
+            .map(|o| Contact {
+                pos: px(o.pos),
+                vel: per_second(o.vel),
+            }),
+    );
+    shots.clear();
+    shots.extend(
+        world
+            .projectiles
+            .iter()
+            .filter(|p| p.freq != ship.freq)
+            .map(|p| Contact {
+                pos: px(p.pos),
+                vel: per_second(p.vel),
+            }),
+    );
+    let bullet_speed = s.bullet_speed as f32 / 10.0;
+    View {
+        tick: world.tick,
+        pos: px(ship.pos),
+        vel: per_second(ship.vel),
+        rotation: ship.rotation,
+        turn_rate: ship.stats.rotation,
+        top_speed: ship.stats.speed as f32 / 10.0,
+        bullet_speed,
+        bullet_range: bullet_speed * world.settings.bullet_alive_time as f32 / 100.0,
+        energy: ship.energy as f32 / (ship.stats.max_energy.max(1) as f32 * 1000.0),
+        enemies: &enemies[..],
+        shots: &shots[..],
     }
 }
 
@@ -326,6 +782,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let script = match opts.script.as_deref().map(read_script) {
+        Some(Ok(s)) => Some(s),
+        Some(Err(e)) => {
+            eprintln!("error: script: {e}");
+            std::process::exit(2);
+        }
+        None => None,
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    if opts.script.as_deref() == Some("-") {
+        watch_stdin(stop.clone());
+    }
     let cache = MapCache::new(
         opts.map_cache
             .clone()
@@ -334,11 +802,21 @@ fn main() {
 
     let mut bots = Vec::new();
     for i in 0..opts.count {
-        let name = if opts.count > 1 {
+        let mut name = if opts.count > 1 {
             format!("{}{}", opts.name, i + 1)
         } else {
             opts.name.clone()
         };
+        let (mut password, mut arena, mut ship) =
+            (opts.password.clone(), opts.arena.clone(), opts.ship);
+        let mut freq = None;
+        if let Some(s) = script.as_ref() {
+            name = s.name.clone().unwrap_or(name);
+            password = s.password.clone().unwrap_or(password);
+            arena = s.arena.clone().or(arena);
+            ship = s.ship.unwrap_or(ship);
+            freq = s.freq;
+        }
         let driver = match UdpDriver::connect(&opts.server) {
             Ok(d) => d,
             Err(e) => {
@@ -348,9 +826,9 @@ fn main() {
         };
         let cfg = SessionConfig {
             name: name.clone(),
-            password: opts.password.clone(),
-            arena: opts.arena.clone(),
-            ship: opts.ship,
+            password,
+            arena,
+            ship,
             machine_id: 0x0B07_0000 + i as u32,
             new_user: opts.new_user,
             ..Default::default()
@@ -374,7 +852,15 @@ fn main() {
             id
         });
         let handshake = client_handshake(opts.security, None, identity, seed);
-        let session = Session::with_handshake(cfg, driver.now_ms(), handshake);
+        let now = driver.now_ms();
+        let session = Session::with_handshake(cfg, now, handshake);
+        let brain = script
+            .as_ref()
+            .map(|s| Brain::new(s.behaviour, s.points.clone(), s.range.unwrap_or(30)));
+        let talk = script
+            .as_ref()
+            .map(|s| Talk::new(s, now))
+            .filter(|t| !t.is_quiet());
         bots.push(Bot {
             label: name,
             session,
@@ -382,7 +868,17 @@ fn main() {
             loud: i == 0 || opts.verbose,
             map: None,
             green_seed: 0,
+            doors: None,
+            ship,
+            freq,
+            freq_asked: false,
+            fly: opts.fly,
             world: None,
+            nav: None,
+            me: u16::MAX,
+            brain,
+            talk,
+            peer_suffix: script.as_ref().and_then(|s| s.peers.clone()),
             rng: Rng::new(seed | 1),
             chatted: false,
             last_step_ms: 0,
@@ -391,6 +887,7 @@ fn main() {
     log::info!("{} bot(s) connecting to {}", bots.len(), opts.server);
 
     let start = Instant::now();
+    let mut lost = false;
     loop {
         let mut open = 0;
         for bot in &mut bots {
@@ -402,7 +899,7 @@ fn main() {
                 log::warn!("[{}] socket error: {e}", bot.label);
                 bot.session.disconnect();
             }
-            bot.handle_events(&opts, &cache);
+            bot.handle_events(&cache);
             let now = bot.driver.now_ms();
             if bot.world.is_none() {
                 bot.last_step_ms = now;
@@ -428,9 +925,13 @@ fn main() {
                         }
                     }
                 }
-                if bot.world.is_some() {
-                    bot.fly(now);
-                } else if bot.session.position_due(now) {
+                if let Some((kind, to, text)) = bot.talk.as_mut().and_then(|t| t.next(now)) {
+                    bot.session.send_chat(kind, to, &text);
+                }
+                // Other ships and shots keep moving while spectating, too.
+                let flying = bot.own_ship_flying();
+                bot.fly(now);
+                if !flying && bot.session.position_due(now) {
                     // Spectators still report in so the server knows they're alive.
                     bot.session.send_position(now, &Default::default());
                 }
@@ -439,17 +940,26 @@ fn main() {
         }
         if open == 0 {
             log::info!("all bots disconnected");
+            lost = true;
             break;
         }
-        if opts.duration.is_some_and(|d| start.elapsed() >= d) {
+        let quit = stop.load(Ordering::Relaxed);
+        if quit || opts.duration.is_some_and(|d| start.elapsed() >= d) {
             for bot in &mut bots {
                 bot.session.disconnect();
                 let _ = bot.driver.send_pending(&mut bot.session);
             }
-            log::info!("time is up; disconnected");
+            log::info!(
+                "{}; disconnected",
+                if quit { "told to stop" } else { "time is up" }
+            );
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+    // A scripted bot that lost its zone says so, for whatever restarts it.
+    if lost && script.is_some() {
+        std::process::exit(3);
     }
 }
 
@@ -481,6 +991,9 @@ mod tests {
         assert!(parse("--ship 2").is_err());
         assert!(parse("--server x:1 --ship 9").is_err());
         assert!(parse("--help").unwrap().is_none());
+        let o = parse("--server x:1 --script -").unwrap().unwrap();
+        assert_eq!(o.script.as_deref(), Some("-"));
+        assert!(parse("--server x:1 --script - --count 2").is_err());
     }
 
     #[test]
@@ -490,5 +1003,7 @@ mod tests {
         assert_eq!(private_chat("::x"), None);
         let o = parse("--server x:1 --identity ids.txt").unwrap().unwrap();
         assert_eq!(o.identity, Some(PathBuf::from("ids.txt")));
+        assert!(ends_with("Rex [Bot]", " [bot]"));
+        assert!(!ends_with("bot", " [bot]"));
     }
 }
