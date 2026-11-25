@@ -229,7 +229,7 @@ async function switchPilot(name) {
 
 pilotButton.addEventListener("click", () => {
   if (!me) {
-    void askToSignIn().then(() => { if (me) void fetchDrafts(); });
+    void askToSignIn("account").then(() => { if (me) void fetchDrafts(); });
   } else if (pilotMenu.hidden) {
     void openPilotMenu();
   } else {
@@ -254,14 +254,23 @@ $("signout").addEventListener("click", async () => {
 // For the page's other parts (the chat panel): the signed-in pilot, asking to sign in if needed.
 globalThis.foundationSignIn = async () => {
   if (!me) {
-    await askToSignIn();
+    await askToSignIn("chat");
     if (me) void fetchDrafts();
   }
   return me;
 };
 
-// The sign-in box. Resolves when the pilot signed in (me is set) or gave up (me stays null).
-function askToSignIn() {
+// The sign-in box, worded for why it opened ("fly", "chat", or just signing in). Resolves
+// when the pilot signed in (me is set) or gave up (me stays null).
+const SIGNIN_WORDS = {
+  fly: ["Sign in to fly", "Sign in and enter"],
+  chat: ["Sign in to chat", "Sign in"],
+  account: ["Sign in", "Sign in"],
+};
+function askToSignIn(why = "fly") {
+  const [title, button] = SIGNIN_WORDS[why] ?? SIGNIN_WORDS.fly;
+  $("signin-title").textContent = title;
+  $("signin-go").textContent = button;
   signinMsg.textContent = "";
   forgot.hidden = true;
   dialog.showModal();
