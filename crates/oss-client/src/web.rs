@@ -45,6 +45,21 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = globalThis, js_name = foundationStartArena, catch)]
     fn js_start_arena() -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = foundationLeaveZone, catch)]
+    fn js_leave_zone(reason: Option<String>) -> Result<(), JsValue>;
+}
+
+/// Set by [`start_dare_in`]: the page started this run, so leaving the zone goes
+/// back to the page rather than to the start-up screen.
+static STARTED_FROM_PAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hands the pilot back to the page that started the game, with why if the visit
+/// ended on its own (a failed or lost connection). True when the page took over;
+/// false for a run the page didn't start, or a page without the hook.
+pub(crate) fn return_to_page(reason: Option<&str>) -> bool {
+    STARTED_FROM_PAGE.load(std::sync::atomic::Ordering::Relaxed)
+        && js_leave_zone(reason.map(str::to_owned)).is_ok()
 }
 
 /// The latest arena list from the page: `None` before its first answer (the page
@@ -169,6 +184,7 @@ pub fn start_dare_in(name: &str, password: &str, arena: &str) -> Result<(), JsVa
         .map_err(|error| JsValue::from_str(&error))?
         .ok_or_else(|| JsValue::from_str("Dare client options unavailable"))?;
     options.directories.clear();
+    STARTED_FROM_PAGE.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::run(options).map_err(|error| JsValue::from_str(&error))
 }
 

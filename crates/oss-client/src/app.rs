@@ -953,6 +953,9 @@ fn leave_zone(screen: &mut Screen) {
 impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, msg: String) {
         log::error!("{msg}");
+        // In the browser, the page that started the game shows why and takes over.
+        #[cfg(target_arch = "wasm32")]
+        crate::web::return_to_page(Some(&msg));
         self.error = Some(msg);
         event_loop.exit();
     }
@@ -966,6 +969,11 @@ impl App {
     /// settings and from what that run was playing -- the originals always have a
     /// front end to come back to, and vanishing is the thing being fixed.
     fn back_to_front_end(&mut self) -> Result<(), String> {
+        // In the browser, a run the page started goes back to that page instead.
+        #[cfg(target_arch = "wasm32")]
+        if crate::web::return_to_page(None) {
+            return Ok(());
+        }
         let Some(run) = self.running.as_mut() else {
             return Ok(());
         };
@@ -1774,9 +1782,11 @@ impl App {
                     }
                     (None, Some(err)) => return self.fail(event_loop, err),
                     (None, None) => {
-                        if let Some(why) = give_up {
+                        if let Some(why) = &give_up {
                             log::info!("{why}");
                         }
+                        #[cfg(target_arch = "wasm32")]
+                        crate::web::return_to_page(give_up.as_deref());
                         event_loop.exit();
                         return;
                     }

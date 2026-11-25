@@ -6,8 +6,10 @@
 // it fetches, so a browser holding an older copy of any of them can't mix the two.
 const version = new URL(import.meta.url).searchParams.get("v") ?? "";
 const here = (path) => new URL(version ? `${path}?v=${encodeURIComponent(version)}` : path, import.meta.url);
-const { default: init, start_dare_in } = await import(here("pkg/oss_client.js"));
-const { connectZone } = await import(here("transport.mjs"));
+// The game (its script, its 13 MB WebAssembly and the zone link) is fetched only when the
+// pilot presses Enter: opening the page downloads nothing of it.
+let game = null; // { init, start_dare_in } once its script is loaded
+let connectZone = null;
 
 const WASM = here("pkg/oss_client_bg.wasm");
 const BUILD = here("build.json");
@@ -20,7 +22,8 @@ const button = $("start");
 const label = $("start-label");
 const status = $("status");
 const picker = $("arena");
-const pilotLink = $("pilot");
+const pilotButton = $("pilot");
+const pilotMenu = $("pilotmenu");
 const newHere = $("newhere");
 const dialog = $("signin");
 const form = $("signin-form");
@@ -104,6 +107,12 @@ async function fetchArenas() {
 globalThis.foundationArenas = () => arenaFeed;
 globalThis.refreshFoundationArenas = () => void fetchArenas();
 globalThis.foundationStartArena = () => picker.value || undefined;
+// Leaving the zone (Exit, or a lost connection) comes back here: a fresh home page, with why.
+const LEFT_KEY = "foundation.left";
+globalThis.foundationLeaveZone = (reason) => {
+  try { sessionStorage.setItem(LEFT_KEY, reason ? String(reason) : ""); } catch {}
+  location.reload();
+};
 const FOUNDATION_PAGES = new Set(["/build.html", "/account/signup", "/account/forgot"]);
 globalThis.openFoundationPage = (path) => {
   if (FOUNDATION_PAGES.has(path)) window.open(`https://subspacefoundation.com${path}`, "_blank", "noopener");
@@ -166,15 +175,78 @@ async function whoAmI() {
 }
 
 function showPilot() {
-  pilotLink.textContent = me ?? "Sign in";
-  pilotLink.href = me ? "/account/" : "#signin";
+  $("pilot-name").textContent = me ?? "Sign in";
+  $("pilot-label").hidden = !me;
+  $("pilot-caret").hidden = !me;
   newHere.hidden = !!me;
+  if (!me) closePilotMenu();
 }
 
-pilotLink.addEventListener("click", (event) => {
-  if (me) return;
-  event.preventDefault();
-  void askToSignIn().then(() => { if (me) void fetchDrafts(); });
+// ---- the pilot menu: the names on this pilot's email (switch), account links, sign out -------
+function closePilotMenu() {
+  pilotMenu.hidden = true;
+  pilotButton.setAttribute("aria-expanded", "false");
+}
+
+async function openPilotMenu() {
+  const list = $("pilotlist");
+  list.replaceChildren(option("", "…"));
+  pilotMenu.hidden = false;
+  pilotButton.setAttribute("aria-expanded", "true");
+  let names = [me];
+  try {
+    const response = await fetch("/account/api/pilots", { cache: "no-store", credentials: "same-origin" });
+    if (response.status === 401) { me = null; showPilot(); return; }
+    if (response.ok) names = ((await response.json()).pilots ?? []).map((p) => p.name);
+  } catch {}
+  list.replaceChildren(...names.map((name) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.setAttribute("role", "menuitemradio");
+    item.setAttribute("aria-checked", String(name === me));
+    item.textContent = name;
+    if (name === me) item.className = "current";
+    else item.addEventListener("click", () => void switchPilot(name));
+    return item;
+  }));
+}
+
+async function switchPilot(name) {
+  try {
+    const response = await fetch("/account/api/pilots/switch", { method: "POST", credentials: "same-origin", headers: HEADERS, body: JSON.stringify({ name }) });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.ok) throw new Error(body.message || "Couldn't switch names.");
+    me = body.name;
+    showPilot();
+    closePilotMenu();
+    void fetchDrafts();
+  } catch (error) {
+    say(error?.message ?? String(error), true);
+  }
+}
+
+pilotButton.addEventListener("click", () => {
+  if (!me) {
+    void askToSignIn().then(() => { if (me) void fetchDrafts(); });
+  } else if (pilotMenu.hidden) {
+    void openPilotMenu();
+  } else {
+    closePilotMenu();
+  }
+});
+document.addEventListener("click", (event) => {
+  if (!pilotMenu.hidden && !pilotMenu.contains(event.target) && !pilotButton.contains(event.target)) closePilotMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !pilotMenu.hidden) { closePilotMenu(); pilotButton.focus(); }
+});
+$("signout").addEventListener("click", async () => {
+  try {
+    await fetch("/account/api/logout", { method: "POST", credentials: "same-origin", headers: HEADERS, body: "{}" });
+  } catch {}
+  me = null;
+  showPilot();
+  void fetchDrafts();
 });
 
 // The sign-in box. Resolves when the pilot signed in (me is set) or gave up (me stays null).
@@ -249,13 +321,12 @@ async function expectedSize() {
 }
 
 let percent = 0;
-// While the game downloads, the button says how far along it is (it can still be pressed).
+// While the game downloads (after Enter), the button says how far along it is.
 function progress(value) {
   percent = value;
   button.style.setProperty("--p", `${value}%`);
   button.classList.toggle("downloading", value < 100);
-  label.textContent = value < 100 ? `Loading ${value}%` : "Play";
-  if (waiting) say(`Starting as soon as the game has loaded… ${value}%`);
+  label.textContent = value < 100 ? `Loading ${value}%` : "Enter";
 }
 
 async function download() {
@@ -280,9 +351,22 @@ async function download() {
   return bytes;
 }
 
-// ---- Play -----------------------------------------------------------------------------------
-let waiting = false; // Play was pressed before the game finished loading
-let gameReady;       // resolves when the game is loaded
+// ---- Enter --------------------------------------------------------------------------------
+let loading = null; // the game's download and start-up, begun by the first Enter
+
+function loadGame() {
+  loading ??= (async () => {
+    progress(0);
+    const [glue, transport] = await Promise.all([import(here("pkg/oss_client.js")), import(here("transport.mjs"))]);
+    connectZone = transport.connectZone;
+    const bytes = await download();
+    await glue.default({ module_or_path: bytes });
+    game = glue;
+    progress(100);
+  })();
+  loading.catch(() => { loading = null; button.classList.remove("downloading"); label.textContent = "Enter"; });
+  return loading;
+}
 
 async function gamePass() {
   const response = await fetch("/account/api/gamepass", { method: "POST", credentials: "same-origin", headers: HEADERS, body: "{}" });
@@ -294,16 +378,11 @@ async function gamePass() {
 
 async function play() {
   button.disabled = true;
+  say("");
   try {
     if (!me) await askToSignIn();
     if (!me) return; // cancelled
-    if (percent < 100) {
-      waiting = true;
-      button.classList.add("loading");
-      say(`Starting as soon as the game has loaded… ${percent}%`);
-      await gameReady;
-      waiting = false;
-    }
+    await loadGame();
     let pass = await gamePass();
     if (!pass) { // the site session ended: sign in again
       me = null;
@@ -317,8 +396,6 @@ async function play() {
   } catch (error) {
     say(error?.message ?? String(error), true);
   } finally {
-    waiting = false;
-    button.classList.remove("loading");
     if (!entry.hidden) button.disabled = false;
   }
 }
@@ -336,7 +413,7 @@ function enter(name, pass, arena) {
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
-    start_dare_in(name, pass, arena);
+    game.start_dare_in(name, pass, arena);
   } catch (error) {
     entry.hidden = false;
     document.body.classList.remove("playing");
@@ -345,6 +422,13 @@ function enter(name, pass, arena) {
 }
 
 // ---- start ----------------------------------------------------------------------------------
+try {
+  const left = sessionStorage.getItem(LEFT_KEY);
+  if (left !== null) {
+    sessionStorage.removeItem(LEFT_KEY);
+    if (left) say(left, true);
+  }
+} catch {}
 void fetchArenas();
 setInterval(() => { if (!entry.hidden) void fetchArenas(); }, 30000);
 void whoAmI().then(fetchDrafts);
@@ -354,15 +438,5 @@ if (missing) {
   say(missing, true);
 } else {
   button.disabled = false;
-  progress(0);
   button.addEventListener("click", play);
-  gameReady = (async () => {
-    const bytes = await download();
-    await init({ module_or_path: bytes });
-    progress(100);
-  })();
-  gameReady.catch((error) => {
-    button.disabled = true;
-    say(error?.message ?? String(error), true);
-  });
 }
