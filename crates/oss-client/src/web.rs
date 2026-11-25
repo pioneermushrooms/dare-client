@@ -136,6 +136,42 @@ pub fn start_dare() -> Result<(), JsValue> {
     crate::run(options).map_err(|error| JsValue::from_str(&error))
 }
 
+/// Starts the game straight in the Foundation zone, signed in as `name`, without the
+/// start-up screen: the page has already signed the pilot in, and `password` is what
+/// it was given to log in with. `arena` is the arena to enter, or empty for any
+/// public one. Leaving the zone opens the start-up screen as usual.
+#[wasm_bindgen]
+pub fn start_dare_in(name: &str, password: &str, arena: &str) -> Result<(), JsValue> {
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    std::panic::set_hook(Box::new(|error| log_error(&error.to_string())));
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(JsValue::from_str(
+            "A pilot name is needed to start in the zone",
+        ));
+    }
+    let mut args = vec![
+        "--server".to_string(),
+        "5.161.238.245:5000".to_string(),
+        "--name".to_string(),
+        name.to_string(),
+        "--password".to_string(),
+        password.to_string(),
+    ];
+    let arena = arena.trim();
+    if !arena.is_empty() {
+        args.push("--arena".to_string());
+        args.push(arena.to_string());
+    }
+    let mut options = crate::options(args.into_iter())
+        .map_err(|error| JsValue::from_str(&error))?
+        .ok_or_else(|| JsValue::from_str("Dare client options unavailable"))?;
+    options.directories.clear();
+    crate::run(options).map_err(|error| JsValue::from_str(&error))
+}
+
 pub(crate) struct WebDriver {
     link: Link,
     started: Instant,
