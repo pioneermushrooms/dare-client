@@ -86,21 +86,21 @@ const clean = (name) => String(name ?? "").replace(/[\t\r\n]/g, " ").trim();
 
 async function fetchArenas() {
   try {
-    const response = await fetch("/arena/api/public", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+    // every arena the zone has, as its ?arena -a list shows them ("0" is the public arena)
+    const response = await fetch("/arena/api/arenas", { cache: "no-store", signal: AbortSignal.timeout(10000) });
     if (!response.ok) throw new Error();
     const data = await response.json();
-    const publicPlayers = Number.isInteger(data.publicPlayers) ? data.publicPlayers : null;
-    arenas = [{ name: "", label: "public", players: publicPlayers }].concat(
-      (data.arenas ?? [])
-        .filter((arena) => arena.status === "Active" && clean(arena.name))
-        .map((arena) => ({ name: clean(arena.name), label: clean(arena.name), players: Number.isInteger(arena.players) ? arena.players : null })),
-    );
-    const lines = arenas.filter((a) => a.name).map((a) => `${a.name}\t${a.players ?? ""}`);
-    if (publicPlayers != null) lines.unshift(`public\t${publicPlayers}`);
-    arenaFeed = lines.join("\n");
+    arenas = (data.arenas ?? [])
+      .filter((arena) => clean(arena.name))
+      .map((arena) => {
+        const name = clean(arena.name);
+        return { name: name === "0" ? "" : name, label: name === "0" ? "public" : name, players: Number.isInteger(arena.players) ? arena.players : 0 };
+      });
+    if (!arenas.some((a) => a.name === "")) arenas.unshift({ name: "", label: "public", players: 0 });
+    arenaFeed = arenas.map((a) => `${a.label}\t${a.players}`).join("\n");
   } catch {
     arenaFeed = null;
-    if (arenas.length === 0) arenas = [{ name: "", label: "public", players: null }];
+    if (arenas.length === 0) arenas = [{ name: "", label: "public", players: 0 }];
   }
   renderPicker();
 }
@@ -118,14 +118,16 @@ globalThis.openFoundationPage = (path) => {
   if (FOUNDATION_PAGES.has(path)) window.open(`https://subspacefoundation.com${path}`, "_blank", "noopener");
 };
 
+// The pilot's own arenas (owner or co-mod), so a private one is choosable too.
 async function fetchDrafts() {
   myDrafts = [];
   if (!me) return renderPicker();
   try {
-    const response = await fetch("/arena/api/drafts/mine", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+    const response = await fetch("/arena/api/me", { cache: "no-store", credentials: "same-origin", signal: AbortSignal.timeout(10000) });
     if (response.ok) {
       const data = await response.json();
-      myDrafts = (data.drafts ?? []).filter((d) => d.status !== "Archived").map((d) => `#${clean(d.name)}`);
+      // (#name copies left from the old draft workflow aren't arenas to fly in)
+      myDrafts = (data.arenas ?? []).map((a) => clean(a.name)).filter((n) => n && !n.startsWith("#"));
     }
   } catch {}
   renderPicker();
@@ -140,14 +142,14 @@ function option(value, text) {
 
 function renderPicker() {
   const want = picker.dataset.touched ? picker.value : (linkArena ?? savedArena());
-  // the pilot count only where someone is flying
-  const options = arenas.map((a) => option(a.name, a.players ? `${a.label} · ${a.players} flying` : a.label));
+  // how many are in each, so you know what you're getting into
+  const options = arenas.map((a) => option(a.name, `${a.label} · ${a.players}`));
   const known = new Set(arenas.map((a) => a.name));
   if (myDrafts.length) {
     const group = document.createElement("optgroup");
-    group.label = "Your drafts";
-    for (const d of myDrafts) { group.append(option(d, d)); known.add(d); }
-    options.push(group);
+    group.label = "Your private arenas";
+    for (const d of myDrafts) if (!known.has(d)) { group.append(option(d, d)); known.add(d); }
+    if (group.children.length) options.push(group);
   }
   // an arena asked for by name that isn't listed (yet): keep it choosable
   if (want && !known.has(want)) options.push(option(want, want));
