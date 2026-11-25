@@ -249,6 +249,15 @@ $("signout").addEventListener("click", async () => {
   void fetchDrafts();
 });
 
+// For the page's other parts (the chat panel): the signed-in pilot, asking to sign in if needed.
+globalThis.foundationSignIn = async () => {
+  if (!me) {
+    await askToSignIn();
+    if (me) void fetchDrafts();
+  }
+  return me;
+};
+
 // The sign-in box. Resolves when the pilot signed in (me is set) or gave up (me stays null).
 function askToSignIn() {
   signinMsg.textContent = "";
@@ -383,6 +392,7 @@ async function play() {
     if (!me) await askToSignIn();
     if (!me) return; // cancelled
     await loadGame();
+    await globalThis.foundationChatLeave?.(); // the same name can't be in the zone twice
     let pass = await gamePass();
     if (!pass) { // the site session ended: sign in again
       me = null;
