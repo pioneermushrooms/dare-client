@@ -368,7 +368,9 @@ const BOT_ROWS: [BotRow; 7] = [
         code: KeyCode::KeyE,
         label: "E = Change behavior or ship",
         command: "?bots set",
-        prompt: Some("Type the bot's name and its new behavior or ship, then Enter. e.g. Sparring patrol"),
+        prompt: Some(
+            "Type the bot's name and its new behavior or ship, then Enter. e.g. Sparring patrol",
+        ),
     },
     BotRow {
         key: 'd',
@@ -503,16 +505,31 @@ mod tests {
     #[test]
     fn the_bots_panel_fits_and_its_keys_are_its_own() {
         let cols = ((40.0 * 8.0 - 4.0) / 8.0_f32).floor() as usize;
-        for line in super::BOT_ROWS.iter().map(|row| row.label).chain(super::BOT_NOTES) {
-            assert!(line.chars().count() <= cols, "{line:?} is wider than {cols}");
+        for line in super::BOT_ROWS
+            .iter()
+            .map(|row| row.label)
+            .chain(super::BOT_NOTES)
+        {
+            assert!(
+                line.chars().count() <= cols,
+                "{line:?} is wider than {cols}"
+            );
         }
         let mut keys: Vec<char> = super::BOT_ROWS.iter().map(|row| row.key).collect();
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), super::BOT_ROWS.len());
-        assert!(super::BOT_ROWS.iter().any(|row| row.command == "?bots create"));
+        assert!(
+            super::BOT_ROWS
+                .iter()
+                .any(|row| row.command == "?bots create")
+        );
         for row in &super::BOT_ROWS {
-            assert!(row.label.to_ascii_lowercase().starts_with(&format!("{} =", row.key)));
+            assert!(
+                row.label
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{} =", row.key))
+            );
         }
     }
 

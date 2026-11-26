@@ -79,14 +79,27 @@ pub fn set(slot: usize, img: Option<Image>) -> Result<(), String> {
     Ok(())
 }
 
-/// Uses `img` in place of the sheet named `name` (an [`art::OVERRIDABLE`] name other
-/// than `ships`, which is set ship by ship), or the arena's or game's own with `None`.
+/// Whether `name` is a graphic the pilot can replace: an [`art::OVERRIDABLE`] name
+/// other than `ships` (set ship by ship), or `<weapon>@<ship>` for a weapon sheet
+/// ([`art::SHIP_WEAPONS`]) used only for shots fired from ship 1..8.
+pub fn is_pilot_graphic(name: &str) -> bool {
+    match name.split_once('@') {
+        Some((weapon, ship)) => {
+            art::SHIP_WEAPONS.contains(&weapon) && matches!(ship.as_bytes(), [b'1'..=b'8'])
+        }
+        None => name != "ships" && art::OVERRIDABLE.contains(&name),
+    }
+}
+
+/// Uses `img` in place of the sheet named `name` (see [`is_pilot_graphic`]), or the
+/// arena's or game's own with `None`. `bombs@3` is the bombs sheet for shots from
+/// ship 3 only, on top of `bombs` (the pilot's own for every ship, else the arena's).
 /// A sheet with no transparency at all has its black keyed out, as LVZ sheets do.
 // Set by the page in browser play.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub fn set_graphic(name: &str, img: Option<Image>) -> Result<(), String> {
     let name = name.to_ascii_lowercase();
-    if name == "ships" || !art::OVERRIDABLE.contains(&name.as_str()) {
+    if !is_pilot_graphic(&name) {
         return Err(format!("{name} isn't a graphic the pilot can replace"));
     }
     let mut other = OTHER.lock().unwrap_or_else(|e| e.into_inner());
@@ -259,13 +272,32 @@ mod tests {
         assert!(all.contains_key("prizes"));
         set_use_own(false);
         let arenas = merged(&lvz);
-        assert_eq!(arenas["bombs"].width, 160, "the arena's, when the pilot picks it");
+        assert_eq!(
+            arenas["bombs"].width, 160,
+            "the arena's, when the pilot picks it"
+        );
         assert!(!arenas.contains_key("prizes"));
         set_use_own(true);
-        assert_eq!(merged(&lvz)["bombs"].width, 320, "and back, without setting them again");
+        assert_eq!(
+            merged(&lvz)["bombs"].width,
+            320,
+            "and back, without setting them again"
+        );
         set_graphic("bombs", None).unwrap();
         set_graphic("prizes", None).unwrap();
         assert_eq!(merged(&lvz)["bombs"].width, 160);
+    }
+
+    #[test]
+    fn a_weapon_sheet_can_be_for_one_ship() {
+        assert!(set_graphic("bombs@0", Some(sheet(160, 208, 255))).is_err());
+        assert!(set_graphic("bombs@9", Some(sheet(160, 208, 255))).is_err());
+        assert!(set_graphic("prizes@2", Some(sheet(160, 16, 255))).is_err());
+        assert!(set_graphic("repel@2", Some(sheet(480, 192, 255))).is_err());
+        set_graphic("Mines@4", Some(sheet(160, 128, 255))).unwrap();
+        assert!(merged(&HashMap::new()).contains_key("mines@4"));
+        set_graphic("mines@4", None).unwrap();
+        assert!(!merged(&HashMap::new()).contains_key("mines@4"));
     }
 
     #[test]

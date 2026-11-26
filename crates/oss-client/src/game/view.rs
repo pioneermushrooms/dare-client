@@ -4,7 +4,7 @@ use oss_sim::{Pos, ProjectileKind, fixed::ROTATION_UNITS, tile, toggle};
 
 use oss_proto::objects::layer;
 
-use super::art::{Art, anim_frame, once_frame};
+use super::art::{Art, Weapon, anim_frame, once_frame};
 use super::sandbox::{EffectKind, Sandbox};
 use crate::gfx::{Region, Renderer, TextureId};
 
@@ -474,9 +474,19 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
     for pr in &world.projectiles {
         let (x, y) = lerp_pos(pr.prev_pos, pr.pos, alpha);
         let lvl = pr.level.min(3) as u32;
+        // The pilot may give one ship's shots their own sheets.
+        let from = if a.has_ship_weapons {
+            world
+                .ships
+                .iter()
+                .find(|s| s.id == pr.owner)
+                .map(|s| s.kind)
+        } else {
+            None
+        };
         let region = match pr.kind {
             ProjectileKind::Bullet => anim_frame(
-                a.bullets,
+                a.weapon(Weapon::Bullets, from),
                 5,
                 5,
                 lvl * 4 + if pr.bouncing { 20 } else { 0 },
@@ -485,13 +495,14 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
                 t,
             ),
             ProjectileKind::Burst => {
-                let n = a.bullets.frame_count(5, 5);
+                let sheet = a.weapon(Weapon::Bullets, from);
+                let n = sheet.frame_count(5, 5);
                 let first = if pr.armed { n.saturating_sub(4) } else { 16 };
-                anim_frame(a.bullets, 5, 5, first, 4, 0.15, t)
+                anim_frame(sheet, 5, 5, first, 4, 0.15, t)
             }
             ProjectileKind::Shrapnel => {
                 let first = lvl.min(2) * 10 + if pr.bouncing { 30 } else { 0 };
-                anim_frame(a.shrapnel, 8, 8, first, 10, 0.6, t)
+                anim_frame(a.weapon(Weapon::Shrapnel, from), 8, 8, first, 10, 0.6, t)
             }
             ProjectileKind::Bomb => {
                 let first = if pr.emp {
@@ -501,10 +512,10 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
                 } else {
                     0
                 } + lvl * 10;
-                anim_frame(a.bombs, 16, 16, first, 10, 1.0, t)
+                anim_frame(a.weapon(Weapon::Bombs, from), 16, 16, first, 10, 1.0, t)
             }
             ProjectileKind::Mine => anim_frame(
-                a.mines,
+                a.weapon(Weapon::Mines, from),
                 16,
                 16,
                 lvl * 10 + if pr.emp { 40 } else { 0 },
@@ -512,7 +523,9 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
                 1.0,
                 t,
             ),
-            ProjectileKind::Thor => anim_frame(a.bombs, 16, 16, 120, 10, 1.0, t),
+            ProjectileKind::Thor => {
+                anim_frame(a.weapon(Weapon::Bombs, from), 16, 16, 120, 10, 1.0, t)
+            }
             ProjectileKind::Decoy => {
                 let Some(owner) = world.ships.iter().find(|s| s.id == pr.owner) else {
                     continue;

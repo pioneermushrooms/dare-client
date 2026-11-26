@@ -6,6 +6,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use web_time::Instant;
 
+#[cfg(target_arch = "wasm32")]
+use crate::web::WebDriver as UdpDriver;
 use oss_session::map::MapCache;
 #[cfg(not(target_arch = "wasm32"))]
 use oss_session::map::default_cache_dir;
@@ -15,8 +17,6 @@ use oss_session::security::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use oss_session::udp::UdpDriver;
-#[cfg(target_arch = "wasm32")]
-use crate::web::WebDriver as UdpDriver;
 use oss_session::{Profile, RegistrationForm, Session, SessionConfig, SessionEvent, State};
 
 /// What a build outside this repository can supply to a connection. Both halves

@@ -58,6 +58,41 @@ pub struct Art {
     /// Per-ship replacement sheets from LVZ files (`ship1`..`ship8`): region and
     /// frame side (40 square frames).
     pub ship_sheets: [Option<(Region, u32)>; 8],
+    /// The pilot's own weapon sheets for shots from one ship (`bullets@1`..`shrapnel@8`),
+    /// by ship then [`SHIP_WEAPONS`] order; `None` uses the sheet for every ship.
+    pub ship_weapons: [[Option<Region>; 4]; 8],
+    /// Whether any of [`Self::ship_weapons`] is set (so shots needn't look up their ship).
+    pub has_ship_weapons: bool,
+}
+
+/// Weapon sheets a pilot may set for one ship's shots, as `<name>@<ship>`.
+pub const SHIP_WEAPONS: [&str; 4] = ["bullets", "bombs", "mines", "shrapnel"];
+
+/// One of [`SHIP_WEAPONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Weapon {
+    Bullets = 0,
+    Bombs = 1,
+    Mines = 2,
+    Shrapnel = 3,
+}
+
+impl Art {
+    /// The `weapon` sheet for a shot from ship `kind` (0..8), or from no known ship.
+    pub fn weapon(&self, weapon: Weapon, kind: Option<u8>) -> Region {
+        if let Some(own) = kind
+            .and_then(|k| self.ship_weapons.get(k as usize))
+            .and_then(|w| w[weapon as usize])
+        {
+            return own;
+        }
+        match weapon {
+            Weapon::Bullets => self.bullets,
+            Weapon::Bombs => self.bombs,
+            Weapon::Mines => self.mines,
+            Weapon::Shrapnel => self.shrapnel,
+        }
+    }
 }
 
 /// Sheets an LVZ file can replace, by file name without extension (lowercase),
@@ -243,6 +278,40 @@ pub fn load_with(
         }
     }
 
+    for (k, sheets) in art.ship_weapons.iter_mut().enumerate() {
+        for (w, name) in SHIP_WEAPONS.iter().enumerate() {
+            if let Some(img) = overrides.get(&format!("{name}@{}", k + 1)) {
+                sheets[w] = Some(add(img)?);
+                art.has_ship_weapons = true;
+            }
+        }
+    }
+
     let size = atlas.size();
     Ok((art, size, atlas.into_pixels()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ships_own_weapon_sheet_wins_for_its_shots_only() {
+        let region = |x| Region {
+            x,
+            y: 0,
+            w: 16,
+            h: 16,
+        };
+        let mut art = Art {
+            bombs: region(1),
+            ..Art::default()
+        };
+        art.ship_weapons[2][Weapon::Bombs as usize] = Some(region(7));
+        assert_eq!(art.weapon(Weapon::Bombs, Some(2)).x, 7);
+        assert_eq!(art.weapon(Weapon::Bombs, Some(3)).x, 1);
+        assert_eq!(art.weapon(Weapon::Bombs, None).x, 1);
+        assert_eq!(art.weapon(Weapon::Bombs, Some(200)).x, 1);
+        assert_eq!(art.weapon(Weapon::Mines, Some(2)).x, 0);
+    }
 }
