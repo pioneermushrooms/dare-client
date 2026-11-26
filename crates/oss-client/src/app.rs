@@ -1872,6 +1872,11 @@ impl App {
             } else {
                 None
             };
+            // The zone may have given a different name (a guest's), and a log sent
+            // for the staff is looked up by it.
+            if let Some(me) = conn.net.session.me() {
+                log::info!("flying as {}", me.name);
+            }
             match Sandbox::new_online(&mut run.renderer, &self.dir, conn.net, run.scale, audio) {
                 Ok(mut s) => {
                     log::info!("entered arena and initialized game view");

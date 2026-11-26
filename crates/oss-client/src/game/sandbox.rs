@@ -2248,11 +2248,6 @@ impl Sandbox {
             self.world.ships.len(),
             self.map_revision,
         );
-        // The zone may have given a different name (a guest's), and a log sent
-        // for the staff is looked up by it.
-        if let Some(p) = self.net.as_ref().and_then(|n| n.session.me()) {
-            log::info!("flying as {}", p.name);
-        }
         self.message(format!("Entered arena {arena}."), color::GREEN);
     }
 
