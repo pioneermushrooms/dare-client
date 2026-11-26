@@ -51,6 +51,20 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = globalThis, js_name = foundationOpenGraphics, catch)]
     fn js_open_graphics() -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = dareLoadingStage, catch)]
+    fn js_loading_stage(stage: &str, detail: &str, percent: i32) -> Result<(), JsValue>;
+}
+
+/// Tells the page where the way into the arena has got to, so its loader can
+/// show the same steps and hand over to the game's own screen without a jump:
+/// `stage` is a [`crate::game::online::Stage::key`] (or `playing` once the arena
+/// is on screen), `detail` the line under the bar, and `percent` how far
+/// through this step's downloads, or -1 when that is not known. The first call
+/// comes once the game has drawn its connecting screen. A page without the hook
+/// is fine: nothing happens.
+pub(crate) fn loading_stage(stage: &str, detail: &str, percent: i32) {
+    let _ = js_loading_stage(stage, detail, percent);
 }
 
 /// Asks the page to open its custom graphics overlay. False when the page has none.
@@ -91,6 +105,27 @@ pub fn ship_sheet(ship: u8) -> Result<JsValue, JsValue> {
         &js_sys::Uint8ClampedArray::from(&img.rgba[..]),
     )?;
     Ok(out.into())
+}
+
+/// Uses `sheet` (PNG or BMP bytes, laid out like the game's own sheet of that
+/// name) for the graphic `name` (bombs, bullets, prizes...; not ships, which are
+/// set one by one) for this player. The game picks it up on its next frame.
+#[wasm_bindgen]
+pub fn set_custom_graphic(name: &str, sheet: &[u8]) -> Result<(), JsValue> {
+    let img = oss_assets::decode_image(sheet).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    crate::game::custom_ships::set_graphic(name, Some(img)).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Gives the graphic `name` back to the arena's or the game's own.
+#[wasm_bindgen]
+pub fn clear_custom_graphic(name: &str) -> Result<(), JsValue> {
+    crate::game::custom_ships::set_graphic(name, None).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Whether the pilot's own ships and graphics are shown (true) or the arena's.
+#[wasm_bindgen]
+pub fn use_own_graphics(on: bool) {
+    crate::game::custom_ships::set_use_own(on);
 }
 
 fn slot(ship: u8) -> Result<usize, JsValue> {

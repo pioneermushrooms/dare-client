@@ -1,5 +1,8 @@
-//! The pilot's own ship graphics: sheets that replace `ship1`..`ship8` for this
-//! player only, on top of whatever the arena's LVZ files and the install supply.
+//! The pilot's own graphics: sheets that replace `ship1`..`ship8`, and any other
+//! sheet an LVZ may replace (bombs, bullets, prizes...; see [`art::OVERRIDABLE`]),
+//! for this player only, on top of whatever the arena's LVZ files and the install
+//! supply. With [`set_use_own`] off, the arena's (and the game's own) are used
+//! instead, without forgetting the pilot's.
 //!
 //! A sheet is the layout the game already reads ship replacements in (see
 //! [`super::art::Art::ship`]): 40 square frames in 10 columns and 4 rows, so
@@ -13,9 +16,9 @@
 //! [`revision`] moves. What each slot shows after a rebuild is kept in
 //! [`shown`], so the page can display the ships the player is actually flying.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use oss_assets::{AssetDirs, Image};
 
@@ -31,6 +34,8 @@ pub const ROWS: u32 = 4;
 static CUSTOM: Mutex<[Option<Image>; SLOTS]> = Mutex::new([const { None }; SLOTS]);
 static SHOWN: Mutex<[Option<Image>; SLOTS]> = Mutex::new([const { None }; SLOTS]);
 static REVISION: AtomicU64 = AtomicU64::new(0);
+static OTHER: Mutex<BTreeMap<String, Image>> = Mutex::new(BTreeMap::new());
+static USE_OWN: AtomicBool = AtomicBool::new(true);
 
 /// Moves every time a sheet is set or cleared.
 pub fn revision() -> u64 {
@@ -74,6 +79,45 @@ pub fn set(slot: usize, img: Option<Image>) -> Result<(), String> {
     Ok(())
 }
 
+/// Uses `img` in place of the sheet named `name` (an [`art::OVERRIDABLE`] name other
+/// than `ships`, which is set ship by ship), or the arena's or game's own with `None`.
+/// A sheet with no transparency at all has its black keyed out, as LVZ sheets do.
+// Set by the page in browser play.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn set_graphic(name: &str, img: Option<Image>) -> Result<(), String> {
+    let name = name.to_ascii_lowercase();
+    if name == "ships" || !art::OVERRIDABLE.contains(&name.as_str()) {
+        return Err(format!("{name} isn't a graphic the pilot can replace"));
+    }
+    let mut other = OTHER.lock().unwrap_or_else(|e| e.into_inner());
+    match img {
+        Some(mut img) => {
+            if img.width == 0 || img.height == 0 {
+                return Err("that picture is empty".to_string());
+            }
+            if img.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255) {
+                img.key_black_transparent();
+            }
+            other.insert(name, img);
+        }
+        None => {
+            other.remove(&name);
+        }
+    }
+    REVISION.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Whether the pilot's own graphics go on top (true, the default) or the arena's
+/// and the game's own are shown instead. The pilot's stay set either way.
+// Set by the page in browser play.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn set_use_own(on: bool) {
+    if USE_OWN.swap(on, Ordering::Relaxed) != on {
+        REVISION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// The sheet ship `slot` (0..8) was drawn with at the last atlas build.
 // Set and read by the page in browser play.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -86,9 +130,16 @@ pub fn shown(slot: usize) -> Option<Image> {
         .flatten()
 }
 
-/// `overrides` (an arena's LVZ replacements) with the pilot's own sheets on top.
+/// `overrides` (an arena's LVZ replacements) with the pilot's own sheets on top,
+/// unless the pilot chose the arena's.
 pub fn merged(overrides: &HashMap<String, Image>) -> HashMap<String, Image> {
     let mut all = overrides.clone();
+    if !USE_OWN.load(Ordering::Relaxed) {
+        return all;
+    }
+    for (name, img) in OTHER.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        all.insert(name.clone(), img.clone());
+    }
     let custom = CUSTOM.lock().unwrap_or_else(|e| e.into_inner());
     for (k, img) in custom.iter().enumerate() {
         if let Some(img) = img {
@@ -191,6 +242,30 @@ mod tests {
         assert_eq!(all["ship3"].pixel(0, 0).unwrap()[3], 0);
         set(2, None).unwrap();
         assert_eq!(merged(&lvz)["ship3"].width, 360);
+    }
+
+    #[test]
+    fn own_graphics_cover_the_arenas_until_the_pilot_picks_the_arenas() {
+        let mut lvz = HashMap::new();
+        lvz.insert("bombs".to_string(), sheet(160, 208, 255));
+        assert!(set_graphic("ships", Some(sheet(360, 1152, 255))).is_err());
+        assert!(set_graphic("tiles", Some(sheet(304, 160, 255))).is_err());
+        let before = revision();
+        set_graphic("Bombs", Some(sheet(320, 416, 255))).unwrap();
+        set_graphic("prizes", Some(sheet(160, 16, 0))).unwrap();
+        assert!(revision() > before);
+        let all = merged(&lvz);
+        assert_eq!(all["bombs"].width, 320, "the pilot's own wins");
+        assert!(all.contains_key("prizes"));
+        set_use_own(false);
+        let arenas = merged(&lvz);
+        assert_eq!(arenas["bombs"].width, 160, "the arena's, when the pilot picks it");
+        assert!(!arenas.contains_key("prizes"));
+        set_use_own(true);
+        assert_eq!(merged(&lvz)["bombs"].width, 320, "and back, without setting them again");
+        set_graphic("bombs", None).unwrap();
+        set_graphic("prizes", None).unwrap();
+        assert_eq!(merged(&lvz)["bombs"].width, 160);
     }
 
     #[test]

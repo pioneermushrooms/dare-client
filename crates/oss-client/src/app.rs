@@ -257,6 +257,52 @@ struct Connecting {
     /// A question the zone has asked, drawn over the progress lines while it
     /// waits for an answer.
     prompt: Option<Prompt>,
+    /// When the screen opened, which its animation runs from.
+    since: web_time::Instant,
+    /// The warp through the stars the screen shows.
+    warp: crate::game::connect_screen::Warp,
+    /// What the browser page was last told about the way in, so it is told once
+    /// per change (see [`crate::web::loading_stage`]).
+    #[cfg(target_arch = "wasm32")]
+    told: Option<(&'static str, String, i32)>,
+}
+
+impl Connecting {
+    fn new(net: Online, art: Art, atlas: TextureId, login: Option<Login>) -> Box<Self> {
+        Box::new(Self {
+            net,
+            art,
+            atlas,
+            login,
+            prompt: None,
+            since: web_time::Instant::now(),
+            warp: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            told: None,
+        })
+    }
+
+    /// Tells the browser page where the way in has got to, when that changed.
+    /// The page keeps its own loader over the game until the arena is on
+    /// screen, or until the zone asks the player something ("prompt"), which
+    /// only the game's screen can show.
+    #[cfg(target_arch = "wasm32")]
+    fn tell_page(&mut self) {
+        let net = &self.net;
+        let percent = net
+            .progress
+            .map_or(-1, |p| (p.clamp(0.0, 1.0) * 100.0).floor() as i32);
+        let key = if self.prompt.is_some() {
+            "prompt"
+        } else {
+            net.stage.key()
+        };
+        let now = (key, net.detail.clone(), percent);
+        if self.told.as_ref() != Some(&now) {
+            crate::web::loading_stage(now.0, &now.1, now.2);
+            self.told = Some(now);
+        }
+    }
 }
 
 struct LoginScreen {
@@ -820,6 +866,10 @@ struct App {
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     #[cfg(target_arch = "wasm32")]
     initializing_graphics: bool,
+    /// When [`App::frame`] last ran, so the browser's timer between redraws
+    /// runs the game no more often than [`BROWSER_STEP`].
+    #[cfg(target_arch = "wasm32")]
+    last_frame: web_time::Instant,
     options: Options,
     dir: AssetDirs,
     level: Vec<u8>,
@@ -904,6 +954,8 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         proxy: event_loop.create_proxy(),
         #[cfg(target_arch = "wasm32")]
         initializing_graphics: false,
+        #[cfg(target_arch = "wasm32")]
+        last_frame: web_time::Instant::now(),
         options,
         dir,
         level,
@@ -1252,10 +1304,29 @@ impl ApplicationHandler<AppEvent> for App {
                 web_time::Instant::now() + std::time::Duration::from_millis(5),
             ));
         } else {
+            // A browser redraws only at the display's refresh rate: 60 Hz on most
+            // screens, 30 under some power settings. Driving the game from redraws
+            // alone made input, sends and received updates wait up to a frame each.
+            // Between redraws the game and the connection run on a short timer, the
+            // way a native window runs them as fast as it presents.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let now = web_time::Instant::now();
+                if now.saturating_duration_since(self.last_frame) >= BROWSER_STEP {
+                    self.frame(event_loop, false);
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_frame + BROWSER_STEP));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             event_loop.set_control_flow(ControlFlow::Poll);
         }
     }
 }
+
+/// How often the browser runs the game between redraws: well inside one 100 Hz
+/// simulation tick, and near the finest timer a page is given.
+#[cfg(target_arch = "wasm32")]
+const BROWSER_STEP: std::time::Duration = std::time::Duration::from_millis(4);
 
 impl App {
     fn finish_resume(
@@ -1313,13 +1384,7 @@ impl App {
                     Ok(a) => a,
                     Err(e) => return self.fail(event_loop, e),
                 };
-                Screen::Connecting(Box::new(Connecting {
-                    net,
-                    art,
-                    atlas,
-                    login: None,
-                    prompt: None,
-                }))
+                Screen::Connecting(Connecting::new(net, art, atlas, None))
             }
             Mode::Replay(path) => {
                 let net = match Online::open_replay(path) {
@@ -1330,13 +1395,7 @@ impl App {
                     Ok(a) => a,
                     Err(e) => return self.fail(event_loop, e),
                 };
-                Screen::Connecting(Box::new(Connecting {
-                    net,
-                    art,
-                    atlas,
-                    login: None,
-                    prompt: None,
-                }))
+                Screen::Connecting(Connecting::new(net, art, atlas, None))
             }
             Mode::Login(z) => {
                 let (art, atlas) = match load_art(&self.dir, &mut renderer) {
@@ -1387,6 +1446,10 @@ impl App {
     /// One frame: input, network, simulation and (when `draw`) rendering.
     fn frame(&mut self, event_loop: &ActiveEventLoop, draw: bool) {
         let frame_at = web_time::Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.last_frame = frame_at;
+        }
         if let Some(g) = self.gilrs.as_mut() {
             while let Some(ev) = g.next_event() {
                 let pressed = self.input.gamepad(ev.event);
@@ -1688,13 +1751,8 @@ impl App {
                             if let Some(ui) = skin {
                                 ui.tex.free(&mut run.renderer);
                             }
-                            run.screen = Screen::Connecting(Box::new(Connecting {
-                                net,
-                                art,
-                                atlas,
-                                login: Some(login),
-                                prompt: None,
-                            }));
+                            run.screen =
+                                Screen::Connecting(Connecting::new(net, art, atlas, Some(login)));
                         }
                         Err(e) => ls.login.error = Some(e),
                     }
@@ -1818,9 +1876,16 @@ impl App {
             } else {
                 None
             };
+            // The zone may have given a different name (a guest's), and a log sent
+            // for the staff is looked up by it.
+            if let Some(me) = conn.net.session.me() {
+                log::info!("flying as {}", me.name);
+            }
             match Sandbox::new_online(&mut run.renderer, &self.dir, conn.net, run.scale, audio) {
                 Ok(mut s) => {
                     log::info!("entered arena and initialized game view");
+                    #[cfg(target_arch = "wasm32")]
+                    crate::web::loading_stage("playing", "", 100);
                     s.aim_bot = self.options.autopilot;
                     s.scripted = self.options.send.clone();
                     s.open_screen(self.options.open_screen);
@@ -1915,10 +1980,10 @@ impl App {
                     run.scale,
                     (0.0, 0.0),
                 );
+                let t = conn.since.elapsed().as_secs_f32();
+                conn.warp.draw(&c, &mut run.renderer, &conn.net, t);
                 if let Some(prompt) = conn.prompt.as_mut() {
                     prompt.draw(&c, &mut run.renderer, cursor);
-                } else {
-                    draw_progress(&c, &mut run.renderer, &conn.net);
                 }
                 None
             }
@@ -1940,6 +2005,10 @@ impl App {
         match run.renderer.render(stars, 0.0) {
             Ok(()) | Err(FrameError::Skip) => {}
             Err(FrameError::Fatal(e)) => return self.fail(event_loop, e),
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Screen::Connecting(conn) = &mut run.screen {
+            conn.tell_page();
         }
         run.renderer.perf().frame_done(frame_at.elapsed());
         if let Some(at) = self.options.quit_at
@@ -2456,39 +2525,6 @@ fn draw_start_screen(
         .enumerate()
     {
         c.text(r, x + 4.0, foot + 18.0 + i as f32 * 12.0, colour, line);
-    }
-}
-
-/// The connecting screen while nothing is being asked: where the connection has
-/// got to, how to give up, and a bar for the arena's downloads.
-fn draw_progress(c: &Canvas, r: &mut Renderer, net: &Online) {
-    let lines = [net.status.as_str(), "", "Esc to give up"];
-    for (i, line) in lines.iter().enumerate() {
-        let x = ((c.view_w - line.len() as f32 * 8.0) / 2.0).floor();
-        let y = (c.view_h / 2.0 - 20.0 + i as f32 * 14.0).floor();
-        c.text(
-            r,
-            x,
-            y,
-            if i == 0 { color::GREEN } else { color::WHITE },
-            line,
-        );
-    }
-    // The bar, in the gap under the status line, filled by how much of the
-    // arena's content has arrived (counted in bytes).
-    if let Some(done) = net.progress {
-        let w = (c.view_w * 0.5).clamp(80.0, 320.0).floor();
-        let x = ((c.view_w - w) / 2.0).floor();
-        let y = (c.view_h / 2.0 - 20.0 + 14.0 + 3.0).floor();
-        c.rect(r, x, y, w, 6.0, [0.15, 0.15, 0.2, 1.0]);
-        c.rect(
-            r,
-            x,
-            y,
-            (w * done.clamp(0.0, 1.0)).floor(),
-            6.0,
-            [0.25, 0.8, 0.35, 1.0],
-        );
     }
 }
 

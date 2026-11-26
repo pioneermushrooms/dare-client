@@ -280,6 +280,33 @@ impl Canvas {
         }
     }
 
+    /// Text in the font's white row, tinted `rgba`: for shades the font's own
+    /// rows do not have, like the grey of a step not reached yet.
+    pub fn text_tinted(&self, r: &mut Renderer, x: f32, y: f32, rgba: [f32; 4], s: &str) {
+        if self.font.w == 0 {
+            return;
+        }
+        for (i, ch) in s.chars().enumerate() {
+            let c = ch as u32;
+            if !(32..128).contains(&c) {
+                continue;
+            }
+            let glyph = self.font.frame(8, 12, c - 32);
+            self.ui(r, glyph, x + i as f32 * 8.0, y, None, rgba);
+        }
+    }
+
+    /// One letter of the font's white row at `scale` times its size, tinted
+    /// `rgba`, with its top-left at (x, y).
+    pub fn glyph(&self, r: &mut Renderer, x: f32, y: f32, scale: f32, rgba: [f32; 4], ch: char) {
+        let c = ch as u32;
+        if self.font.w == 0 || !(33..128).contains(&c) {
+            return;
+        }
+        let glyph = self.font.frame(8, 12, c - 32);
+        self.ui(r, glyph, x, y, Some((8.0 * scale, 12.0 * scale)), rgba);
+    }
+
     /// Text right-aligned so it ends at `right`.
     pub fn text_right(&self, r: &mut Renderer, right: f32, y: f32, color: u32, s: &str) {
         self.text(r, right - s.chars().count() as f32 * 8.0, y, color, s);

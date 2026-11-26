@@ -390,6 +390,13 @@ function shareShips() {
     clear: (ship) => game.clear_custom_ship(ship),
     sheet: (ship) => game.ship_sheet(ship), // { width, height, rgba } or null before the game draws
   };
+  // Every other graphic the arena could replace (bombs, bullets, prizes...), and whether the
+  // pilot's own are shown or the arena's.
+  globalThis.dareGraphics = {
+    set: (name, sheetBytes) => game.set_custom_graphic(name, sheetBytes), // PNG or BMP bytes
+    clear: (name) => game.clear_custom_graphic(name),
+    useOwn: (on) => game.use_own_graphics(!!on),
+  };
   globalThis.dispatchEvent(new Event("dare-ships-ready"));
 }
 
@@ -462,6 +469,7 @@ function enter(name, pass, arena, settings) {
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
+    startReport(name, arena);
     game.start_dare_in(name, pass, arena, settings);
   } catch (error) {
     entry.hidden = false;
@@ -469,6 +477,55 @@ function enter(name, pass, arena, settings) {
     say(error?.message ?? String(error), true);
   }
 }
+
+// ---- the game's log, for the zone's staff ------------------------------------------------------
+// While the pilot is in the game, what the game writes to the console (connecting, its "perf:" and
+// "tracking:" figures every ten seconds, errors) goes to the site every 30 s and when the page
+// closes, so a report of lag can be looked into without asking the pilot for anything. The game
+// writes no chat, keys or passwords there. At most 400 lines per send; the rest are counted.
+const REPORT_URL = "/clientlog";
+const report = { id: "", pilot: "", arena: "", seq: 0, started: 0, lines: [], dropped: 0 };
+
+function note(level, args) {
+  if (!report.started) return;
+  if (report.lines.length >= 400) { report.dropped++; return; }
+  const text = args.map((a) => (typeof a === "string" ? a : a?.message ?? String(a))).join(" ");
+  report.lines.push([Math.round(performance.now() - report.started), level, text.slice(0, 2000)]);
+}
+for (const level of ["info", "warn", "error"]) {
+  const original = console[level].bind(console);
+  console[level] = (...args) => { note(level, args); original(...args); };
+}
+addEventListener("error", (e) => note("error", [`page: ${e.message}`]));
+addEventListener("unhandledrejection", (e) => note("error", [`page: ${e.reason?.message ?? e.reason}`]));
+
+function sendReport(closing) {
+  if (!report.started || (!report.lines.length && !closing)) return;
+  const net = navigator.connection;
+  const body = JSON.stringify({
+    id: report.id, seq: report.seq++, version, pilot: report.pilot, arena: report.arena,
+    seconds: Math.round((performance.now() - report.started) / 1000), closing,
+    ua: navigator.userAgent, platform: navigator.userAgentData?.platform ?? navigator.platform,
+    screen: `${screen.width}x${screen.height}@${devicePixelRatio}`, cores: navigator.hardwareConcurrency,
+    net: net ? { type: net.effectiveType, rtt: net.rtt, downlink: net.downlink } : null,
+    lines: report.lines, dropped: report.dropped,
+  });
+  report.lines = [];
+  report.dropped = 0;
+  const blob = new Blob([body], { type: "application/json" });
+  if (closing && navigator.sendBeacon?.(REPORT_URL, blob)) return;
+  fetch(REPORT_URL, { method: "POST", body: blob, keepalive: true }).catch(() => {});
+}
+
+function startReport(pilot, arena) {
+  report.id = crypto.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  report.pilot = pilot;
+  report.arena = arena;
+  report.started = performance.now();
+  note("info", [`page: entering ${arena || "public"} as ${pilot}`]);
+  setInterval(() => sendReport(false), 30000);
+}
+addEventListener("pagehide", () => sendReport(true));
 
 // ---- start ----------------------------------------------------------------------------------
 try {
