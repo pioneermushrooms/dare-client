@@ -211,6 +211,15 @@ pub fn keys_type(
         }
 }
 
+/// The line that tells a player arriving how to talk.
+pub fn chat_help(enter_to_chat: bool) -> &'static str {
+    if enter_to_chat {
+        "Enter to chat, V for voice lines, Esc for the menu."
+    } else {
+        "Type to chat, Esc for the menu."
+    }
+}
+
 /// The clip for a chat sound id: 128-255 are voice lines (`voice<id>`), 1-26 Continuum's
 /// classic chat sounds (`bong<id>`); anything else plays nothing.
 pub fn clip_name(sound: u8) -> Option<String> {
@@ -394,6 +403,15 @@ mod tests {
         assert!(!m.hint_due(5.0));
         assert!(!m.hint_due(19.9));
         assert!(m.hint_due(20.0));
+    }
+
+    #[test]
+    fn arrival_help_matches_the_setting() {
+        assert_eq!(
+            chat_help(true),
+            "Enter to chat, V for voice lines, Esc for the menu."
+        );
+        assert_eq!(chat_help(false), "Type to chat, Esc for the menu.");
     }
 
     #[test]

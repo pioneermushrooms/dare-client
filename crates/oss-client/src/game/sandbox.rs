@@ -132,6 +132,9 @@ pub struct Sandbox {
     pub enter_to_chat: bool,
     /// The voice menu (V).
     pub(super) voice: super::voice::VoiceMenu,
+    /// How to talk is said on the first frame, once the Enter-to-chat setting is known
+    /// (it is set after the screen is built).
+    chat_help_due: bool,
     /// The last player you killed and the last who killed you (,
     /// ).
     last_killed: Option<String>,
@@ -268,10 +271,7 @@ impl Sandbox {
             renderer, dir, tileset, world, objects, 0, scale, audio, None,
         )?;
         s.last_ship = ship.min(7);
-        s.message(
-            "Welcome to the Open SubSpace sandbox. Type to chat, Esc for the menu.",
-            color::GREEN,
-        );
+        s.message("Welcome to the Open SubSpace sandbox.", color::GREEN);
         Ok(s)
     }
 
@@ -370,11 +370,9 @@ impl Sandbox {
                 "Playing a replay. Arrows move the camera, Ctrl follows the stat box selection.",
                 color::GREEN,
             );
+            s.chat_help_due = false;
         } else {
-            s.message(
-                format!("Entered arena {arena}. Type to chat, Esc for the menu."),
-                color::GREEN,
-            );
+            s.message(format!("Entered arena {arena}."), color::GREEN);
             // Said here as well as in `?status`, because a session that quietly
             // fell back to VIE is exactly the thing a player should not have to
             // think to ask about.
@@ -433,6 +431,7 @@ impl Sandbox {
             chat: ChatLog::default(),
             enter_to_chat: true,
             voice: super::voice::VoiceMenu::new(),
+            chat_help_due: true,
             last_killed: None,
             last_killer: None,
             news: Vec::new(),
@@ -717,6 +716,9 @@ impl Sandbox {
         self.last = now;
         self.clock += dt.as_secs_f32();
         self.fps.frame(now);
+        if std::mem::take(&mut self.chat_help_due) {
+            self.message(voice::chat_help(self.enter_to_chat), color::GREEN);
+        }
         while self.scripted.last().is_some_and(|(t, _)| self.clock >= *t) {
             if let Some((_, line)) = self.scripted.pop() {
                 log::info!("--send: {line}");
