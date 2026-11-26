@@ -744,6 +744,75 @@ fn a_continuum_profile_reaches_the_wire_in_the_continuum_forms() {
     );
 }
 
+/// A zone that verifies the executable checksum (ASSS, SubspaceServer) compares a
+/// VIE client's answer with `vie_exe_checksum(key)`. The keyed profile has to get
+/// that value onto the wire, in the 40-byte SubSpace form, with the rest of the
+/// response still the session's own work.
+#[test]
+fn the_keyed_profile_sends_the_checksum_a_verifying_zone_expects() {
+    let mut now = 1_000u64;
+    let mut server = Server::new(Config::server());
+    server.add_acceptor(Box::new(VieAcceptor::default()));
+    let cfg = SessionConfig {
+        name: "keyed".into(),
+        password: "pw".into(),
+        want_lvz: true,
+        client: oss_session::client::vie_keyed(),
+        ..Default::default()
+    };
+    let mut client = Session::new(cfg, now, 0xBEEF);
+    let mut zone = Zone::default();
+
+    for _ in 0..2000 {
+        now += 10;
+        client.tick(now);
+        while let Some(d) = client.poll_transmit() {
+            server.handle_datagram(now, ADDR, &d);
+        }
+        server.tick(now);
+        while let Some((_, ev)) = server.poll_event() {
+            if let Event::Packet(p) = ev {
+                zone.handle(&mut server, &p);
+            }
+        }
+        while let Some((_, d)) = server.poll_transmit() {
+            client.handle_datagram(now, &d);
+        }
+        while let Some(ev) = client.poll_event() {
+            match &ev {
+                SessionEvent::MapNeeded { .. } => client.download_map(),
+                SessionEvent::FilesListed(files) => {
+                    for f in files {
+                        client.download_file(&f.name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if zone.security.is_some() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        zone.login_wire,
+        Some((oss_proto::c2s::Login::VIE_LEN, 0x09, 134)),
+        "it logs in as the SubSpace client"
+    );
+    let sec = zone.security.expect("security response");
+    assert_eq!(sec.exe_checksum, checksum::vie_exe_checksum(KEY));
+    assert_eq!(
+        zone.security_len,
+        Some(oss_proto::c2s::SecurityResponse::VIE_LEN),
+        "in the SubSpace form"
+    );
+    assert_eq!(sec.continuum, None);
+    assert_eq!(
+        sec.settings_checksum,
+        checksum::settings_checksum(KEY, &zone.settings)
+    );
+}
+
 #[test]
 fn logs_in_enters_arena_downloads_map_and_plays() {
     let mut now = 1_000u64;

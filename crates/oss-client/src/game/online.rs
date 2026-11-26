@@ -33,8 +33,26 @@ pub struct Supplied {
     /// [`ServerOptions::security`] names.
     pub security: Option<Security>,
     /// Which client the session presents itself as. `None` is
-    /// [`oss_session::VieClient`], as [`SessionConfig`] defaults to.
+    /// [`oss_session::VieClient`], as [`SessionConfig`] defaults to, except in
+    /// the browser build, where it is [`oss_session::KeyedVieClient`]: the
+    /// browser plays on the Foundation zone only, which verifies the keyed
+    /// executable checksum.
     pub client: Option<Profile>,
+}
+
+/// The client a connection presents when nothing is supplied.
+///
+/// The browser build connects to the Foundation zone only (its transport refuses
+/// any other server). That zone runs SubspaceServer, which compares a VIE
+/// client's executable checksum with the keyed value and reports every zero to
+/// its sysops as a mismatch, so the browser answers with the keyed value. The
+/// native client keeps the 1.34 client's zero.
+fn default_client(browser: bool) -> Profile {
+    if browser {
+        oss_session::client::vie_keyed()
+    } else {
+        SessionConfig::default().client
+    }
 }
 
 /// The zone's news, cached beside its maps under Continuum's name for it.
@@ -254,7 +272,7 @@ impl Online {
             client: supplied
                 .client
                 .clone()
-                .unwrap_or_else(|| SessionConfig::default().client),
+                .unwrap_or_else(|| default_client(cfg!(target_arch = "wasm32"))),
             redirect_id,
             ..Default::default()
         };
@@ -923,7 +941,9 @@ mod tests {
     use oss_session::security::{HandshakeRequest, SecurityMode, SecurityProfile};
     use oss_session::{ClientProfile, LoginForm, Profile, SecurityAnswer, SecurityChallenge};
 
-    use super::{Downloads, Online, ServerOptions, Supplied, redirect_recording, size_text};
+    use super::{
+        Downloads, Online, ServerOptions, Supplied, default_client, redirect_recording, size_text,
+    };
 
     /// A recording carries on beside the first after a redirect, never over it.
     #[test]
@@ -1025,6 +1045,28 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(net.session.config().client.login().kind, 0x09);
         drop(net);
+    }
+
+    /// The browser build plays on Foundation only, whose zone verifies the keyed
+    /// executable checksum; the native client keeps the 1.34 client's zero. Both
+    /// log in as the SubSpace client.
+    #[test]
+    fn the_browser_answers_with_the_keyed_exe_checksum() {
+        let challenge = SecurityChallenge {
+            key: 0x1234_5678,
+            map_crc32: None,
+        };
+        let browser = default_client(true);
+        assert_eq!(
+            browser.security(challenge).exe_checksum,
+            oss_proto::checksum::vie_exe_checksum(challenge.key)
+        );
+        assert_eq!(browser.login().kind, 0x09);
+        assert_eq!(browser.security(challenge).continuum, None);
+
+        let native = default_client(false);
+        assert_eq!(native.security(challenge).exe_checksum, 0);
+        assert_eq!(native.login().kind, 0x09);
     }
 
     /// An arena as it arrives: a big map, then a handful of small files.

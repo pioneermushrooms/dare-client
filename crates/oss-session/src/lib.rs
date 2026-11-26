@@ -33,7 +33,9 @@ use oss_proto::s2c::{self, MapFilename, login_code};
 use oss_proto::wire::Redacted;
 use oss_proto::{C2SPosition, ClientSettings, FixedStr, Packet, S2CPacket, WeaponInfo, checksum};
 
-pub use client::{ClientProfile, LoginForm, Profile, SecurityAnswer, SecurityChallenge, VieClient};
+pub use client::{
+    ClientProfile, KeyedVieClient, LoginForm, Profile, SecurityAnswer, SecurityChallenge, VieClient,
+};
 pub use oss_net::DisconnectReason as Reason;
 pub use oss_proto::common::chat_type;
 pub use oss_proto::common::{Brick, ObjectChange, object_change};
