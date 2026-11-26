@@ -203,6 +203,8 @@ pub struct Options {
     pub open_screen: Option<StartScreen>,
     /// Macro keys from the settings file.
     pub macros: Vec<(crate::game::input::Binding, String)>,
+    /// Enter opens chat; letters drive the voice menu (settings `[chat] enter_to_chat`).
+    pub enter_to_chat: bool,
     /// Directory servers for the zone browser.
     pub directories: Vec<String>,
     /// Connection encryption.
@@ -879,6 +881,7 @@ impl ApplicationHandler for App {
                             }
                         }
                         s.macros = self.options.macros.clone();
+                        s.enter_to_chat = self.options.enter_to_chat;
                         s.palette = self.options.palette;
                         s.ui_scale_extra = self.options.ui_scale;
                         Screen::Game(Box::new(s))
@@ -1396,6 +1399,7 @@ impl App {
                     match Sandbox::new(&mut run.renderer, &self.dir, &level, 0, run.scale, audio) {
                         Ok(mut s) => {
                             s.macros = self.options.macros.clone();
+                            s.enter_to_chat = self.options.enter_to_chat;
                             s.palette = self.options.palette;
                             s.ui_scale_extra = self.options.ui_scale;
                             // The start screen goes away here; its skin's texture
@@ -1580,6 +1584,7 @@ impl App {
                         }
                     }
                     s.macros = self.options.macros.clone();
+                    s.enter_to_chat = self.options.enter_to_chat;
                     s.palette = self.options.palette;
                     s.ui_scale_extra = self.options.ui_scale;
                     run.screen = Screen::Game(Box::new(s));
@@ -1769,6 +1774,7 @@ impl App {
         o.player_name = cfg.name.clone();
         o.bindings = cfg.bindings.clone();
         o.macros = cfg.macros.clone();
+        o.enter_to_chat = cfg.enter_to_chat;
         o.palette = cfg.palette;
         o.ui_scale = cfg.ui_scale;
         o.pad = cfg.pad.clone();
@@ -1796,6 +1802,7 @@ impl App {
                     cfg.palette,
                     cfg.ui_scale,
                 );
+                game.set_enter_to_chat(cfg.enter_to_chat);
             }
         }
         self.options.fullscreen = cfg.fullscreen;

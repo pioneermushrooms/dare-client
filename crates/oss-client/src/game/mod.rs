@@ -23,4 +23,6 @@ pub mod start_spots;
 pub mod statbox;
 mod tracking;
 pub mod view;
+pub mod voice;
+mod voice_table;
 pub mod zones;
