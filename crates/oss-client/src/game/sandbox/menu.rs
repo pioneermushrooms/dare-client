@@ -154,62 +154,49 @@ impl Sandbox {
 
     fn bot_menu_input(&mut self, strokes: &[Stroke]) {
         for stroke in strokes {
-            match stroke.text.map(|c| c.to_ascii_lowercase()) {
-                Some('l') => self.send_chat_line("?bots list"),
-                Some('s') => {
-                    self.chat.input = "?bots save ".into();
+            let Some(ch) = stroke.text.map(|c| c.to_ascii_lowercase()) else {
+                continue;
+            };
+            let Some(row) = BOT_ROWS.iter().find(|row| row.key == ch) else {
+                continue;
+            };
+            match row.prompt {
+                // Rows that just ask the zone something keep the panel up, so
+                // the answer shows in the log beneath it.
+                None => self.send_chat_line(row.command),
+                // Rows that need a bot name put the command on the chat line,
+                // close the menu and say what to type next.
+                Some(prompt) => {
+                    self.chat.input = format!("{} ", row.command);
                     self.bot_menu = false;
                     self.menu = false;
-                    self.message(
-                        "Enter a behavior and bot label, then press Enter.",
-                        color::YELLOW,
-                    );
+                    self.message(prompt, color::YELLOW);
                     break;
                 }
-                Some('r') => {
-                    self.chat.input = "?bots remove ".into();
-                    self.bot_menu = false;
-                    self.menu = false;
-                    self.message("Enter the bot label, then press Enter.", color::YELLOW);
-                    break;
-                }
-                _ => {}
             }
         }
     }
 
     fn draw_bot_menu(&mut self, c: &Canvas, r: &mut Renderer) {
-        let w = 320.0;
+        let w = 40.0 * 8.0;
         let x = ((c.view_w - w) / 2.0).floor();
         let y = 4.0;
-        c.panel(r, x, y, w, 116.0);
-        c.text_center(r, x + w / 2.0, y + 2.0, color::GREEN, "Arena bots");
+        let h = 20.0 + (BOT_ROWS.len() + BOT_NOTES.len()) as f32 * 12.0 + 6.0;
+        c.panel(r, x, y, w, h);
+        c.text_center(r, x + w / 2.0, y + 2.0, color::GREEN, "-= Arena bots =-");
         c.separator(r, x, y + 14.0, w);
         self.menu_spots.clear();
-        for (i, (label, key, ch)) in [
-            ("L = List bots", KeyCode::KeyL, 'l'),
-            ("S = Save bot", KeyCode::KeyS, 's'),
-            ("R = Remove bot", KeyCode::KeyR, 'r'),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let row = y + 20.0 + i as f32 * 12.0;
-            c.text(r, x + 4.0, row, color::WHITE, label);
+        for (i, row) in BOT_ROWS.iter().enumerate() {
+            let line_y = y + 20.0 + i as f32 * 12.0;
+            c.text(r, x + 4.0, line_y, color::WHITE, row.label);
             self.menu_spots.push((
-                Rect::new(x, row - 1.0, w, 12.0),
-                Stroke::press(key).typing(ch),
+                Rect::new(x, line_y - 1.0, w, 12.0),
+                Stroke::press(row.code).typing(row.key),
             ));
         }
-        for (i, line) in [
-            "Modes: idle patrol sentry fighter",
-            "Results appear in chat",
-            "Esc = Back",
-        ]
-        .iter()
-        .enumerate()
-        {
-            c.text(r, x + 4.0, y + 62.0 + i as f32 * 12.0, color::YELLOW, line);
+        let notes_y = y + 26.0 + BOT_ROWS.len() as f32 * 12.0;
+        for (i, line) in BOT_NOTES.iter().enumerate() {
+            c.text(r, x + 4.0, notes_y + i as f32 * 12.0, color::YELLOW, line);
         }
     }
 
@@ -349,6 +336,79 @@ fn may_leave(in_a_fight: bool, energy: i32, max_energy: i32) -> bool {
     !in_a_fight || energy * 2 >= max_energy
 }
 
+/// One row of the Manage bots panel: the key, what it says, the `?bots`
+/// command it runs, and -- for a row that needs a bot name -- what to tell the
+/// player to type after the command is put on the chat line.
+struct BotRow {
+    key: char,
+    code: KeyCode,
+    label: &'static str,
+    command: &'static str,
+    prompt: Option<&'static str>,
+}
+
+/// The panel's rows. Every line fits the 40-column box.
+const BOT_ROWS: [BotRow; 7] = [
+    BotRow {
+        key: 'c',
+        code: KeyCode::KeyC,
+        label: "C = Create a bot",
+        command: "?bots create",
+        prompt: Some("Type a name, behavior and ship, then Enter. e.g. Sparring fighter 3"),
+    },
+    BotRow {
+        key: 'l',
+        code: KeyCode::KeyL,
+        label: "L = List your bots",
+        command: "?bots list",
+        prompt: None,
+    },
+    BotRow {
+        key: 'e',
+        code: KeyCode::KeyE,
+        label: "E = Change behavior or ship",
+        command: "?bots set",
+        prompt: Some("Type the bot's name and its new behavior or ship, then Enter. e.g. Sparring patrol"),
+    },
+    BotRow {
+        key: 'd',
+        code: KeyCode::KeyD,
+        label: "D = Deploy (send a bot in)",
+        command: "?bots deploy",
+        prompt: Some("Type the name of the bot to send in, then Enter."),
+    },
+    BotRow {
+        key: 'p',
+        code: KeyCode::KeyP,
+        label: "P = Stop (pull a bot out)",
+        command: "?bots stop",
+        prompt: Some("Type the name of the bot to take out, then Enter. Its settings are kept."),
+    },
+    BotRow {
+        key: 'r',
+        code: KeyCode::KeyR,
+        label: "R = Remove a bot for good",
+        command: "?bots remove",
+        prompt: Some("Type the name of the bot to delete, then Enter."),
+    },
+    BotRow {
+        key: 'h',
+        code: KeyCode::KeyH,
+        label: "H = Help",
+        command: "?bots help",
+        prompt: None,
+    },
+];
+
+/// The lines under the rows.
+const BOT_NOTES: [&str; 5] = [
+    "fighter: chases and shoots pilots",
+    "patrol: flies waypoints  sentry: guards",
+    "idle: sits still  ship 1-8: as Esc menu",
+    "Waypoints & chat: Arena Editor (web)",
+    "Answers appear in chat.  Esc = Back",
+];
+
 /// What one of the menu's own keys means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuChoice {
@@ -436,6 +496,24 @@ mod tests {
         }
         // And the widest line of the left-hand column.
         assert!("PgUp/PgDn = Scroll messages".chars().count() <= cols(2.0));
+    }
+
+    /// The bots panel is a box of the same width: every row and note fits,
+    /// every row answers to its own key, and no two rows share one.
+    #[test]
+    fn the_bots_panel_fits_and_its_keys_are_its_own() {
+        let cols = ((40.0 * 8.0 - 4.0) / 8.0_f32).floor() as usize;
+        for line in super::BOT_ROWS.iter().map(|row| row.label).chain(super::BOT_NOTES) {
+            assert!(line.chars().count() <= cols, "{line:?} is wider than {cols}");
+        }
+        let mut keys: Vec<char> = super::BOT_ROWS.iter().map(|row| row.key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), super::BOT_ROWS.len());
+        assert!(super::BOT_ROWS.iter().any(|row| row.command == "?bots create"));
+        for row in &super::BOT_ROWS {
+            assert!(row.label.to_ascii_lowercase().starts_with(&format!("{} =", row.key)));
+        }
     }
 
     /// "There's no spectator mode anywhere in the game options menu." Offline,
