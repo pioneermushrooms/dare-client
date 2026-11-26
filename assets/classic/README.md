@@ -33,3 +33,6 @@ need nothing from here. A packaged build can also ship its own `assets/classic` 
 executable instead of this one.
 
 Nothing in the client's code depends on these particular files existing.
+
+`sound/voice*.wav` are not Continuum's: they are this fork's voice-menu clips (V, then letters),
+generated for it, one per voice line, named by the chat sound id the zone sends (128-255).

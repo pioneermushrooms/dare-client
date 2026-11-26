@@ -22,8 +22,87 @@ const GLOW: [f32; 4] = [0.31, 0.83, 1.0, 1.0];
 const MUTED: [f32; 4] = [0.72, 0.79, 0.88, 1.0];
 const DIM: [f32; 4] = [0.45, 0.52, 0.6, 1.0];
 
-/// Each step's share of the progress line, and the word shown under it.
-fn share(stage: Stage) -> (f32, f32, &'static str) {
+/// How long one of the ship's preparations stays up while its step lasts,
+/// and at least, when the step moves on sooner, in seconds.
+const PHRASE_EVERY: f32 = 2.6;
+const PHRASE_MIN: f32 = 1.2;
+
+/// The ship's preparations, in the order they make sense in, for each step
+/// (the browser page has the same, in its `loading.js`; its first list goes
+/// with its own step, downloading the game, which the desktop game shows
+/// while it connects).
+const SYSTEMS: &[&str] = &[
+    "Running pre-flight diagnostics",
+    "Powering up the main bus",
+    "Running reactor self-test",
+    "Venting the cryo lines",
+    "Bleeding the coolant loop",
+    "Refuelling",
+    "Priming the fuel injectors",
+    "Pressurising the cockpit",
+    "Booting the flight computer",
+    "Checking oxygen reserves",
+    "Loading weapons firmware",
+    "Calibrating inertial dampers",
+    "Spinning up the gyros",
+    "Warming up the thrusters",
+    "Checking your engines",
+    "Clearing debris from the intakes",
+    "Charging the capacitor banks",
+    "Topping off the afterburner",
+    "Checking hull integrity",
+    "Checking the thermal shielding",
+    "Bringing shields online",
+];
+const CONNECT: &[&str] = &[
+    "Tuning the radar",
+    "Aligning the comms array",
+    "Hailing the zone",
+    "Locking onto the nav beacon",
+    "Syncing the ship's clock",
+];
+const SIGN_IN: &[&str] = &[
+    "Transmitting pilot credentials",
+    "Verifying flight clearance",
+    "Requesting a launch window",
+    "Docking control: cleared",
+];
+const ENTER: &[&str] = &[
+    "Releasing the docking clamps",
+    "Testing the hyperdrive",
+    "Arming the hyperdrive",
+    "Spooling up the warp core",
+    "Engaging hyperdrive",
+];
+const DOWNLOAD: &[&str] = &[
+    "Downloading star charts",
+    "Mapping the sector",
+    "Plotting the jump exit",
+    "Scanning for hostiles",
+    "Marking the safe zones",
+    "Testing the repel generator",
+    "Loading the bursts",
+    "Stocking decoys and portals",
+    "Arming weapons",
+];
+const REPLAY: &[&str] = &["Rewinding the flight recorder", "Loading the tapes"];
+
+/// The preparations shown while `stage` lasts, in order.
+fn phrases(stage: Stage) -> Vec<&'static str> {
+    match stage {
+        // In the browser the page showed the systems checks while the game
+        // downloaded; on the desktop they open the connecting step.
+        Stage::Connect if cfg!(target_arch = "wasm32") => CONNECT.to_vec(),
+        Stage::Connect => SYSTEMS.iter().chain(CONNECT).copied().collect(),
+        Stage::SignIn => SIGN_IN.to_vec(),
+        Stage::Enter => ENTER.to_vec(),
+        Stage::Download => DOWNLOAD.to_vec(),
+        Stage::Replay => REPLAY.to_vec(),
+    }
+}
+
+/// Each step's share of the progress line.
+fn share(stage: Stage) -> (f32, f32) {
     // In the browser the page's own step, downloading the game, has the
     // first 45% of the line.
     let page = if cfg!(target_arch = "wasm32") {
@@ -33,12 +112,34 @@ fn share(stage: Stage) -> (f32, f32, &'static str) {
     };
     let at = |f: f32| page + (1.0 - page) * f;
     match stage {
-        Stage::Connect => (at(0.0), at(0.27), "Connecting"),
-        Stage::SignIn => (at(0.27), at(0.45), "Signing in"),
-        Stage::Enter => (at(0.45), at(0.6), "Joining the arena"),
-        Stage::Download => (at(0.6), 1.0, "Loading the map"),
-        Stage::Replay => (0.0, 1.0, "Loading the recording"),
+        Stage::Connect => (at(0.0), at(0.27)),
+        Stage::SignIn => (at(0.27), at(0.45)),
+        Stage::Enter => (at(0.45), at(0.6)),
+        Stage::Download => (at(0.6), 1.0),
+        Stage::Replay => (0.0, 1.0),
     }
+}
+
+/// The progress line `dt` seconds on from `shown`: eased toward `target`, and
+/// creeping by itself (faster the further it is from `cap`) where that is
+/// further, but never past `cap` and never back.
+fn move_line(shown: f32, target: f32, cap: f32, dt: f32) -> f32 {
+    let eased = shown + (target - shown) * (dt * 4.0).min(1.0);
+    let crept = shown + (0.0015 + 0.06 * (cap - shown).max(0.0)) * dt;
+    eased.max(crept).min(cap).max(shown)
+}
+
+/// Where the line may creep to while `stage` lasts: halfway into the next
+/// step's share, or nearly the end.
+fn creep_cap(stage: Stage) -> f32 {
+    let next = match stage {
+        Stage::Connect => Some(Stage::SignIn),
+        Stage::SignIn => Some(Stage::Enter),
+        Stage::Enter => Some(Stage::Download),
+        Stage::Download | Stage::Replay => None,
+    };
+    let (_, hi) = share(stage);
+    next.map_or(0.985, |n| hi + (share(n).1 - hi) * 0.5)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +162,15 @@ pub struct Warp {
     stage: Option<Stage>,
     stage_at: f32,
     last: Option<f32>,
+    /// The preparation on show, when it came up, and which step's list and
+    /// where in it.
+    phrase: &'static str,
+    phrase_at: f32,
+    phrase_stage: Option<Stage>,
+    phrase_index: usize,
+    /// Every preparation shown this visit, so none comes round again until
+    /// its step's list is used up.
+    said: Vec<&'static str>,
 }
 
 impl Default for Warp {
@@ -75,6 +185,11 @@ impl Default for Warp {
             stage: None,
             stage_at: 0.0,
             last: None,
+            phrase: "",
+            phrase_at: f32::NEG_INFINITY,
+            phrase_stage: None,
+            phrase_index: 0,
+            said: Vec::new(),
         };
         for _ in 0..STARS {
             let s = warp.star(false);
@@ -115,19 +230,73 @@ impl Warp {
         Star { x, y, z, color }
     }
 
-    /// Moves the progress line on: a step's downloads move it by their bytes,
-    /// other steps ease it on toward the end of their share while they last.
+    /// Moves the progress line on. It only moves forward and never stands
+    /// still: a step's downloads move it by their bytes, other steps ease it
+    /// on toward the end of their share, and underneath both it creeps on by
+    /// itself, slower the closer it gets to a little way into the next step.
     fn advance(&mut self, net: &Online, t: f32, dt: f32) {
         if self.stage != Some(net.stage) {
             self.stage = Some(net.stage);
             self.stage_at = t;
         }
-        let (lo, hi, _) = share(net.stage);
+        let wait = if self.phrase_stage == Some(net.stage) {
+            PHRASE_EVERY
+        } else {
+            PHRASE_MIN
+        };
+        if t - self.phrase_at >= wait {
+            self.say(net.stage, t);
+        }
+        let (lo, hi) = share(net.stage);
+        let cap = creep_cap(net.stage);
         let target = match net.progress.filter(|_| net.stage == Stage::Download) {
             Some(p) => lo + (hi - lo) * p.clamp(0.0, 1.0),
-            None => lo + (hi - lo) * 0.9 * (1.0 - (-(t - self.stage_at) / 1.6).exp()),
+            None => lo + (hi - lo) * 0.9 * (1.0 - (-(t - self.stage_at) / 2.0).exp()),
         };
-        self.shown = (self.shown + (target - self.shown) * (dt * 4.0).min(1.0)).max(self.shown);
+        self.shown = move_line(self.shown, target, cap, dt);
+    }
+
+    /// The next of the ship's preparations: further on in `stage`'s list
+    /// (from its start when the step is new), one of the next few not shown
+    /// this visit, so a load shows as many as its time allows and the next one
+    /// may show others. Nothing comes round again until the step's list is
+    /// used up, which only a long wait does.
+    fn say(&mut self, stage: Stage, t: f32) {
+        let list = phrases(stage);
+        let mut from = if self.phrase_stage == Some(stage) {
+            self.phrase_index + 1
+        } else {
+            0
+        };
+        if list.iter().skip(from).all(|p| self.said.contains(p)) {
+            from = 0;
+            self.said.retain(|p| !list.contains(p));
+        }
+        let ahead: Vec<usize> = (from..list.len())
+            .take(3)
+            .filter(|&i| !self.said.contains(&list[i]))
+            .collect();
+        // mostly the next one, sometimes one a little further on
+        let pick = match ahead.as_slice() {
+            [] => from.min(list.len().saturating_sub(1)),
+            [only] => *only,
+            [next, later @ ..] => {
+                let roll = self.random();
+                if roll < 0.6 {
+                    *next
+                } else {
+                    later[((roll - 0.6) / 0.4 * later.len() as f32) as usize % later.len()]
+                }
+            }
+        };
+        let Some(&text) = list.get(pick) else {
+            return;
+        };
+        self.phrase = text;
+        self.phrase_index = pick;
+        self.phrase_stage = Some(stage);
+        self.phrase_at = t;
+        self.said.push(text);
     }
 
     /// Cruising at first, faster as the way in gets on.
@@ -265,27 +434,17 @@ impl Warp {
             );
         }
 
-        // what is happening, with dots that come and go (kept centred as if
-        // all three were there, so the word does not shuffle)
-        let (_, _, word) = share(net.stage);
-        let dots = ((t * 2.5) as usize % 4).min(3);
-        let word = format!(
-            "{}{}{}",
-            word.to_uppercase(),
-            &"..."[..dots],
-            &"   "[dots..]
+        // what the ship is getting ready, faded in as it changes
+        let fade = ((t - self.phrase_at) / 0.25).clamp(0.0, 1.0);
+        spaced(
+            c,
+            r,
+            (cx, ly + 12.0),
+            1.0,
+            2.0,
+            [MUTED[0], MUTED[1], MUTED[2], fade],
+            &self.phrase.to_uppercase(),
         );
-        spaced(c, r, (cx, ly + 12.0), 1.0, 2.0, MUTED, &word);
-        if !net.detail.is_empty() {
-            let detail = fit(&net.detail, ((c.view_w - 16.0) / 8.0) as usize);
-            c.text_tinted(
-                r,
-                (cx - detail.len() as f32 * 4.0).floor(),
-                ly + 28.0,
-                DIM,
-                &detail,
-            );
-        }
         let esc = "Esc to cancel";
         c.text_tinted(
             r,
@@ -357,20 +516,6 @@ fn spaced(
     }
 }
 
-/// `s` cut to `room` characters, with "..." where it was cut.
-fn fit(s: &str, room: usize) -> String {
-    let n = s.chars().count();
-    if n <= room {
-        return s.to_string();
-    }
-    if room <= 3 {
-        return s.chars().take(room).collect();
-    }
-    let mut out: String = s.chars().take(room - 3).collect();
-    out.push_str("...");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,12 +525,55 @@ mod tests {
         let steps = [Stage::Connect, Stage::SignIn, Stage::Enter, Stage::Download];
         let mut end = share(steps[0]).0;
         for s in steps {
-            let (lo, hi, _) = share(s);
+            let (lo, hi) = share(s);
             assert_eq!(lo, end, "{s:?} starts where the last ended");
             assert!(hi > lo);
             end = hi;
         }
         assert_eq!(end, 1.0);
+    }
+
+    #[test]
+    fn the_line_creeps_on_but_not_past_its_cap_and_phrases_change() {
+        // Nothing reports for a long while: the line still moves every frame,
+        // into the next step's share, and stops short of its cap.
+        let (lo, hi) = share(Stage::Connect);
+        let cap = creep_cap(Stage::Connect);
+        let mut shown = lo;
+        for _ in 0..4000 {
+            let next = move_line(shown, lo, cap, 0.05);
+            assert!(next > shown || next == cap, "stood still at {shown}");
+            assert!(next <= cap);
+            shown = next;
+        }
+        assert!(shown > hi, "it crept into the next share");
+        // A real figure ahead of the creep pulls it on faster, but not past the cap.
+        assert!(move_line(lo, hi, cap, 0.05) > move_line(lo, lo, cap, 0.05));
+        assert_eq!(move_line(cap, 1.0, cap, 0.05), cap);
+
+        // The preparations go forward through a step's list, none twice,
+        // until it is used up; then it starts over at the top.
+        let mut warp = Warp::default();
+        let mut seen = Vec::new();
+        loop {
+            warp.say(Stage::Download, seen.len() as f32);
+            if seen.contains(&warp.phrase) {
+                break;
+            }
+            if let Some(&last) = seen.last() {
+                let at = |p| DOWNLOAD.iter().position(|q| *q == p).unwrap();
+                assert!(at(warp.phrase) > at(last), "went back in the list");
+            }
+            seen.push(warp.phrase);
+        }
+        assert!(
+            seen.len() >= DOWNLOAD.len() / 3,
+            "skipped too many: {seen:?}"
+        );
+        assert!(warp.phrase_index <= 2, "started over near the top");
+        // a new step starts near the top of its own list
+        warp.say(Stage::Enter, 99.0);
+        assert!(warp.phrase_index <= 2 && ENTER.contains(&warp.phrase));
     }
 
     #[test]
@@ -397,12 +585,5 @@ mod tests {
             assert!(s.x * s.x + s.y * s.y >= 0.004);
             assert!((0.05..=1.0).contains(&s.z));
         }
-    }
-
-    #[test]
-    fn long_lines_are_cut_with_dots() {
-        assert_eq!(fit("tactical.lvl", 20), "tactical.lvl");
-        assert_eq!(fit("a-very-long-file-name.lvz", 10), "a-very-...");
-        assert_eq!(fit("abcdef", 2), "ab");
     }
 }

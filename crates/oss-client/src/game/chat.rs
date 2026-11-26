@@ -387,6 +387,9 @@ pub struct ChatLog {
     /// as in SubSpace and Continuum, and the line is only drawn once it has
     /// something in it (nullspace `ChatController::Render`, `if (input[0] != 0)`).
     pub input: String,
+    /// Enter-to-chat (ours): the line was opened with Enter and takes characters until
+    /// it is sent or cancelled. Always false with Enter-to-chat off.
+    pub open: bool,
     /// Rows scrolled back from the newest (ours; Continuum cannot scroll).
     scroll: usize,
     /// Names that messaged you privately, newest first.
@@ -405,6 +408,7 @@ impl Default for ChatLog {
         Self {
             entries: Vec::new(),
             input: String::new(),
+            open: false,
             scroll: 0,
             privates: Vec::new(),
             namelen: DEFAULT_NAMELEN,
@@ -555,8 +559,21 @@ impl ChatLog {
     /// Enter: takes the line and leaves the chat line empty again.
     pub fn submit(&mut self) -> String {
         self.completing = None;
+        self.open = false;
         let line = std::mem::take(&mut self.input);
         line.trim().to_string()
+    }
+
+    /// Enter-to-chat: Enter opens the line for typing.
+    pub fn open(&mut self) {
+        self.open = true;
+    }
+
+    /// Enter-to-chat: Esc throws the line away and closes it.
+    pub fn cancel(&mut self) {
+        self.completing = None;
+        self.input.clear();
+        self.open = false;
     }
 
     /// Tab: completes `:partial` to a player name, cycling on repeats.
@@ -836,6 +853,29 @@ mod tests {
         assert_eq!(log.input, ":Alpha:");
         log.type_char(':');
         assert_eq!(log.input, ":Bravo:");
+    }
+
+    #[test]
+    fn enter_opens_and_submit_closes() {
+        let mut log = ChatLog::default();
+        assert!(!log.open);
+        log.open();
+        assert!(log.open);
+        for c in "hi".chars() {
+            log.type_char(c);
+        }
+        assert_eq!(log.submit(), "hi");
+        assert!(!log.open);
+    }
+
+    #[test]
+    fn cancel_clears_and_closes() {
+        let mut log = ChatLog::default();
+        log.open();
+        log.type_char('x');
+        log.cancel();
+        assert!(!log.open);
+        assert!(log.input.is_empty());
     }
 
     #[test]

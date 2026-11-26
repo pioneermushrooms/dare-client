@@ -57,6 +57,10 @@ the start-up screen.
 
 ## Accessibility and scaling
 
+`[chat] enter_to_chat` (on by default; *Enter to chat* in the window's Accessibility section):
+Enter opens the chat line and V opens the voice menu. Off, every key types straight into chat
+as in SubSpace and Continuum, and the voice menu is not available.
+
 `[accessibility] palette` picks a colour-blind or high-contrast palette; `ui_scale` draws the
 interface larger than the world, so the chat, stat box and menus can be read at a size that
 suits you without zooming the game. `--scale <n>` sets the integer pixel scale for the world

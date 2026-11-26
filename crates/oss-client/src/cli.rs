@@ -396,6 +396,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
             open_settings,
             open_screen,
             macros: Vec::new(),
+            enter_to_chat: true,
             palette: Default::default(),
             ui_scale: 0,
             directories: directories.clone(),
@@ -473,6 +474,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
         open_settings,
         open_screen,
         macros: Vec::new(),
+        enter_to_chat: true,
         palette: Default::default(),
         ui_scale: 0,
         directories,
@@ -539,6 +541,7 @@ fn finish_options(opts: &mut app::Options, cfg: config::Config) -> Result<(), St
     opts.volume = cfg.volume;
     opts.bindings = cfg.bindings;
     opts.macros = cfg.macros;
+    opts.enter_to_chat = cfg.enter_to_chat;
     opts.palette = cfg.palette;
     opts.ui_scale = cfg.ui_scale;
     opts.pad = cfg.pad;
