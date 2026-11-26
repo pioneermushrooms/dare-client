@@ -7,6 +7,9 @@ rust-version.workspace = true
 license = "GPL-2.0-or-later"
 repository.workspace = true
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 oss-proto.workspace = true
 oss-net.workspace = true
@@ -16,6 +19,7 @@ oss-assets.workspace = true
 oss-session.workspace = true
 oss-credstore.workspace = true
 winit = "0.30"
+web-time = "1.1"
 wgpu = "30"
 gilrs = "0.11"
 bytemuck = { version = "1", features = ["derive"] }
@@ -36,3 +40,10 @@ jiff = { version = "0.2", default-features = false, features = [
 
 [lints]
 workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+cpal = { version = "0.18", features = ["wasm-bindgen"] }
+jiff = { version = "0.2", default-features = false, features = ["js"] }

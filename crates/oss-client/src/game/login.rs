@@ -139,8 +139,22 @@ pub enum DialogResult {
     Play(Choice),
 }
 
+/// The form's lines for the profile dialog (`profile`) or the plain form, with
+/// a password store (`vault`), in the browser (`browser`: no zone field).
+pub fn fields_for(profile: bool, vault: bool, browser: bool) -> &'static [Field] {
+    match (profile, vault) {
+        (true, _) if browser => &BROWSER_PROFILE_FIELDS,
+        (true, true) => &PROFILE_FIELDS_WITH_REMEMBER,
+        (true, false) => &PROFILE_FIELDS,
+        (false, true) => &FIELDS_WITH_REMEMBER,
+        (false, false) => &FIELDS,
+    }
+}
+
 /// The profile dialog's fields, in order.
 const PROFILE_FIELDS: [Field; 4] = [Field::Name, Field::Password, Field::Arena, Field::Server];
+/// The browser's: it plays on one zone, and has no password store.
+const BROWSER_PROFILE_FIELDS: [Field; 3] = [Field::Name, Field::Password, Field::Arena];
 const PROFILE_FIELDS_WITH_REMEMBER: [Field; 5] = [
     Field::Name,
     Field::Password,
@@ -378,12 +392,7 @@ impl Login {
     /// The form's lines, in order: with the Remember line only where there is a
     /// password store.
     pub fn fields(&self) -> &'static [Field] {
-        match (self.profile, self.vault) {
-            (true, true) => &PROFILE_FIELDS_WITH_REMEMBER,
-            (true, false) => &PROFILE_FIELDS,
-            (false, true) => &FIELDS_WITH_REMEMBER,
-            (false, false) => &FIELDS,
-        }
+        fields_for(self.profile, self.vault, cfg!(target_arch = "wasm32"))
     }
 
     /// Opens the profile dialog, on the first empty line (or the name).
@@ -635,6 +644,16 @@ fn parse_ship(v: &str) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_dialog_has_no_zone_field() {
+        assert_eq!(
+            fields_for(true, false, true),
+            &[Field::Name, Field::Password, Field::Arena]
+        );
+        assert!(fields_for(true, false, false).contains(&Field::Server));
+        assert!(fields_for(true, true, false).contains(&Field::Server));
+    }
+
     use super::*;
 
     /// The keystrokes a frame of these keys and this text arrives as.

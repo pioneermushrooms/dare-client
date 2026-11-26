@@ -4,14 +4,19 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use web_time::Instant;
 
-use oss_session::map::{MapCache, default_cache_dir};
+use oss_session::map::MapCache;
+#[cfg(not(target_arch = "wasm32"))]
+use oss_session::map::default_cache_dir;
 use oss_session::replay::{Player as ReplayPlayer, Recorder};
 use oss_session::security::{
     HandshakeRequest, Identities, KnownServers, Security, SecurityMode, built_in, fingerprint,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use oss_session::udp::UdpDriver;
+#[cfg(target_arch = "wasm32")]
+use crate::web::WebDriver as UdpDriver;
 use oss_session::{Profile, RegistrationForm, Session, SessionConfig, SessionEvent, State};
 
 /// What a build outside this repository can supply to a connection. Both halves
@@ -215,8 +220,8 @@ impl Online {
             redirect_id,
             ..Default::default()
         };
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let seed = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
             .unwrap_or(1);
         let now = driver.now_ms();
@@ -244,6 +249,9 @@ impl Online {
         });
         let security = supplied.security.clone().unwrap_or_else(built_in);
         let handshake = security.handshake(HandshakeRequest {
+            #[cfg(target_arch = "wasm32")]
+            mode: SecurityMode::Vie,
+            #[cfg(not(target_arch = "wasm32"))]
             mode: opts.security,
             pinned: pin,
             identity,
@@ -251,8 +259,8 @@ impl Online {
         });
         let mut session = Session::with_handshake(cfg, now, handshake);
         if let Some(path) = &opts.record {
-            let started = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let started = web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs())
                 .to_string();
             let meta = [
@@ -270,7 +278,10 @@ impl Online {
         Ok(Self {
             session,
             source: Source::Live(driver),
+            #[cfg(not(target_arch = "wasm32"))]
             cache: MapCache::new(default_cache_dir(&opts.server)),
+            #[cfg(target_arch = "wasm32")]
+            cache: MapCache::new(PathBuf::from("maps")),
             map: None,
             seeds: None,
             status: format!("Connecting to {}...", opts.server),

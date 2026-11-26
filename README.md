@@ -186,6 +186,17 @@ WebGPU-compatible for it, but it is not built or tested. This is 0.1.x: it has b
 against the original server software and against this project's own, and it has not been
 played by a hundred people at once.
 
+## Scripted arena bots
+
+Run one headless pilot with `cargo run --release -p oss-bot -- --server 127.0.0.1:5000 --script patrol.txt`.
+The script sets the pilot name, arena, ship, frequency, and behavior (`idle`, `patrol`,
+`sentry`, or `fighter`). It can also set waypoints, greetings, timed announcements, and chat replies.
+See the [script format](crates/oss-bot/src/script.rs) for an example and the supported fields.
+
+To supervise a bot, use `--script -`, send the script ending with `end` on its own line,
+and keep stdin open while the bot runs. Closing stdin stops the bot. Exit code `3` means
+the bot lost its connection to the zone.
+
 ## Reference
 
 - [docs/playing.md](docs/playing.md) — keys, gamepad, chat prefixes, client-side commands,

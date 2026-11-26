@@ -12,6 +12,10 @@ use crate::gfx::Renderer;
 impl Sandbox {
     /// Keys while the menu is up.
     pub(super) fn menu_input(&mut self, edges: &[Action], strokes: &[Stroke]) {
+        if self.bot_menu {
+            self.bot_menu_input(strokes);
+            return;
+        }
         // The menu lists F2 and F12, so they work while it is up -- they used to
         // be thrown away unread here -- and it stays up, because in Continuum the
         // menu is where display switches are flipped. F11 changes ship, so it
@@ -22,6 +26,10 @@ impl Sandbox {
                 Action::ShowFps => self.fps_view = self.fps_view.next(),
                 Action::Spectate => {
                     self.toggle_spectator();
+                    self.menu = false;
+                }
+                Action::Graphics => {
+                    self.open_graphics();
                     self.menu = false;
                 }
                 _ => {}
@@ -46,7 +54,7 @@ impl Sandbox {
             // usual.
             if let Some(c) = stroke.text {
                 let handled = self.menu_key(c);
-                self.menu = false;
+                self.menu = self.bot_menu;
                 if !handled {
                     self.chat.type_char(c);
                 }
@@ -55,6 +63,20 @@ impl Sandbox {
         if !self.menu {
             self.chat.scroll_to_bottom();
         }
+    }
+
+    /// G on the menu, or F8: the custom graphics overlay. The page that hosts
+    /// browser play draws it (it has the file picker and the pilot's shipyard)
+    /// and hands the chosen ship sheets back through `set_custom_ship`.
+    pub(super) fn open_graphics(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if crate::web::open_graphics() {
+            return;
+        }
+        self.message(
+            "Custom graphics are in browser play at subspacefoundation.com.",
+            color::YELLOW,
+        );
     }
 
     /// Q on the menu, or `?quit`: leave the game and go back to the front end.
@@ -113,6 +135,7 @@ impl Sandbox {
         match choice {
             MenuChoice::Quit => self.request_leave(),
             MenuChoice::Options => self.open_settings = true,
+            MenuChoice::Graphics => self.open_graphics(),
             MenuChoice::Spectate => self.request_ship(SPECTATOR),
             MenuChoice::News => {
                 self.news_open = true;
@@ -121,8 +144,60 @@ impl Sandbox {
             MenuChoice::Ship(kind) => self.request_ship(kind),
             MenuChoice::FrameRate => self.fps_view = self.fps_view.next(),
             MenuChoice::Arenas => self.ask_for_arenas(),
+            MenuChoice::Bots => {
+                self.bot_menu = true;
+                self.send_chat_line("?bots list");
+            }
         }
         true
+    }
+
+    fn bot_menu_input(&mut self, strokes: &[Stroke]) {
+        for stroke in strokes {
+            let Some(ch) = stroke.text.map(|c| c.to_ascii_lowercase()) else {
+                continue;
+            };
+            let Some(row) = BOT_ROWS.iter().find(|row| row.key == ch) else {
+                continue;
+            };
+            match row.prompt {
+                // Rows that just ask the zone something keep the panel up, so
+                // the answer shows in the log beneath it.
+                None => self.send_chat_line(row.command),
+                // Rows that need a bot name put the command on the chat line,
+                // close the menu and say what to type next.
+                Some(prompt) => {
+                    self.chat.input = format!("{} ", row.command);
+                    self.bot_menu = false;
+                    self.menu = false;
+                    self.message(prompt, color::YELLOW);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn draw_bot_menu(&mut self, c: &Canvas, r: &mut Renderer) {
+        let w = 40.0 * 8.0;
+        let x = ((c.view_w - w) / 2.0).floor();
+        let y = 4.0;
+        let h = 20.0 + (BOT_ROWS.len() + BOT_NOTES.len()) as f32 * 12.0 + 6.0;
+        c.panel(r, x, y, w, h);
+        c.text_center(r, x + w / 2.0, y + 2.0, color::GREEN, "-= Arena bots =-");
+        c.separator(r, x, y + 14.0, w);
+        self.menu_spots.clear();
+        for (i, row) in BOT_ROWS.iter().enumerate() {
+            let line_y = y + 20.0 + i as f32 * 12.0;
+            c.text(r, x + 4.0, line_y, color::WHITE, row.label);
+            self.menu_spots.push((
+                Rect::new(x, line_y - 1.0, w, 12.0),
+                Stroke::press(row.code).typing(row.key),
+            ));
+        }
+        let notes_y = y + 26.0 + BOT_ROWS.len() as f32 * 12.0;
+        for (i, line) in BOT_NOTES.iter().enumerate() {
+            c.text(r, x + 4.0, notes_y + i as f32 * 12.0, color::YELLOW, line);
+        }
     }
 
     /// The digit keys the menu's eight ships answer to, in order, so a click on
@@ -152,6 +227,10 @@ impl Sandbox {
     /// the menu reads characters, so a click that could only press a key code
     /// would do nothing here, exactly as `--press` could not.
     pub(super) fn draw_menu(&mut self, c: &Canvas, r: &mut Renderer) {
+        if self.bot_menu {
+            self.draw_bot_menu(c, r);
+            return;
+        }
         let ships = [
             "Ships",
             "1 = Warbird",
@@ -170,11 +249,13 @@ impl Sandbox {
         ];
         if self.online() {
             keys.push((" A = Arena list", Stroke::press(KeyCode::KeyA).typing('a')));
+            keys.push((" B = Manage bots", Stroke::press(KeyCode::KeyB).typing('b')));
         }
         if !self.news.is_empty() {
             keys.push((" N = Zone news", Stroke::press(KeyCode::KeyN).typing('n')));
         }
         keys.push((" O = Options", Stroke::press(KeyCode::KeyO).typing('o')));
+        keys.push((" G = Graphics", Stroke::press(KeyCode::KeyG).typing('g')));
         keys.push(("F12= Frame rate", Stroke::press(KeyCode::F12)));
         self.menu_spots.clear();
         // Spectator is a row under the eight ships, and it is there whether or
@@ -255,11 +336,86 @@ fn may_leave(in_a_fight: bool, energy: i32, max_energy: i32) -> bool {
     !in_a_fight || energy * 2 >= max_energy
 }
 
+/// One row of the Manage bots panel: the key, what it says, the `?bots`
+/// command it runs, and -- for a row that needs a bot name -- what to tell the
+/// player to type after the command is put on the chat line.
+struct BotRow {
+    key: char,
+    code: KeyCode,
+    label: &'static str,
+    command: &'static str,
+    prompt: Option<&'static str>,
+}
+
+/// The panel's rows. Every line fits the 40-column box.
+const BOT_ROWS: [BotRow; 7] = [
+    BotRow {
+        key: 'c',
+        code: KeyCode::KeyC,
+        label: "C = Create a bot",
+        command: "?bots create",
+        prompt: Some("Type a name, behavior and ship, then Enter. e.g. Sparring fighter 3"),
+    },
+    BotRow {
+        key: 'l',
+        code: KeyCode::KeyL,
+        label: "L = List your bots",
+        command: "?bots list",
+        prompt: None,
+    },
+    BotRow {
+        key: 'e',
+        code: KeyCode::KeyE,
+        label: "E = Change behavior or ship",
+        command: "?bots set",
+        prompt: Some("Type the bot's name and its new behavior or ship, then Enter. e.g. Sparring patrol"),
+    },
+    BotRow {
+        key: 'd',
+        code: KeyCode::KeyD,
+        label: "D = Deploy (send a bot in)",
+        command: "?bots deploy",
+        prompt: Some("Type the name of the bot to send in, then Enter."),
+    },
+    BotRow {
+        key: 'p',
+        code: KeyCode::KeyP,
+        label: "P = Stop (pull a bot out)",
+        command: "?bots stop",
+        prompt: Some("Type the name of the bot to take out, then Enter. Its settings are kept."),
+    },
+    BotRow {
+        key: 'r',
+        code: KeyCode::KeyR,
+        label: "R = Remove a bot for good",
+        command: "?bots remove",
+        prompt: Some("Type the name of the bot to delete, then Enter."),
+    },
+    BotRow {
+        key: 'h',
+        code: KeyCode::KeyH,
+        label: "H = Help",
+        command: "?bots help",
+        prompt: None,
+    },
+];
+
+/// The lines under the rows.
+const BOT_NOTES: [&str; 5] = [
+    "fighter: chases and shoots pilots",
+    "patrol: flies waypoints  sentry: guards",
+    "idle: sits still  ship 1-8: as Esc menu",
+    "Waypoints & chat: Arena Editor (web)",
+    "Answers appear in chat.  Esc = Back",
+];
+
 /// What one of the menu's own keys means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuChoice {
     Quit,
     Options,
+    /// Esc then G: the custom graphics overlay.
+    Graphics,
     Spectate,
     News,
     Ship(u8),
@@ -267,6 +423,7 @@ enum MenuChoice {
     FrameRate,
     /// Esc then A: the zone's arena list.
     Arenas,
+    Bots,
 }
 
 /// What a character typed on the menu does, or `None` for "any other key to
@@ -281,10 +438,12 @@ fn menu_choice(ch: char, has_news: bool, online: bool) -> Option<MenuChoice> {
     match ch.to_ascii_lowercase() {
         'q' => Some(MenuChoice::Quit),
         'o' => Some(MenuChoice::Options),
+        'g' => Some(MenuChoice::Graphics),
         's' => Some(MenuChoice::Spectate),
         'n' if has_news => Some(MenuChoice::News),
         'f' => Some(MenuChoice::FrameRate),
         'a' if online => Some(MenuChoice::Arenas),
+        'b' if online => Some(MenuChoice::Bots),
         d @ '1'..='8' => Some(MenuChoice::Ship(d as u8 - b'1')),
         _ => None,
     }
@@ -339,6 +498,24 @@ mod tests {
         assert!("PgUp/PgDn = Scroll messages".chars().count() <= cols(2.0));
     }
 
+    /// The bots panel is a box of the same width: every row and note fits,
+    /// every row answers to its own key, and no two rows share one.
+    #[test]
+    fn the_bots_panel_fits_and_its_keys_are_its_own() {
+        let cols = ((40.0 * 8.0 - 4.0) / 8.0_f32).floor() as usize;
+        for line in super::BOT_ROWS.iter().map(|row| row.label).chain(super::BOT_NOTES) {
+            assert!(line.chars().count() <= cols, "{line:?} is wider than {cols}");
+        }
+        let mut keys: Vec<char> = super::BOT_ROWS.iter().map(|row| row.key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), super::BOT_ROWS.len());
+        assert!(super::BOT_ROWS.iter().any(|row| row.command == "?bots create"));
+        for row in &super::BOT_ROWS {
+            assert!(row.label.to_ascii_lowercase().starts_with(&format!("{} =", row.key)));
+        }
+    }
+
     /// "There's no spectator mode anywhere in the game options menu." Offline,
     /// that was exactly true: the menu hid the row and the ship change refused
     /// spectator outright, so the sandbox -- where the lead was -- could not
@@ -355,6 +532,8 @@ mod tests {
         // The rest of the menu, so that pulling this out changed nothing else.
         assert_eq!(menu_choice('q', false, false), Some(MenuChoice::Quit));
         assert_eq!(menu_choice('o', false, false), Some(MenuChoice::Options));
+        assert_eq!(menu_choice('g', false, false), Some(MenuChoice::Graphics));
+        assert_eq!(menu_choice('G', true, true), Some(MenuChoice::Graphics));
         assert_eq!(menu_choice('1', false, false), Some(MenuChoice::Ship(0)));
         assert_eq!(menu_choice('8', false, false), Some(MenuChoice::Ship(7)));
         assert_eq!(menu_choice('f', false, false), Some(MenuChoice::FrameRate));

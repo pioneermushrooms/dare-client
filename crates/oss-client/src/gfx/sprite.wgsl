@@ -73,7 +73,7 @@ fn vs_fullscreen(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> 
 }
 
 fn hash(x: i32, y: i32, layer: u32) -> u32 {
-    var h = bitcast<u32>(x) * 0x8da6b343u ^ bitcast<u32>(y) * 0xd8163841u ^ layer * 0xcb1ab31fu;
+    var h = (bitcast<u32>(x) * 0x8da6b343u) ^ (bitcast<u32>(y) * 0xd8163841u) ^ (layer * 0xcb1ab31fu);
     h = h ^ (h >> 16u);
     h = h * 0x7feb352du;
     h = h ^ (h >> 15u);

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use oss_credstore::{OsStore, PasswordStore, account};
 

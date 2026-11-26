@@ -30,6 +30,39 @@ pub enum SkinAction {
     OpenProfile,
     NextSkin,
     Info(&'static str),
+    /// Ask to open the arena application (browser build).
+    CreateArena,
+}
+
+/// Running in the browser, where the list is Foundation's arenas.
+pub const IN_BROWSER: bool = cfg!(target_arch = "wasm32");
+
+/// The confirmation "+ CREATE" shows before it opens a tab.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub const CREATE_CONFIRM: &str =
+    "Open the arena builder in a new tab? Enter to confirm, Esc to cancel.";
+
+/// What the `trace` hot spot does: "+ CREATE" in the browser, a note elsewhere.
+pub fn trace_action(browser: bool) -> SkinAction {
+    if browser {
+        SkinAction::CreateArena
+    } else {
+        SkinAction::Info("Trace is coming in a later update.")
+    }
+}
+
+/// The answer to a pending confirmation in this frame's keys: Enter is yes, Esc is
+/// no. Asked before [`key`], so the Enter is not also taken as Play.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn confirm_key(strokes: &[Stroke]) -> Option<bool> {
+    strokes
+        .iter()
+        .filter(|s| !s.repeat)
+        .find_map(|s| match s.key? {
+            KeyCode::Enter | KeyCode::NumpadEnter => Some(true),
+            KeyCode::Escape => Some(false),
+            _ => None,
+        })
 }
 
 /// The hot spots Tab walks through, in order.
@@ -59,7 +92,7 @@ pub fn click(spot: &HotSpot, zone_row: Option<usize>, double: bool) -> Option<Sk
         HotSpot::Profile | HotSpot::ProfText | HotSpot::ProfBox => A::OpenProfile,
         HotSpot::ZoneUp => A::ScrollZones(-1),
         HotSpot::ZoneDown => A::ScrollZones(1),
-        HotSpot::Trace => A::Info("Trace is coming in a later update."),
+        HotSpot::Trace => trace_action(IN_BROWSER),
         HotSpot::ZoneText => {
             let row = zone_row?;
             if double {
@@ -162,6 +195,7 @@ pub fn scroll_to_show(selected: usize, scroll: usize, rows: usize) -> usize {
 }
 
 /// Where the zone that was selected is now, after the list changed.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn keep_selection(old_address: Option<&str>, zones: &[ZoneInfo]) -> Option<usize> {
     if zones.is_empty() {
         return None;
@@ -173,7 +207,73 @@ pub fn keep_selection(old_address: Option<&str>, zones: &[ZoneInfo]) -> Option<u
     )
 }
 
-/// The info box's text for a hot spot.
+/// Where the login form's arena is in the arena list (`""` is `public`), if listed.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn keep_arena_selection(arena: &str, zones: &[ZoneInfo]) -> Option<usize> {
+    let want = if arena.is_empty() {
+        crate::game::arenas::PUBLIC
+    } else {
+        arena
+    };
+    // Arena names are case-insensitive on the server.
+    zones
+        .iter()
+        .position(|z| z.address.eq_ignore_ascii_case(want))
+}
+
+/// What this frame does to a pending confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmStep {
+    /// Enter: go ahead.
+    Yes,
+    /// Esc: drop it.
+    No,
+    /// Something else was pressed or clicked: drop it, and let that act.
+    Cancel,
+    /// No input this frame.
+    Wait,
+}
+
+/// A pending confirmation against this frame's keys and click: Enter answers yes,
+/// Esc no, and any other key or a click quietly cancels it, so a later Enter
+/// cannot act on a question the player has moved on from.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn confirm_step(strokes: &[Stroke], clicked: bool) -> ConfirmStep {
+    match confirm_key(strokes) {
+        Some(true) => ConfirmStep::Yes,
+        Some(false) => ConfirmStep::No,
+        None if clicked || strokes.iter().any(|s| !s.repeat) => ConfirmStep::Cancel,
+        None => ConfirmStep::Wait,
+    }
+}
+
+/// The info box's text for a hot spot on this build's start screen.
+pub fn screen_help(spot: &HotSpot) -> &'static str {
+    help_for(spot, IN_BROWSER)
+}
+
+/// The help line for `spot`; `browser` gives the arena list's wording.
+pub fn help_for(spot: &HotSpot, browser: bool) -> &'static str {
+    if browser {
+        match spot {
+            HotSpot::Trace => {
+                return "+ Create: build your own arena, private until you publish it.";
+            }
+            HotSpot::Ping => return "Sort arenas by pilots or by name.",
+            HotSpot::Zones => return "Refresh the arena list. (F3, Cmd-R)",
+            HotSpot::ZoneText | HotSpot::ZoneBox => {
+                return "Click an arena to pick it; double-click to play there. (Up/Down)";
+            }
+            HotSpot::ZoneUp | HotSpot::ZoneDown => {
+                return "Scroll the arena list. (wheel, PgUp/PgDn)";
+            }
+            _ => {}
+        }
+    }
+    help(spot)
+}
+
+/// The info box's text for a hot spot (the desktop wording).
 pub fn help(spot: &HotSpot) -> &'static str {
     match spot {
         HotSpot::Play => "Play: join the selected zone. (Enter)",
@@ -267,6 +367,105 @@ mod tests {
         ));
         assert_eq!(click(&HotSpot::PrevProf, None, false), None);
         assert_eq!(click(&HotSpot::Other("user1".into()), None, false), None);
+    }
+
+    #[test]
+    fn create_confirm_names_the_builder() {
+        assert_eq!(
+            CREATE_CONFIRM,
+            "Open the arena builder in a new tab? Enter to confirm, Esc to cancel."
+        );
+    }
+
+    #[test]
+    fn confirm_key_reads_enter_and_escape() {
+        assert_eq!(confirm_key(&press(KeyCode::Enter)), Some(true));
+        assert_eq!(confirm_key(&press(KeyCode::NumpadEnter)), Some(true));
+        assert_eq!(confirm_key(&press(KeyCode::Escape)), Some(false));
+        assert_eq!(confirm_key(&press(KeyCode::KeyX)), None);
+        assert_eq!(confirm_key(&[]), None);
+    }
+
+    #[test]
+    fn confirm_takes_enter_before_play() {
+        // The same Enter that would play answers the confirmation; the caller
+        // asks confirm_key first and does not pass the stroke on.
+        let enter = press(KeyCode::Enter);
+        let mut focus = 0;
+        assert_eq!(
+            key(&enter, false, false, &mut focus),
+            Some(SkinAction::Play)
+        );
+        assert_eq!(confirm_key(&enter), Some(true));
+    }
+
+    #[test]
+    fn trace_is_create_in_the_browser() {
+        assert_eq!(trace_action(true), SkinAction::CreateArena);
+        assert!(matches!(trace_action(false), SkinAction::Info(_)));
+        assert_eq!(
+            help_for(&HotSpot::Trace, true),
+            "+ Create: build your own arena, private until you publish it."
+        );
+        assert_eq!(
+            help_for(&HotSpot::Ping, true),
+            "Sort arenas by pilots or by name."
+        );
+        assert_eq!(
+            help_for(&HotSpot::Zones, true),
+            "Refresh the arena list. (F3, Cmd-R)"
+        );
+        assert_eq!(
+            help_for(&HotSpot::ZoneText, true),
+            "Click an arena to pick it; double-click to play there. (Up/Down)"
+        );
+        assert_eq!(help_for(&HotSpot::Ping, false), help(&HotSpot::Ping));
+        assert_eq!(help_for(&HotSpot::Play, true), help(&HotSpot::Play));
+    }
+
+    #[test]
+    fn selection_follows_arena_name() {
+        let zone = |n: &str| ZoneInfo {
+            name: n.into(),
+            description: String::new(),
+            address: n.into(),
+            players: 0,
+            ping_ms: None,
+        };
+        let rows = [zone("public"), zone("duel"), zone("race")];
+        assert_eq!(keep_arena_selection("race", &rows), Some(2));
+        assert_eq!(keep_arena_selection("", &rows), Some(0));
+        assert_eq!(keep_arena_selection("gone", &rows), None);
+        assert_eq!(keep_arena_selection("duel", &[]), None);
+    }
+
+    #[test]
+    fn arena_selection_ignores_case() {
+        let zone = |n: &str| ZoneInfo {
+            name: n.into(),
+            description: String::new(),
+            address: n.into(),
+            players: 0,
+            ping_ms: None,
+        };
+        let rows = [zone("public"), zone("duel")];
+        assert_eq!(keep_arena_selection("Duel", &rows), Some(1));
+        assert_eq!(keep_arena_selection("Public", &rows), Some(0));
+    }
+
+    #[test]
+    fn any_other_input_cancels_a_pending_confirmation() {
+        assert_eq!(
+            confirm_step(&press(KeyCode::Enter), false),
+            ConfirmStep::Yes
+        );
+        assert_eq!(confirm_step(&press(KeyCode::Escape), true), ConfirmStep::No);
+        assert_eq!(
+            confirm_step(&press(KeyCode::KeyP), false),
+            ConfirmStep::Cancel
+        );
+        assert_eq!(confirm_step(&[], true), ConfirmStep::Cancel);
+        assert_eq!(confirm_step(&[], false), ConfirmStep::Wait);
     }
 
     #[test]

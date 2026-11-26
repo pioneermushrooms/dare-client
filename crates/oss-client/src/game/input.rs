@@ -57,10 +57,12 @@ pub enum Action {
     Screenshot,
     /// Spectator mode on and off: F11, as in Continuum.
     Spectate,
+    /// Open the custom graphics overlay (browser play): F8.
+    Graphics,
 }
 
 impl Action {
-    pub const ALL: [Action; 33] = [
+    pub const ALL: [Action; 34] = [
         Action::Forward,
         Action::Backward,
         Action::Left,
@@ -94,6 +96,7 @@ impl Action {
         Action::DetachTurrets,
         Action::Screenshot,
         Action::Spectate,
+        Action::Graphics,
     ];
 
     /// Name used in the config file.
@@ -132,6 +135,7 @@ impl Action {
             Action::DetachTurrets => "detach_turrets",
             Action::Screenshot => "screenshot",
             Action::Spectate => "spectate",
+            Action::Graphics => "graphics",
         }
     }
 
@@ -213,6 +217,7 @@ impl Default for Bindings {
             // screenshot key, so a Continuum player pressing F11 to watch got a
             // screenshot instead; PrintScreen still takes one.
             (Action::Spectate, K::F11, Any),
+            (Action::Graphics, K::F8, Any),
         ];
         let mut b = Bindings {
             map: HashMap::new(),

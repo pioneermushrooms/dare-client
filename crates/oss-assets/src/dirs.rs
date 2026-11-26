@@ -13,7 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::image::{Image, decode_image};
-use crate::locate::{AssetError, ContinuumDir, find_entry, is_install, read_file};
+use crate::locate::{AssetError, find_entry, is_install, read_file};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::locate::ContinuumDir;
 use crate::sound::{Sound, decode_wave};
 
 /// Environment variable naming an asset folder that overrides the defaults.
@@ -77,6 +79,7 @@ fn checkout_assets_above(exe_dir: &Path) -> Option<PathBuf> {
         .find(|dir| is_install(dir))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn env_path(var: &str) -> Option<PathBuf> {
     std::env::var_os(var)
         .filter(|v| !v.is_empty())
@@ -86,6 +89,12 @@ fn env_path(var: &str) -> Option<PathBuf> {
 impl AssetDirs {
     /// Builds the search path. A folder given explicitly (flag or environment) that
     /// doesn't exist is an error, so typos are noticed.
+    #[cfg(target_arch = "wasm32")]
+    pub fn locate(_search: &AssetSearch) -> Result<Self, AssetError> {
+        Ok(Self::from_roots(Vec::new()))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn locate(search: &AssetSearch) -> Result<Self, AssetError> {
         let mut roots = Vec::new();
         let mut tried = Vec::new();
@@ -151,21 +160,48 @@ impl AssetDirs {
 
     /// Loads `graphics/<name>` (`.bm2`, `.bmp`, then `.png`) as RGBA.
     pub fn load_graphic(&self, name: &str) -> Result<Image, AssetError> {
-        let path = self
-            .find("graphics", name, &["bm2", "bmp", "png"])
-            .ok_or_else(|| AssetError::Missing(format!("graphics/{name}")))?;
-        let data = read_file(&path)?;
+        let (path, data) = self.asset_bytes("graphics", name, &["bm2", "bmp", "png"])?;
         decode_image(&data).map_err(|source| AssetError::Image { path, source })
     }
 
     /// Loads `sound/<name>` (`.wa2`, then `.wav`).
     pub fn load_sound(&self, name: &str) -> Result<Sound, AssetError> {
-        let path = self
-            .find("sound", name, &["wa2", "wav"])
-            .ok_or_else(|| AssetError::Missing(format!("sound/{name}")))?;
-        let data = read_file(&path)?;
+        let (path, data) = self.asset_bytes("sound", name, &["wa2", "wav"])?;
         decode_wave(&data).map_err(|source| AssetError::Sound { path, source })
     }
+
+    fn asset_bytes(
+        &self,
+        folder: &str,
+        name: &str,
+        extensions: &[&str],
+    ) -> Result<(PathBuf, std::borrow::Cow<'static, [u8]>), AssetError> {
+        if let Some(path) = self.find(folder, name, extensions) {
+            let data = read_file(&path)?;
+            return Ok((path, data.into()));
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(asset) = bundled_asset(folder, name, extensions) {
+            return Ok(asset);
+        }
+        Err(AssetError::Missing(format!("{folder}/{name}")))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn bundled_asset(
+    folder: &str,
+    name: &str,
+    extensions: &[&str],
+) -> Option<(PathBuf, std::borrow::Cow<'static, [u8]>)> {
+    const FILES: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/classic_assets.rs"));
+    extensions.iter().find_map(|extension| {
+        let path = format!("{folder}/{name}.{extension}").to_ascii_lowercase();
+        FILES
+            .iter()
+            .find(|(key, _)| *key == path)
+            .map(|(_, data)| (PathBuf::from(path), (*data).into()))
+    })
 }
 
 fn find_in(root: &Path, subdir: &str, stem: &str, exts: &[&str]) -> Option<PathBuf> {

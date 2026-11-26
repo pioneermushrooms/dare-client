@@ -6,7 +6,7 @@
 //! simulated here and reported to the server; other ships follow their position
 //! packets and their weapons are recreated locally.
 
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use oss_assets::AssetDirs;
 use oss_proto::objects::layer;
@@ -18,9 +18,10 @@ use oss_sim::{
 };
 use winit::keyboard::KeyCode;
 
-use super::art::{self, Art};
+use super::art::Art;
 use super::balls::{BallAction, BallPlayer, BallRules, Balls};
 use super::chat::{self, ChatContext, ChatLog, ChatPlayer, Line, Message};
+use super::custom_ships;
 use super::flags::{Flags, Toucher};
 use super::hud::{self, RadarCache};
 use super::input::{Action, InputState, Stroke};
@@ -193,6 +194,7 @@ pub struct Sandbox {
     pub(super) clock: f32,
     pub(super) effects: Vec<Effect>,
     pub(super) menu: bool,
+    bot_menu: bool,
     pub(super) fps_view: hud::FpsView,
     /// The zone's arena list, while it is on screen (Esc then A, or `?arena`).
     arena_list: Option<arenas::ArenaList>,
@@ -218,6 +220,9 @@ pub struct Sandbox {
     /// one answers to. Filled as the menu is drawn, so a row can never be
     /// somewhere other than where it is shown.
     menu_spots: Vec<(Rect, Stroke)>,
+    /// [`custom_ships::revision`] when the atlas was last built: the pilot's own
+    /// ship sheets are rebuilt in when it moves.
+    custom_ships_seen: u64,
     /// Watching instead of flying (online spectator mode).
     pub(super) spectating: bool,
     spec_cam: (f32, f32),
@@ -246,8 +251,8 @@ const SOUNDS: &[&str] = &[
 const HEARING_RANGE: f32 = 1200.0;
 
 fn time_seed() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
         .unwrap_or(1)
 }
@@ -398,7 +403,9 @@ impl Sandbox {
         if let Some(a) = audio.as_mut() {
             a.preload(SOUNDS);
         }
-        let (art, atlas_size, atlas_pixels) = art::load(dir, tileset)?;
+        let custom_ships_seen = custom_ships::revision();
+        let (art, atlas_size, atlas_pixels) =
+            custom_ships::load_art(dir, tileset, &std::collections::HashMap::new())?;
         let atlas = renderer.create_texture(atlas_size, atlas_size, &atlas_pixels);
         // Turf flags sit on the map's flag tiles, numbered in file order.
         let flag_tiles = objects
@@ -407,6 +414,7 @@ impl Sandbox {
             .map(|o| (o.x as i32, o.y as i32))
             .collect();
         let mut s = Self {
+            custom_ships_seen,
             menu_spots: Vec::new(),
             world,
             me_id,
@@ -463,6 +471,7 @@ impl Sandbox {
             clock: 0.0,
             effects: Vec::new(),
             menu: false,
+            bot_menu: false,
             fps_view: Default::default(),
             arena_list: None,
             last_ship: 0,
@@ -1062,7 +1071,11 @@ impl Sandbox {
             return;
         }
         if edges.contains(&Action::Menu) {
-            self.menu = !self.menu;
+            if self.bot_menu {
+                self.bot_menu = false;
+            } else {
+                self.menu = !self.menu;
+            }
             // Continuum shows the whole chat buffer while the menu is open
             // (nullspace `Game.cpp`); leaving it puts the log back at the newest.
             if !self.menu {
@@ -1141,6 +1154,7 @@ impl Sandbox {
             match e {
                 Action::ShowFps => self.fps_view = self.fps_view.next(),
                 Action::Spectate => self.toggle_spectator(),
+                Action::Graphics => self.open_graphics(),
                 Action::Screenshot => {
                     // Misc:DisableScreenshot: the arena forbids them.
                     let forbidden = self
@@ -1571,12 +1585,9 @@ impl Sandbox {
                         );
                         self.tracking.record(&c);
                     }
-                    if let Some(w) = pos.weapon.and_then(remote_weapon) {
-                        self.world.fire_remote(i, &st, w, age, &mut sim_events);
-                    }
                 }
                 SessionEvent::PlayerFired { pid, at } => {
-                    // A late shot: fire it from where and when it left, leave the ship be.
+                    // Fire from the report snapshot independently of newer movement.
                     let Some(i) = self
                         .world
                         .ship_index(pid as u16)
@@ -1892,7 +1903,7 @@ impl Sandbox {
     /// Rebuilds the atlas with the LVZ replacement sheets. On failure (say the atlas
     /// is full) the current art stays.
     fn rebuild_art(&mut self, r: &mut Renderer) {
-        let built = art::load_with(
+        let built = custom_ships::load_art(
             &self.asset_dirs,
             self.tileset.as_deref(),
             &self.lvz.art_overrides,
@@ -1906,7 +1917,7 @@ impl Sandbox {
                 self.art = art;
                 self.map_revision += 1;
             }
-            Err(e) => log::warn!("couldn't apply LVZ graphics: {e}"),
+            Err(e) => log::warn!("couldn't apply ship or LVZ graphics: {e}"),
         }
     }
 
@@ -2704,8 +2715,10 @@ impl Sandbox {
         // Before the canvases below take a copy of `self.atlas`, or they spend the
         // frame drawing the old atlas with the new art's regions.
         self.lvz.upload(r);
-        if self.lvz.art_changed {
+        let custom = custom_ships::revision();
+        if self.lvz.art_changed || custom != self.custom_ships_seen {
             self.lvz.art_changed = false;
+            self.custom_ships_seen = custom;
             self.rebuild_art(r);
         }
         let mut c = Canvas::new(&self.art, self.atlas, r.size(), self.scale, cam);

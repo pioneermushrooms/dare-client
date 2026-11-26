@@ -30,6 +30,13 @@ THEMES = {
         "zone": ((74, 222, 128), (250, 204, 21), (248, 113, 113)),
         "profile": ((34, 211, 238), (240, 240, 240), (250, 204, 21), (160, 174, 190)),
         "tagline": "SUBSPACE  ZONE",
+        "title": "DARE",
+        "subtitle": "OPEN SUBSPACE CLIENT",
+        "list_title": "ZONES",
+        "columns": ("PING", "ZONE", "PLAYERS"),
+        "labels": {"zones": "REFRESH", "trace": "TRACE"},
+        "prof_labels": ("PROFILE", "NAME", "MACROS", "KEYS"),
+        "footer": "DARE ZONE  -  OSS-CLIENT",
     },
     "Dare Night": {
         "space": ((6, 3, 14), (20, 8, 34)),
@@ -46,6 +53,38 @@ THEMES = {
         "zone": ((45, 212, 191), (244, 196, 92), (244, 114, 182)),
         "profile": ((192, 132, 252), (240, 240, 240), (45, 212, 191), (170, 160, 190)),
         "tagline": "NIGHT  SHIFT",
+        "title": "DARE",
+        "subtitle": "OPEN SUBSPACE CLIENT",
+        "list_title": "ZONES",
+        "columns": ("PING", "ZONE", "PLAYERS"),
+        "labels": {"zones": "REFRESH", "trace": "TRACE"},
+        "prof_labels": ("PROFILE", "NAME", "MACROS", "KEYS"),
+        "footer": "DARE ZONE  -  OSS-CLIENT",
+    },
+    # SubSpace Foundation's own look, in the site's colours (navy #070c15, panel #0d1624,
+    # cyan #71e4fa). The default in the browser build.
+    "Foundation": {
+        "space": ((5, 9, 17), (9, 20, 38)),
+        "panel": (13, 22, 36),
+        "panel_hi": (52, 71, 98),
+        "panel_lo": (7, 12, 21),
+        "well": (6, 10, 18),
+        "accent": (113, 228, 250),
+        "accent_dim": (30, 78, 96),
+        "hot": (113, 228, 250),
+        "hot_dim": (22, 70, 88),
+        "logo": ((210, 248, 255), (60, 170, 210)),
+        "text": (200, 212, 230),
+        "zone": ((113, 228, 250), (241, 246, 255), (174, 188, 208)),
+        "profile": ((113, 228, 250), (241, 246, 255), (113, 228, 250), (174, 188, 208)),
+        "tagline": "",
+        "brand": "SUBSPACE FOUNDATION",
+        "subtitle": "",
+        "list_title": "FOUNDATION ARENAS",
+        "columns": ("SORT", "ARENA", "PILOTS"),
+        "labels": {"zones": "REFRESH", "trace": "+ CREATE"},
+        "prof_labels": ("PROFILE", "NAME", "ARENA", "KEYS"),
+        "footer": "SUBSPACEFOUNDATION.COM",
     },
 }
 
@@ -87,6 +126,7 @@ FONT = {
     "7": "11111 00001 00010 00100 01000 01000 01000",
     "8": "01110 10001 10001 01110 10001 10001 01110",
     "9": "01110 10001 10001 01111 00001 00010 01100",
+    "+": "00000 00100 00100 11111 00100 00100 00000",
     " ": "00000 00000 00000 00000 00000 00000 00000",
     ".": "00000 00000 00000 00000 00000 01100 01100",
     "-": "00000 00000 00000 11111 00000 00000 00000",
@@ -303,6 +343,20 @@ def logo(c, cx, y, word, t, scale=6):
                 c.set(x0 - 4 + xx, y - 4 + yy, (20, 10, 4))
 
 
+def brand(c, t):
+    """The Foundation title: a cyan diamond mark and the brand name in the logo style."""
+    cx, cy, r = 34, 26, 15
+    for yy in range(cy - r, cy + r + 1):
+        for xx in range(cx - r, cx + r + 1):
+            d = abs(xx - cx) + abs(yy - cy)
+            if d <= r:
+                edge = d >= r - 2
+                inner = d <= r - 7
+                if edge or inner:
+                    c.set(xx, yy, t["accent"] if edge else mix(t["accent"], (255, 255, 255), 0.35))
+    logo(c, 62 + text_width(t["brand"], 3) // 2, 14, t["brand"], t, scale=3)
+
+
 # --- layout -------------------------------------------------------------------------
 # Rectangles are inclusive (x0, y0, x1, y1), as the skin text format has them.
 PROFBOX = (12, 62, 292, 160)
@@ -333,14 +387,17 @@ SWEEP_FRAMES = 10
 
 def draw_main(t):
     c = Canvas(W, H)
-    starfield(c, t, 7 if t["tagline"].startswith("S") else 11)
+    starfield(c, t, 11 if t["tagline"].startswith("N") else 7)
     # title bar
     c.rect(0, 0, W - 1, 50, mix(t["panel_lo"], t["space"][0], 0.3))
     c.rect(0, 50, W - 1, 50, t["accent_dim"])
     c.rect(0, 54, W - 1, 54, t["panel_lo"])
-    logo(c, 150, 8, "DARE", t)
-    text(c, 300, 14, t["tagline"], t["text"], 2)
-    text(c, 302, 34, "OPEN SUBSPACE CLIENT", t["accent"])
+    if "brand" in t:
+        brand(c, t)
+    else:
+        logo(c, 150, 8, t["title"], t)
+        text(c, 300, 14, t["tagline"], t["text"], 2)
+        text(c, 302, 34, t["subtitle"], t["accent"])
     # sweep track
     c.rect(SWEEP[0], SWEEP[1], SWEEP[2], SWEEP[3], t["panel_lo"])
     # profile
@@ -349,7 +406,7 @@ def draw_main(t):
     side_arrow(c, *PREVPROF, True, t, 0)
     side_arrow(c, *NEXTPROF, False, t, 0)
     well(c, 22, PROFTEXT[1] - 2, PROFTEXT[2] + 2, PROFTEXT[3] + 1, t, scan=True)
-    for i, label in enumerate(("PROFILE", "NAME", "MACROS", "KEYS")):
+    for i, label in enumerate(t["prof_labels"]):
         text(c, 30, PROFTEXT[1] + 4 + i * 16, label, t["accent"])
     # ships
     panel(c, *SHIPBOX, t, "SHIP")
@@ -359,13 +416,14 @@ def draw_main(t):
     bay(c, *SPECTATE, t, False)
     text(c, SPECTATE[2] + 8, SPECTATE[1] + 18, "SPECTATE", t["text"])
     # zones
-    panel(c, *ZONEBOX, t, "ZONES")
-    button(c, *ZONES, "REFRESH", t, 0)
-    button(c, *TRACE, "TRACE", t, 0)
+    panel(c, *ZONEBOX, t, t["list_title"])
+    button(c, *ZONES, t["labels"]["zones"], t, 0)
+    button(c, *TRACE, t["labels"]["trace"], t, 0)
     well(c, ZONETEXT[0] - 2, ZONETEXT[1] - 2, ZONETEXT[2] + 2, ZONETEXT[3] + 2, t, scan=True)
-    text(c, PING[0] + 2, PING[1] + 2, "PING", t["accent"])
-    text(c, 356, PING[1] + 2, "ZONE", t["accent"])
-    text(c, 560, PING[1] + 2, "PLAYERS", t["accent"])
+    ping, name, count = t["columns"]
+    text(c, PING[0] + 2, PING[1] + 2, ping, t["accent"])
+    text(c, 356, PING[1] + 2, name, t["accent"])
+    text(c, 601 - text_width(count), PING[1] + 2, count, t["accent"])
     c.rect(ZONEUP[0] + 7, ZONEUP[3] + 2, ZONEUP[0] + 9, ZONEDOWN[1] - 2, t["panel_lo"])
     arrow(c, *ZONEUP, True, t, 0)
     arrow(c, *ZONEDOWN, False, t, 0)
@@ -376,7 +434,7 @@ def draw_main(t):
     button(c, *KEYDEFS, "KEYS", t, 0)
     button(c, *MACROS, "MACROS", t, 0)
     button(c, *OPTIONS, "OPTIONS", t, 0)
-    text(c, 26, 400, "DARE ZONE  -  OSS-CLIENT", t["panel_hi"])
+    text(c, 26, 400, t["footer"], t["panel_hi"])
     button(c, *PLAY, "PLAY", t, 0, hot=True)
     button(c, *QUIT, "QUIT", t, 0)
     return c
@@ -421,7 +479,7 @@ def build(name):
     t = THEMES[name]
     main = draw_main(t)
     atlas = Atlas(W)
-    lines = [f"; {name} - a start-screen skin for the Dare client", "; Original art, drawn by make_skin.py.", "",
+    lines = [f"; {name} - a start-screen skin for the {'Foundation' if 'brand' in t else 'Dare'} client", "; Original art, drawn by make_skin.py.", "",
              f"main = (0,0,{W - 1},{H - 1})"]
 
     def r(rect):
@@ -439,8 +497,8 @@ def build(name):
         lines.append(f"{spot} = {r(rect)}{norm} + {p(alt)}")
 
     btn("profile", PROFILE, "PROFILE")
-    btn("zones", ZONES, "REFRESH")
-    btn("trace", TRACE, "TRACE")
+    btn("zones", ZONES, t["labels"]["zones"])
+    btn("trace", TRACE, t["labels"]["trace"])
     btn("keydefs", KEYDEFS, "KEYS")
     btn("macros", MACROS, "MACROS")
     btn("options", OPTIONS, "OPTIONS")
@@ -468,7 +526,7 @@ def build(name):
     lines.append(f"spectate = {r((SPECTATE[2] + 1, SPECTATE[1], SPECTATE[2] + 60, SPECTATE[3]))}")
 
     def ping_lit(img, dx, dy):
-        text(img, PING[0] + 2 + dx, PING[1] + 2 + dy, "PING", (255, 255, 255))
+        text(img, PING[0] + 2 + dx, PING[1] + 2 + dy, t["columns"][0], (255, 255, 255))
     lines.append(f"ping = {r(PING)} + {p(atlas.add(piece(main, PING, ping_lit)))}")
 
     # light sweep along the title bar: a bright pulse travelling left to right

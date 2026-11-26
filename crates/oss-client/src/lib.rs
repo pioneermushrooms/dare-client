@@ -82,3 +82,6 @@ pub use game::online::{ServerOptions, Supplied};
 pub use game::palette::PaletteKind;
 pub use oss_session::security::{HandshakeRequest, Security, SecurityProfile, built_in};
 pub use oss_session::{ClientProfile, Profile};
+
+#[cfg(target_arch = "wasm32")]
+mod web;
