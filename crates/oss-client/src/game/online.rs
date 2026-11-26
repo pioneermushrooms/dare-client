@@ -85,20 +85,6 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// The steps in order, as the connecting screen lists them.
-    pub const STEPS: [Stage; 4] = [Stage::Connect, Stage::SignIn, Stage::Enter, Stage::Download];
-
-    /// The step's name on the screen, and on the browser page's loader.
-    pub fn label(self) -> &'static str {
-        match self {
-            Stage::Connect => "Connect to the zone",
-            Stage::SignIn => "Sign in",
-            Stage::Enter => "Enter the arena",
-            Stage::Download => "Load map and graphics",
-            Stage::Replay => "Play the recording",
-        }
-    }
-
     /// The name the browser page knows the step by.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     pub fn key(self) -> &'static str {
@@ -743,11 +729,6 @@ impl Online {
     pub fn arena_name(&self) -> Option<&str> {
         let arena = self.reach.as_ref()?.opts.arena.as_deref()?.trim();
         (!arena.is_empty()).then_some(arena)
-    }
-
-    /// The ship the player asked to enter in, 0..=7, or 8 for spectator.
-    pub fn ship(&self) -> u8 {
-        self.reach.as_ref().map_or(8, |r| r.opts.ship)
     }
 
     /// Chat the zone sent before the game screen existed, in arrival order, taken

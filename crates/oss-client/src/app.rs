@@ -255,12 +255,14 @@ struct Connecting {
     /// A question the zone has asked, drawn over the progress lines while it
     /// waits for an answer.
     prompt: Option<Prompt>,
-    /// When the screen opened: its ship turns and its stars drift by it.
+    /// When the screen opened, which its animation runs from.
     since: web_time::Instant,
+    /// The warp through the stars the screen shows.
+    warp: crate::game::connect_screen::Warp,
     /// What the browser page was last told about the way in, so it is told once
     /// per change (see [`crate::web::loading_stage`]).
     #[cfg(target_arch = "wasm32")]
-    told: Option<(crate::game::online::Stage, String, i32)>,
+    told: Option<(&'static str, String, i32)>,
 }
 
 impl Connecting {
@@ -272,23 +274,30 @@ impl Connecting {
             login,
             prompt: None,
             since: web_time::Instant::now(),
+            warp: Default::default(),
             #[cfg(target_arch = "wasm32")]
             told: None,
         })
     }
 
     /// Tells the browser page where the way in has got to, when that changed.
-    /// Called once a frame has been drawn, so the page's first word is also its
-    /// cue that the game's own screen is up to take over from its loader.
+    /// The page keeps its own loader over the game until the arena is on
+    /// screen, or until the zone asks the player something ("prompt"), which
+    /// only the game's screen can show.
     #[cfg(target_arch = "wasm32")]
     fn tell_page(&mut self) {
         let net = &self.net;
         let percent = net
             .progress
             .map_or(-1, |p| (p.clamp(0.0, 1.0) * 100.0).floor() as i32);
-        let now = (net.stage, net.detail.clone(), percent);
+        let key = if self.prompt.is_some() {
+            "prompt"
+        } else {
+            net.stage.key()
+        };
+        let now = (key, net.detail.clone(), percent);
         if self.told.as_ref() != Some(&now) {
-            crate::web::loading_stage(now.0.key(), &now.1, now.2);
+            crate::web::loading_stage(now.0, &now.1, now.2);
             self.told = Some(now);
         }
     }
@@ -1933,23 +1942,11 @@ impl App {
                     (0.0, 0.0),
                 );
                 let t = conn.since.elapsed().as_secs_f32();
+                conn.warp.draw(&c, &mut run.renderer, &conn.net, t);
                 if let Some(prompt) = conn.prompt.as_mut() {
                     prompt.draw(&c, &mut run.renderer, cursor);
-                } else {
-                    // The panel is a few lines in a window that may be very
-                    // big: drawn twice the size where there is room for it.
-                    let size = run.renderer.size();
-                    let zoom = crate::game::connect_screen::zoom(size, run.scale);
-                    let c = Canvas::new(&conn.art, conn.atlas, size, run.scale * zoom, (0.0, 0.0));
-                    crate::game::connect_screen::draw(
-                        &c,
-                        &mut run.renderer,
-                        &conn.art,
-                        &conn.net,
-                        t,
-                    );
                 }
-                Some(crate::game::connect_screen::stars(t, run.scale))
+                None
             }
             Screen::Empty => None,
         };
