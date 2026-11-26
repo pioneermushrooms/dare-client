@@ -255,6 +255,43 @@ struct Connecting {
     /// A question the zone has asked, drawn over the progress lines while it
     /// waits for an answer.
     prompt: Option<Prompt>,
+    /// When the screen opened: its ship turns and its stars drift by it.
+    since: web_time::Instant,
+    /// What the browser page was last told about the way in, so it is told once
+    /// per change (see [`crate::web::loading_stage`]).
+    #[cfg(target_arch = "wasm32")]
+    told: Option<(crate::game::online::Stage, String, i32)>,
+}
+
+impl Connecting {
+    fn new(net: Online, art: Art, atlas: TextureId, login: Option<Login>) -> Box<Self> {
+        Box::new(Self {
+            net,
+            art,
+            atlas,
+            login,
+            prompt: None,
+            since: web_time::Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            told: None,
+        })
+    }
+
+    /// Tells the browser page where the way in has got to, when that changed.
+    /// Called once a frame has been drawn, so the page's first word is also its
+    /// cue that the game's own screen is up to take over from its loader.
+    #[cfg(target_arch = "wasm32")]
+    fn tell_page(&mut self) {
+        let net = &self.net;
+        let percent = net
+            .progress
+            .map_or(-1, |p| (p.clamp(0.0, 1.0) * 100.0).floor() as i32);
+        let now = (net.stage, net.detail.clone(), percent);
+        if self.told.as_ref() != Some(&now) {
+            crate::web::loading_stage(now.0.key(), &now.1, now.2);
+            self.told = Some(now);
+        }
+    }
 }
 
 struct LoginScreen {
@@ -1310,13 +1347,7 @@ impl App {
                     Ok(a) => a,
                     Err(e) => return self.fail(event_loop, e),
                 };
-                Screen::Connecting(Box::new(Connecting {
-                    net,
-                    art,
-                    atlas,
-                    login: None,
-                    prompt: None,
-                }))
+                Screen::Connecting(Connecting::new(net, art, atlas, None))
             }
             Mode::Replay(path) => {
                 let net = match Online::open_replay(path) {
@@ -1327,13 +1358,7 @@ impl App {
                     Ok(a) => a,
                     Err(e) => return self.fail(event_loop, e),
                 };
-                Screen::Connecting(Box::new(Connecting {
-                    net,
-                    art,
-                    atlas,
-                    login: None,
-                    prompt: None,
-                }))
+                Screen::Connecting(Connecting::new(net, art, atlas, None))
             }
             Mode::Login(z) => {
                 let (art, atlas) = match load_art(&self.dir, &mut renderer) {
@@ -1684,13 +1709,8 @@ impl App {
                             if let Some(ui) = skin {
                                 ui.tex.free(&mut run.renderer);
                             }
-                            run.screen = Screen::Connecting(Box::new(Connecting {
-                                net,
-                                art,
-                                atlas,
-                                login: Some(login),
-                                prompt: None,
-                            }));
+                            run.screen =
+                                Screen::Connecting(Connecting::new(net, art, atlas, Some(login)));
                         }
                         Err(e) => ls.login.error = Some(e),
                     }
@@ -1817,6 +1837,8 @@ impl App {
             match Sandbox::new_online(&mut run.renderer, &self.dir, conn.net, run.scale, audio) {
                 Ok(mut s) => {
                     log::info!("entered arena and initialized game view");
+                    #[cfg(target_arch = "wasm32")]
+                    crate::web::loading_stage("playing", "", 100);
                     s.aim_bot = self.options.autopilot;
                     s.scripted = self.options.send.clone();
                     s.open_screen(self.options.open_screen);
@@ -1910,12 +1932,24 @@ impl App {
                     run.scale,
                     (0.0, 0.0),
                 );
+                let t = conn.since.elapsed().as_secs_f32();
                 if let Some(prompt) = conn.prompt.as_mut() {
                     prompt.draw(&c, &mut run.renderer, cursor);
                 } else {
-                    draw_progress(&c, &mut run.renderer, &conn.net);
+                    // The panel is a few lines in a window that may be very
+                    // big: drawn twice the size where there is room for it.
+                    let size = run.renderer.size();
+                    let zoom = crate::game::connect_screen::zoom(size, run.scale);
+                    let c = Canvas::new(&conn.art, conn.atlas, size, run.scale * zoom, (0.0, 0.0));
+                    crate::game::connect_screen::draw(
+                        &c,
+                        &mut run.renderer,
+                        &conn.art,
+                        &conn.net,
+                        t,
+                    );
                 }
-                None
+                Some(crate::game::connect_screen::stars(t, run.scale))
             }
             Screen::Empty => None,
         };
@@ -1935,6 +1969,10 @@ impl App {
         match run.renderer.render(stars, 0.0) {
             Ok(()) | Err(FrameError::Skip) => {}
             Err(FrameError::Fatal(e)) => return self.fail(event_loop, e),
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Screen::Connecting(conn) = &mut run.screen {
+            conn.tell_page();
         }
         run.renderer.perf().frame_done(frame_at.elapsed());
         if let Some(at) = self.options.quit_at
@@ -2449,39 +2487,6 @@ fn draw_start_screen(
         .enumerate()
     {
         c.text(r, x + 4.0, foot + 18.0 + i as f32 * 12.0, colour, line);
-    }
-}
-
-/// The connecting screen while nothing is being asked: where the connection has
-/// got to, how to give up, and a bar for the arena's downloads.
-fn draw_progress(c: &Canvas, r: &mut Renderer, net: &Online) {
-    let lines = [net.status.as_str(), "", "Esc to give up"];
-    for (i, line) in lines.iter().enumerate() {
-        let x = ((c.view_w - line.len() as f32 * 8.0) / 2.0).floor();
-        let y = (c.view_h / 2.0 - 20.0 + i as f32 * 14.0).floor();
-        c.text(
-            r,
-            x,
-            y,
-            if i == 0 { color::GREEN } else { color::WHITE },
-            line,
-        );
-    }
-    // The bar, in the gap under the status line, filled by how much of the
-    // arena's content has arrived (counted in bytes).
-    if let Some(done) = net.progress {
-        let w = (c.view_w * 0.5).clamp(80.0, 320.0).floor();
-        let x = ((c.view_w - w) / 2.0).floor();
-        let y = (c.view_h / 2.0 - 20.0 + 14.0 + 3.0).floor();
-        c.rect(r, x, y, w, 6.0, [0.15, 0.15, 0.2, 1.0]);
-        c.rect(
-            r,
-            x,
-            y,
-            (w * done.clamp(0.0, 1.0)).floor(),
-            6.0,
-            [0.25, 0.8, 0.35, 1.0],
-        );
     }
 }
 

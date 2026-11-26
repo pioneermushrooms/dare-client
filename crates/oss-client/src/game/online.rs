@@ -65,6 +65,53 @@ enum Source {
     },
 }
 
+/// Where the way into an arena has got to, for the connecting screen's steps.
+///
+/// The browser page shows the same steps before the game starts (with one of its
+/// own in front, the game's download), and the game tells it each one as it
+/// comes, by [`Stage::key`], so both read as one sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Reaching the zone and settling the connection.
+    Connect,
+    /// The login: the name, the password, an account to create.
+    SignIn,
+    /// Logged in and asking for the arena.
+    Enter,
+    /// The arena's map and its graphics files, from the cache or the zone.
+    Download,
+    /// Playing a recording back; none of the above happen.
+    Replay,
+}
+
+impl Stage {
+    /// The steps in order, as the connecting screen lists them.
+    pub const STEPS: [Stage; 4] = [Stage::Connect, Stage::SignIn, Stage::Enter, Stage::Download];
+
+    /// The step's name on the screen, and on the browser page's loader.
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::Connect => "Connect to the zone",
+            Stage::SignIn => "Sign in",
+            Stage::Enter => "Enter the arena",
+            Stage::Download => "Load map and graphics",
+            Stage::Replay => "Play the recording",
+        }
+    }
+
+    /// The name the browser page knows the step by.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub fn key(self) -> &'static str {
+        match self {
+            Stage::Connect => "connect",
+            Stage::SignIn => "signin",
+            Stage::Enter => "enter",
+            Stage::Download => "download",
+            Stage::Replay => "replay",
+        }
+    }
+}
+
 /// How to reach a zone and who to be.
 ///
 /// `Debug` is written out rather than derived so the password cannot be printed.
@@ -129,6 +176,11 @@ pub struct Online {
     pub seeds: Option<(u32, u32, u32)>,
     /// Human-readable progress while connecting.
     pub status: String,
+    /// Which step of the way in this is, for the connecting screen.
+    pub stage: Stage,
+    /// The line under the connecting screen's bar: what is happening in this
+    /// step, in a few words ("tactical.lvl, 40 KB of 120 KB").
+    pub detail: String,
     /// Set when the session failed or closed.
     pub error: Option<String>,
     /// The zone does not know the name and offers to create it: the name, and
@@ -285,6 +337,8 @@ impl Online {
             map: None,
             seeds: None,
             status: format!("Connecting to {}...", opts.server),
+            stage: Stage::Connect,
+            detail: reaching(&opts.server),
             error: None,
             new_account: None,
             registration: false,
@@ -327,6 +381,16 @@ impl Online {
             status: format!(
                 "Playing {} ({}:{:02})...",
                 path.display(),
+                secs / 60,
+                secs % 60
+            ),
+            stage: Stage::Replay,
+            detail: format!(
+                "{} ({}:{:02})",
+                path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned()
+                ),
                 secs / 60,
                 secs % 60
             ),
@@ -419,6 +483,13 @@ impl Online {
                 SessionEvent::Connected => {
                     let cipher = self.session.cipher_name().unwrap_or("?");
                     self.status = format!("Logging in ({cipher})...");
+                    self.stage = Stage::SignIn;
+                    self.detail = match &self.reach {
+                        Some(reach) => {
+                            format!("As {}, {} link", reach.opts.name, cipher.to_uppercase())
+                        }
+                        None => format!("{} link", cipher.to_uppercase()),
+                    };
                     log::info!("connected to {} with {cipher}", self.server);
                     // Trust on first use: remember an OpenSec server's key.
                     if let (false, Some(key)) = (self.pinned, self.session.server_key()) {
@@ -434,6 +505,7 @@ impl Online {
                     // and dropped us later".
                     log::info!("logged in to {}", self.server);
                     self.status = "Entering arena...".into();
+                    self.enter_stage();
                     // Continuum takes the zone's news on login, and only when its
                     // checksum differs from the copy it kept.
                     let cached = self.stored_file(NEWS_FILE);
@@ -471,15 +543,18 @@ impl Online {
                     // The arena's content starts here, so the count starts here too.
                     self.downloads = Downloads::default();
                     self.progress = None;
+                    self.stage = Stage::Download;
                     if self
                         .stored_file(name)
                         .is_some_and(|d| self.session.use_cached_map(&d))
                     {
                         log::info!("map {name} from cache");
+                        self.detail = format!("{name}, already here");
                     } else {
                         // The map's size is learnt from its first progress report.
                         self.downloads.expect(name, 0);
                         self.status = format!("Downloading {name}...");
+                        self.detail = name.clone();
                         self.session.download_map();
                     }
                 }
@@ -490,6 +565,7 @@ impl Online {
                 } if *total > 0 => {
                     self.downloads.sized(name, *total);
                     self.status = self.downloads.line(name, *received);
+                    self.detail = self.downloads.detail(name, *received);
                     self.progress = Some(self.downloads.fraction(*received));
                 }
                 SessionEvent::MapReady {
@@ -631,6 +707,7 @@ impl Online {
                 next.redirects = count;
                 next.early_chat = std::mem::take(&mut self.early_chat);
                 next.status = format!("The zone sent you on to {server}. Connecting...");
+                next.detail = format!("Sent on to {server}");
                 *self = next;
             }
             Err(e) => {
@@ -653,6 +730,26 @@ impl Online {
             && !self.session.downloads_pending()
     }
 
+    /// Logged in: on to the arena, named as the player asked for it.
+    fn enter_stage(&mut self) {
+        self.stage = Stage::Enter;
+        self.detail = match self.arena_name() {
+            Some(arena) => format!("Arena {arena}"),
+            None => "A public arena".into(),
+        };
+    }
+
+    /// The arena asked for, or `None` for whichever public one the zone picks.
+    pub fn arena_name(&self) -> Option<&str> {
+        let arena = self.reach.as_ref()?.opts.arena.as_deref()?.trim();
+        (!arena.is_empty()).then_some(arena)
+    }
+
+    /// The ship the player asked to enter in, 0..=7, or 8 for spectator.
+    pub fn ship(&self) -> u8 {
+        self.reach.as_ref().map_or(8, |r| r.opts.ship)
+    }
+
     /// Chat the zone sent before the game screen existed, in arrival order, taken
     /// once. The game shows these as its first lines so nothing the zone said
     /// during login is lost.
@@ -665,6 +762,7 @@ impl Online {
     pub fn create_account(&mut self) {
         if self.new_account.take().is_some() && self.session.create_account() {
             self.status = "Creating the account...".into();
+            self.detail = "Creating the account".into();
             self.flush();
         }
     }
@@ -675,6 +773,7 @@ impl Online {
         if std::mem::take(&mut self.registration) && self.session.send_registration(form) {
             log::info!("sent the registration form to {}", self.server);
             self.status = "Entering arena...".into();
+            self.enter_stage();
             self.flush();
         }
     }
@@ -695,6 +794,17 @@ impl Online {
         if let Source::Live(d) = &mut self.source {
             let _ = d.send_pending(&mut self.session);
         }
+    }
+}
+
+/// The connecting screen's first line: the address, where a player may have
+/// typed one. The browser build reaches only its own zone, through the page's
+/// link, so an address would say nothing there.
+fn reaching(server: &str) -> String {
+    if cfg!(target_arch = "wasm32") {
+        "Opening the link to the zone".into()
+    } else {
+        format!("Reaching {server}")
     }
 }
 
@@ -771,6 +881,29 @@ impl Downloads {
             (self.done + 1).min(n),
             size_text((self.done_bytes + received).min(self.total())),
             size_text(self.total()),
+        )
+    }
+}
+
+impl Downloads {
+    /// The connecting screen's words under its bar (the bar and its percentage
+    /// say how far): which file, where it sits in the set, and how much of the
+    /// whole has arrived.
+    fn detail(&self, name: &str, received: usize) -> String {
+        let total = self.total();
+        let n = self.sizes.len();
+        let file = if n <= 1 {
+            name.to_string()
+        } else {
+            format!("{name} ({} of {n})", (self.done + 1).min(n))
+        };
+        if total == 0 {
+            return file;
+        }
+        format!(
+            "{file}, {} of {}",
+            size_text((self.done_bytes + received).min(total)),
+            size_text(total),
         )
     }
 }
@@ -936,6 +1069,10 @@ mod tests {
             d.line("jun2018.lvl", 400 * 1024),
             "Downloading jun2018.lvl (1 of 13)... 400 KB of 1.0 MB, 38%"
         );
+        assert_eq!(
+            d.detail("jun2018.lvl", 400 * 1024),
+            "jun2018.lvl (1 of 13), 400 KB of 1.0 MB"
+        );
     }
 
     /// The figure never falls back, from nothing to finished, and ends at 100%.
@@ -968,6 +1105,10 @@ mod tests {
             one.line("smallmap.lvl", 40),
             "Downloading smallmap.lvl... 40%"
         );
+        assert_eq!(one.detail("smallmap.lvl", 40), "smallmap.lvl, 1 KB of 1 KB");
+        let mut no_size = Downloads::default();
+        no_size.expect("big.lvl", 0);
+        assert_eq!(no_size.detail("big.lvl", 0), "big.lvl");
 
         let mut d = arena();
         d.sized("extra.lvz", 4096);
