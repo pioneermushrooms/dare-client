@@ -37,18 +37,31 @@ pub enum Change {
 /// A bot block being read.
 struct Block {
     name: String,
-    password: String,
+    password: Option<String>,
     seat: Seat,
     team: i16,
     script: String,
 }
 
+/// 1-20 characters: letters, digits, single spaces, `_ - .`; starts with a
+/// letter or digit.
+fn valid_name(name: &str) -> bool {
+    let ok = |c: char| c.is_ascii_alphanumeric() || "_-. ".contains(c);
+    (1..=20).contains(&name.len())
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.chars().all(ok)
+        && !name.contains("  ")
+}
+
 impl Block {
     fn finish(self) -> Result<Entry, String> {
         let script = script::parse(&self.script).map_err(|e| format!("bot {}: {e}", self.name))?;
+        let password = self
+            .password
+            .ok_or_else(|| format!("bot {}: missing password", self.name))?;
         Ok(Entry {
             name: self.name,
-            password: self.password,
+            password,
             seat: self.seat,
             team: self.team,
             script,
@@ -78,12 +91,14 @@ pub fn read(text: &str) -> Result<Lineup, String> {
                 "lineup" => arena = Some(rest.to_string()),
                 "controller" => controller = Some(rest.to_string()).filter(|v| !v.is_empty()),
                 "bot" => {
-                    if rest.is_empty() {
-                        return Err("bot needs a name".into());
+                    if !valid_name(rest) {
+                        return Err(format!(
+                            "bot {rest}: name must be 1-20 letters, digits, single spaces or _ - ."
+                        ));
                     }
                     block = Some(Block {
                         name: rest.to_string(),
-                        password: String::new(),
+                        password: None,
                         seat: Seat::In,
                         team: 0,
                         script: String::new(),
@@ -97,10 +112,16 @@ pub fn read(text: &str) -> Result<Lineup, String> {
         match key {
             "end" => {
                 if let Some(b) = block.take() {
+                    if bots
+                        .iter()
+                        .any(|e: &Entry| e.name.eq_ignore_ascii_case(&b.name))
+                    {
+                        return Err(format!("bot {}: listed twice", b.name));
+                    }
                     bots.push(b.finish()?);
                 }
             }
-            "password" => b.password = rest.to_string(),
+            "password" => b.password = Some(rest.to_string()),
             "seat" => {
                 b.seat = match rest {
                     "in" => Seat::In,
@@ -255,6 +276,45 @@ mod tests {
         let old = lineup(&[block("Bot One", "")]);
         let new = lineup(&[block("bot one", "")]);
         assert!(diff(&old, &new).is_empty());
+    }
+
+    fn err(text: &str) -> String {
+        read(text).unwrap_err()
+    }
+
+    #[test]
+    fn bad_names_are_rejected_naming_the_bot() {
+        for name in ["abcdefghijklmnopqrstu", "bad!", "two  spaces", "_lead", ""] {
+            let e = err(&format!("lineup x\nbot {name}\npassword p\nend\ndone\n"));
+            assert!(e.contains("bot"), "{e}");
+            if !name.is_empty() {
+                assert!(e.contains(name), "{e}");
+            }
+        }
+        assert!(read("lineup x\nbot a_b-c.d 9\npassword p\nend\ndone\n").is_ok());
+    }
+
+    #[test]
+    fn duplicate_names_are_rejected_case_insensitively() {
+        let e = err("lineup x\nbot A\npassword p\nend\nbot a\npassword q\nend\ndone\n");
+        assert!(e.contains("twice"), "{e}");
+    }
+
+    #[test]
+    fn a_bot_needs_a_password() {
+        let e = err("lineup x\nbot A\nseat in\nend\ndone\n");
+        assert!(e.contains("A") && e.contains("password"), "{e}");
+    }
+
+    #[test]
+    fn malformed_messages_are_errors() {
+        assert!(err("lineup x\nbot A\npassword p\ndone\n").contains("end"));
+        assert!(err("lineup x\nbot A\npassword p\nend\n").contains("done"));
+        assert!(err("lineup x\nbot A\npassword p\nseat sideways\nend\ndone\n").contains("seat"));
+        assert!(err("lineup x\nbot A\npassword p\nteam abc\nend\ndone\n").contains("team"));
+        assert!(err("lineup x\nbot A\npassword p\nteam 10000\nend\ndone\n").contains("team"));
+        assert!(err("lineup x\ndone\nbot A\n").contains("after done"));
+        assert!(err("bot A\npassword p\nend\ndone\n").contains("lineup"));
     }
 
     #[test]
