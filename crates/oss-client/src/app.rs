@@ -864,6 +864,10 @@ struct App {
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
     #[cfg(target_arch = "wasm32")]
     initializing_graphics: bool,
+    /// When [`App::frame`] last ran, so the browser's timer between redraws
+    /// runs the game no more often than [`BROWSER_STEP`].
+    #[cfg(target_arch = "wasm32")]
+    last_frame: web_time::Instant,
     options: Options,
     dir: AssetDirs,
     level: Vec<u8>,
@@ -948,6 +952,8 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         proxy: event_loop.create_proxy(),
         #[cfg(target_arch = "wasm32")]
         initializing_graphics: false,
+        #[cfg(target_arch = "wasm32")]
+        last_frame: web_time::Instant::now(),
         options,
         dir,
         level,
@@ -1296,10 +1302,29 @@ impl ApplicationHandler<AppEvent> for App {
                 web_time::Instant::now() + std::time::Duration::from_millis(5),
             ));
         } else {
+            // A browser redraws only at the display's refresh rate: 60 Hz on most
+            // screens, 30 under some power settings. Driving the game from redraws
+            // alone made input, sends and received updates wait up to a frame each.
+            // Between redraws the game and the connection run on a short timer, the
+            // way a native window runs them as fast as it presents.
+            #[cfg(target_arch = "wasm32")]
+            {
+                let now = web_time::Instant::now();
+                if now.saturating_duration_since(self.last_frame) >= BROWSER_STEP {
+                    self.frame(event_loop, false);
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_frame + BROWSER_STEP));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             event_loop.set_control_flow(ControlFlow::Poll);
         }
     }
 }
+
+/// How often the browser runs the game between redraws: well inside one 100 Hz
+/// simulation tick, and near the finest timer a page is given.
+#[cfg(target_arch = "wasm32")]
+const BROWSER_STEP: std::time::Duration = std::time::Duration::from_millis(4);
 
 impl App {
     fn finish_resume(
@@ -1418,6 +1443,10 @@ impl App {
     /// One frame: input, network, simulation and (when `draw`) rendering.
     fn frame(&mut self, event_loop: &ActiveEventLoop, draw: bool) {
         let frame_at = web_time::Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.last_frame = frame_at;
+        }
         if let Some(g) = self.gilrs.as_mut() {
             while let Some(ev) = g.next_event() {
                 let pressed = self.input.gamepad(ev.event);
@@ -1843,6 +1872,11 @@ impl App {
             } else {
                 None
             };
+            // The zone may have given a different name (a guest's), and a log sent
+            // for the staff is looked up by it.
+            if let Some(me) = conn.net.session.me() {
+                log::info!("flying as {}", me.name);
+            }
             match Sandbox::new_online(&mut run.renderer, &self.dir, conn.net, run.scale, audio) {
                 Ok(mut s) => {
                     log::info!("entered arena and initialized game view");

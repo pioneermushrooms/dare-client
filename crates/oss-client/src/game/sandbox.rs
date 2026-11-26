@@ -194,6 +194,8 @@ pub struct Sandbox {
     last_ship: u8,
     pub(super) big_radar: bool,
     fps: FpsCounter,
+    /// The ten-second figures for the `perf:` log line.
+    perf: PerfWindow,
     /// The player asked to leave. In SubSpace and Continuum the menu's Q goes back
     /// to the front end rather than ending the program, and it waits until you have
     /// half your energy, so that quitting cannot dodge a death.
@@ -471,6 +473,7 @@ impl Sandbox {
             last_ship: 0,
             big_radar: false,
             fps: FpsCounter::default(),
+            perf: PerfWindow::default(),
             leaving: false,
             leave: false,
             open_settings: false,
@@ -531,6 +534,14 @@ impl Sandbox {
         let net = self.net.as_ref().filter(|n| !n.is_replay())?;
         let ticks = net.session.connection().sync_rtt_ticks()?;
         Some(u64::from(ticks) * 10)
+    }
+
+    /// The `perf:` line, every ten seconds online (not in a replay).
+    fn perf_summary(&mut self, now: Instant) -> Option<String> {
+        let net = self.net.as_ref().filter(|n| !n.is_replay())?;
+        let traffic = net.session.connection().stats();
+        let ping = self.ping_ms();
+        self.perf.summary(now, traffic, ping)
     }
 
     /// Camera centre (game pixels) for the current frame.
@@ -713,12 +724,11 @@ impl Sandbox {
     /// Handles UI keys, the network and advances the simulation to the current time.
     pub fn update(&mut self, input: &mut InputState) {
         let now = Instant::now();
-        let dt = now
-            .saturating_duration_since(self.last)
-            .min(Duration::from_millis(250));
+        let gap = now.saturating_duration_since(self.last);
+        self.perf.updated(now, gap);
+        let dt = gap.min(Duration::from_millis(250));
         self.last = now;
         self.clock += dt.as_secs_f32();
-        self.fps.frame(now);
         while self.scripted.last().is_some_and(|(t, _)| self.clock >= *t) {
             if let Some((_, line)) = self.scripted.pop() {
                 log::info!("--send: {line}");
@@ -912,6 +922,9 @@ impl Sandbox {
         if self.net.as_ref().is_some_and(|n| !n.is_replay())
             && let Some(line) = self.tracking.summary(self.world.tick)
         {
+            log::info!("{line}");
+        }
+        if let Some(line) = self.perf_summary(now) {
             log::info!("{line}");
         }
         self.check_flags();
@@ -2607,6 +2620,11 @@ impl Sandbox {
 
     /// Queues the whole frame on the renderer and returns the starfield parameters.
     pub fn draw(&mut self, r: &mut Renderer) -> StarParams {
+        // Counted here rather than in `update`, which a browser also runs
+        // between redraws: the figure is frames drawn.
+        let now = Instant::now();
+        self.fps.frame(now);
+        self.perf.drew(now);
         let alpha = self.acc.as_secs_f32() / TICK.as_secs_f32();
         let cam = self.camera(alpha);
         let tints = self.palette.text_tints();
@@ -2908,6 +2926,88 @@ fn add_own_ship(world: &mut World, id: u16, ship: u8, freq: u16) {
     }
 }
 
+/// How often the game ran and drew, its longest stalls, and the connection's
+/// traffic, over ten seconds: what a remote report needs to tell a slow
+/// machine, a slow screen and a lossy link apart.
+#[derive(Default)]
+struct PerfWindow {
+    start: Option<Instant>,
+    updates: u32,
+    draws: u32,
+    longest_update_gap: Duration,
+    longest_draw_gap: Duration,
+    last_draw: Option<Instant>,
+    traffic_at_start: Option<oss_net::Stats>,
+}
+
+impl PerfWindow {
+    const SPAN: Duration = Duration::from_secs(10);
+
+    fn updated(&mut self, now: Instant, gap: Duration) {
+        if self.start.is_none() {
+            // The first gap runs from when the game was made, not from an update.
+            self.start = Some(now);
+            return;
+        }
+        self.updates += 1;
+        self.longest_update_gap = self.longest_update_gap.max(gap);
+    }
+
+    fn drew(&mut self, now: Instant) {
+        if let Some(last) = self.last_draw {
+            self.longest_draw_gap = self
+                .longest_draw_gap
+                .max(now.saturating_duration_since(last));
+        }
+        self.last_draw = Some(now);
+        self.draws += 1;
+    }
+
+    fn summary(
+        &mut self,
+        now: Instant,
+        traffic: oss_net::Stats,
+        ping: Option<u64>,
+    ) -> Option<String> {
+        let start = *self.start.get_or_insert(now);
+        let base = *self.traffic_at_start.get_or_insert(traffic);
+        let span = now.saturating_duration_since(start);
+        if span < Self::SPAN {
+            return None;
+        }
+        let secs = span.as_secs_f32();
+        let rate = |n: u64| n as f32 / secs;
+        let ping = ping.map_or_else(|| "unknown".to_string(), |p| format!("{p} ms"));
+        let line = format!(
+            "perf: {:.0} updates/s, {:.0} draws/s, longest gap {} ms between updates, {} ms \
+             between draws | ping {ping} | packets {:.0}/s in, {:.0}/s out, {} resent, {} dropped \
+             in, {} dropped out",
+            rate(u64::from(self.updates)),
+            rate(u64::from(self.draws)),
+            self.longest_update_gap.as_millis(),
+            self.longest_draw_gap.as_millis(),
+            rate(
+                traffic
+                    .datagrams_received
+                    .saturating_sub(base.datagrams_received)
+            ),
+            rate(traffic.datagrams_sent.saturating_sub(base.datagrams_sent)),
+            traffic.retransmits.saturating_sub(base.retransmits),
+            traffic.dropped.saturating_sub(base.dropped),
+            traffic
+                .dropped_outgoing
+                .saturating_sub(base.dropped_outgoing),
+        );
+        *self = Self {
+            start: Some(now),
+            last_draw: self.last_draw,
+            traffic_at_start: Some(traffic),
+            ..Self::default()
+        };
+        Some(line)
+    }
+}
+
 #[derive(Default)]
 struct FpsCounter {
     window_start: Option<Instant>,
@@ -2925,6 +3025,55 @@ impl FpsCounter {
             self.frames = 0;
             self.window_start = Some(now);
         }
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::PerfWindow;
+    use std::time::Duration;
+    use web_time::Instant;
+
+    #[test]
+    fn reports_rates_and_stalls_every_ten_seconds() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut p = PerfWindow::default();
+        let traffic = |n: u64| oss_net::Stats {
+            datagrams_received: n,
+            datagrams_sent: n / 2,
+            retransmits: n / 100,
+            ..Default::default()
+        };
+        p.updated(at(0), Duration::from_secs(3));
+        assert_eq!(p.summary(at(0), traffic(1000), Some(40)), None);
+        // 1000 updates 10 ms apart, one of them 60 ms late; a draw every 20 ms.
+        for i in 1..=1000u64 {
+            let gap = if i == 500 { 60 } else { 10 };
+            p.updated(at(i * 10), Duration::from_millis(gap));
+            if i % 2 == 0 {
+                p.drew(at(i * 10));
+            }
+        }
+        assert_eq!(p.summary(at(9990), traffic(2000), Some(40)), None);
+        let line = p.summary(at(10_000), traffic(3000), Some(40)).unwrap();
+        assert!(
+            line.starts_with("perf: 100 updates/s, 50 draws/s"),
+            "{line}"
+        );
+        assert!(
+            line.contains("longest gap 60 ms between updates, 20 ms between draws"),
+            "{line}"
+        );
+        assert!(
+            line.contains("ping 40 ms | packets 200/s in, 100/s out, 20 resent"),
+            "{line}"
+        );
+        // The next window starts over, and a connection whose counters restarted
+        // reads as no traffic rather than a crash.
+        let next = p.summary(at(20_000), traffic(10), None).unwrap();
+        assert!(next.starts_with("perf: 0 updates/s"), "{next}");
+        assert!(next.contains("ping unknown | packets 0/s in"), "{next}");
     }
 }
 
