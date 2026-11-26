@@ -14,6 +14,9 @@ pub use super::voice_table::{MENUS, PHRASES};
 /// Seconds without a key before an open menu closes itself.
 pub const IDLE_CLOSE: f32 = 4.0;
 
+/// Seconds between "Enter to chat" reminders.
+pub const HINT_EVERY: f32 = 20.0;
+
 /// What a key did to the menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceStep {
@@ -35,6 +38,8 @@ pub struct VoiceMenu {
     open: bool,
     path: String,
     last_key: f32,
+    /// When the "Enter to chat" hint may next be shown (`None`: any time).
+    next_hint: Option<f32>,
     /// Game clock time until which the zone has silenced our voice lines.
     pub silenced_until: f32,
 }
@@ -104,6 +109,16 @@ impl VoiceMenu {
         if self.open && now - self.last_key >= IDLE_CLOSE {
             self.close();
         }
+    }
+
+    /// Whether to remind the player that Enter opens chat (a letter went nowhere);
+    /// at most once every [`HINT_EVERY`] seconds.
+    pub fn hint_due(&mut self, now: f32) -> bool {
+        if self.next_hint.is_some_and(|t| now < t) {
+            return false;
+        }
+        self.next_hint = Some(now + HINT_EVERY);
+        true
     }
 
     /// The panel's title: `V G C`, plus who hears this level's lines once a menu is
@@ -177,6 +192,23 @@ pub fn route_char(enter_to_chat: bool, chat_open: bool, _voice_open: bool) -> Ch
     } else {
         CharRoute::Voice
     }
+}
+
+/// Whether keys that type characters belong to the chat line or the voice menu right now,
+/// rather than to game bindings and macros. With Enter-to-chat on: while either is open;
+/// off: once the chat line has something on it (Continuum).
+pub fn keys_type(
+    enter_to_chat: bool,
+    chat_open: bool,
+    chat_has_text: bool,
+    voice_open: bool,
+) -> bool {
+    voice_open
+        || if enter_to_chat {
+            chat_open
+        } else {
+            chat_has_text
+        }
 }
 
 /// The clip for a chat sound id: 128-255 are voice lines (`voice<id>`), 1-26 Continuum's
@@ -331,6 +363,37 @@ mod tests {
         m.back(0.0);
         m.press('t', 0.0);
         assert_eq!(m.header().as_deref(), Some("V T  (team)"));
+    }
+
+    #[test]
+    fn keys_type_while_the_voice_menu_or_chat_is_open() {
+        // (enter_to_chat, chat_open, chat_has_text, voice_open)
+        assert!(
+            keys_type(true, false, false, true),
+            "voice menu open: letters are its"
+        );
+        assert!(
+            keys_type(true, true, false, false),
+            "Enter-opened line, still empty"
+        );
+        assert!(
+            !keys_type(true, false, false, false),
+            "nothing open: game keys are the game's"
+        );
+        assert!(
+            keys_type(false, false, true, false),
+            "Continuum: a line with text types"
+        );
+        assert!(!keys_type(false, false, false, false));
+    }
+
+    #[test]
+    fn hint_comes_at_most_every_twenty_seconds() {
+        let mut m = VoiceMenu::new();
+        assert!(m.hint_due(0.0));
+        assert!(!m.hint_due(5.0));
+        assert!(!m.hint_due(19.9));
+        assert!(m.hint_due(20.0));
     }
 
     #[test]

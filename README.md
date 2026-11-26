@@ -51,10 +51,12 @@ cargo run --release -p oss-client -- --server 127.0.0.1:5000 --name YourName --s
 
 The keys are Continuum's, so a returning player already has them in their hands. **F1**
 in the game lists them — and lists *yours* if you have changed any, which is why it is
-the place to look rather than a list written down somewhere. To talk, just type: the
-characters go to the chat line as they do in SubSpace and Continuum, and Enter sends.
-[docs/playing.md](docs/playing.md) has the rest — the chat prefixes, the commands the
-client answers itself, macros and replays.
+the place to look rather than a list written down somewhere. To talk, press Enter, type,
+and press Enter again; **V** opens the voice menu, quick spoken lines for your team or the
+arena on two or three keys. Prefer Continuum's way, where every key types straight into
+chat? Turn off *Enter to chat* under Settings > Accessibility.
+[docs/playing.md](docs/playing.md) has the rest — the chat prefixes, the voice menu, the
+commands the client answers itself, macros and replays.
 
 No zone to hand? Run one: [oss-server](https://github.com/DangerMouseUK/oss-server) with no
 arguments is a working zone on port 5000. Or fly on your own:

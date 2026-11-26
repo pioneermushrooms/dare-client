@@ -732,7 +732,7 @@ impl Sandbox {
         // same keystroke all the way from the window event, so this holds on any
         // keyboard layout — and only the character goes, never the key, so a key
         // that is both still does its other job.
-        let typing = self.chat_typing() || self.voice.is_open();
+        let typing = self.keys_type();
         let strokes: Vec<Stroke> = input
             .take_strokes()
             .into_iter()
@@ -753,7 +753,7 @@ impl Sandbox {
         // "Message history (ESC) displays more chat, and you can fly while it
         // is on". The chat line's rule already draws exactly that line between
         // the two kinds of key, so the menu borrows it.
-        input.set_typing(self.menu || self.chat_typing() || self.voice.is_open());
+        input.set_typing(self.menu || self.keys_type());
         self.voice.tick(self.clock);
         // The help shows the player's own keys, so it reads the live table. Copied
         // only while it is open, which is the only time anything looks at it.
@@ -1075,6 +1075,9 @@ impl Sandbox {
             return;
         }
         let mut send = false;
+        // Taken before the keys below: a key that sends a voice line closes the menu,
+        // and must not then also fire a macro bound to the same key.
+        let keys_typed = self.keys_type();
         for stroke in strokes {
             // The chat line is always live. Tab finishes a name on it rather than
             // dropping a bomb, but only once there is something to finish.
@@ -1087,11 +1090,19 @@ impl Sandbox {
                     voice::route_char(self.enter_to_chat, self.chat.open, self.voice.is_open());
                 match route {
                     voice::CharRoute::Chat => self.chat.type_char(c),
-                    voice::CharRoute::Voice => {
-                        if let voice::VoiceStep::Send(code) = self.voice.press(c, self.clock) {
-                            self.send_voice(code);
+                    voice::CharRoute::Voice => match self.voice.press(c, self.clock) {
+                        voice::VoiceStep::Send(code) => self.send_voice(code),
+                        // A letter with nothing open: someone typing the old way.
+                        voice::VoiceStep::Ignored
+                            if !self.voice.is_open() && self.voice.hint_due(self.clock) =>
+                        {
+                            self.message(
+                                "Press Enter to chat, or V for voice lines (Settings > Accessibility).",
+                                color::YELLOW,
+                            );
                         }
-                    }
+                        _ => {}
+                    },
                 }
             }
             // Backspace takes the repeats, so a held Backspace clears the line;
@@ -1123,7 +1134,7 @@ impl Sandbox {
             let line = self.chat.submit();
             self.send_chat_line(&line);
         }
-        self.run_macros(strokes, shift, ctrl);
+        self.run_macros(strokes, shift, ctrl, keys_typed);
         for e in edges.iter() {
             match e {
                 Action::ShowFps => self.fps_view = self.fps_view.next(),
@@ -1184,13 +1195,14 @@ impl Sandbox {
         }
     }
 
-    /// Whether characters belong to the chat line right now.
-    fn chat_typing(&self) -> bool {
-        if self.enter_to_chat {
-            self.chat.open
-        } else {
-            !self.chat.input.is_empty()
-        }
+    /// Whether keys that type belong to the chat line or the voice menu right now.
+    fn keys_type(&self) -> bool {
+        voice::keys_type(
+            self.enter_to_chat,
+            self.chat.open,
+            !self.chat.input.is_empty(),
+            self.voice.is_open(),
+        )
     }
 
     fn send_chat_line(&mut self, line: &str) {
@@ -1288,8 +1300,7 @@ impl Sandbox {
     /// Macro keys (from the settings file): send their line when pressed. A macro on
     /// a key that types gives way to the chat line once that line has something on
     /// it, exactly as a binding does.
-    fn run_macros(&mut self, strokes: &[Stroke], shift: bool, ctrl: bool) {
-        let typing = !self.chat.input.is_empty();
+    fn run_macros(&mut self, strokes: &[Stroke], shift: bool, ctrl: bool, typing: bool) {
         // A macro key fires on the key going down, not on the OS repeating it:
         // leaning on one must not send the line thirty times a second.
         let lines: Vec<String> = self
