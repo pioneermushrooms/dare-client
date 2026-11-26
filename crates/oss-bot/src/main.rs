@@ -28,7 +28,7 @@ use oss_proto::ClientSettings;
 use oss_session::map::{MapCache, default_cache_dir};
 use oss_session::sim::{arena_world, remote_state, remote_weapon};
 use oss_session::udp::UdpDriver;
-use oss_session::{SPECTATOR, Session, SessionConfig, SessionEvent, State, VieClient, chat_type};
+use oss_session::{SPECTATOR, Session, SessionConfig, SessionEvent, State, chat_type};
 use oss_sim::fixed::Rng;
 use oss_sim::{Event, Pos, ShipInput, ShipState, VEL_SCALE, World, toggle};
 
@@ -1041,9 +1041,11 @@ fn view<'a>(
     }
 }
 
-/// Bot number `n`'s login. It presents itself as the game client does, with the
-/// same [`VieClient`] profile and so the same security answers: a bot is a player
-/// to the zone, checked like one.
+/// Bot number `n`'s login. It presents itself as the current game client does:
+/// a SubSpace 1.34 login (0x09) answering security checks with the keyed exe
+/// checksum ([`oss_session::client::vie_keyed`], the browser client's profile),
+/// so a zone that verifies that field never reports a bot as a mismatch. A bot
+/// is a player to the zone, checked like one.
 fn session_config(
     entry: &Entry,
     place: &Place,
@@ -1058,7 +1060,7 @@ fn session_config(
         ship,
         machine_id: 0x0B07_0000 + n as u32,
         new_user: opts.new_user,
-        client: Arc::new(VieClient),
+        client: oss_session::client::vie_keyed(),
         ..Default::default()
     }
 }
@@ -1294,22 +1296,40 @@ mod tests {
         assert!(parse("--host --server a:1 --count 2").is_err());
     }
 
-    /// Bots answer a security check exactly as the game client's profile does.
+    /// Bots answer a security check exactly as the game client (the browser
+    /// build's keyed profile) does: the keyed exe checksum a verifying zone
+    /// computes, in the 40-byte SubSpace form, logging in as 0x09 v134.
     #[test]
     fn bots_answer_security_checks_as_the_game_client() {
-        use oss_session::{ClientProfile, SecurityChallenge};
+        use oss_session::SecurityChallenge;
         let opts = parse("--server a:1 --name Rex").unwrap().unwrap();
         let lineup = lineup_from_options(&opts, None);
         let cfg = session_config(&lineup.bots[0], &Place::of(&lineup), &opts, 0, 0);
-        for key in [1, 0xDEAD_BEEF] {
+        let game = oss_session::client::vie_keyed();
+        for key in [1, 0x1234_5678, 0xDEAD_BEEF] {
             let challenge = SecurityChallenge {
                 key,
                 map_crc32: Some(7),
             };
-            let game = SessionConfig::default().client.security(challenge);
-            assert_eq!(cfg.client.security(challenge), game);
-            assert_eq!(game, VieClient.security(challenge));
+            let answer = cfg.client.security(challenge);
+            assert_eq!(answer, game.security(challenge));
+            assert_eq!(
+                answer.exe_checksum,
+                oss_proto::checksum::vie_exe_checksum(key)
+            );
+            assert_ne!(answer.exe_checksum, 0, "not the 1.34 client's zero");
+            assert_eq!(answer.continuum, None, "still the 40-byte SubSpace form");
         }
+        let login = cfg.client.login();
+        assert_eq!((login.kind, login.version), (0x09, 134));
+        assert_eq!(
+            (login.kind, login.version, login.continuum_id),
+            (
+                game.login().kind,
+                game.login().version,
+                game.login().continuum_id
+            )
+        );
     }
 
     #[test]

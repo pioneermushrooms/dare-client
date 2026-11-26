@@ -5,6 +5,10 @@ arena's settings and map, answers the zone's security checks, and then either si
 mode or flies a ship around — thrusting, turning and firing — sending its position as a player
 would. Many bots can run in one process.
 
+A bot answers security checks as the current game client does: a SubSpace 1.34 login with the
+keyed executable checksum (`oss_session::client::vie_keyed()`), so a zone that verifies that field
+(ASSS, SubspaceServer) does not report it as a mismatch.
+
 It is for people who run or build zones: checking that a zone is up and accepting players,
 watching a new arena from inside, or putting a load of players on a server before real ones
 arrive. It is built on `oss-session`, the same session layer the graphical
