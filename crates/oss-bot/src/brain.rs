@@ -61,6 +61,26 @@ const SEARCH: usize = 120_000;
 /// to death.
 const FIRE_ENERGY: f32 = 0.35;
 
+/// How far ahead (pixels) a bot breaking off aims, away from the nearest enemy.
+const AWAY_PIXELS: f32 = 640.0;
+/// A bot leaving for spectator breaks off for at most this long (ms), and
+/// goes at once once no enemy is within `SAFE_TILES`.
+const BREAK_OFF_MS: u64 = 8000;
+pub const SAFE_TILES: f32 = 40.0;
+
+/// A bot that has been told to spectate but is still breaking off its fight.
+#[derive(Debug, Clone, Copy)]
+pub struct Leaving {
+    pub since_ms: u64,
+}
+
+impl Leaving {
+    /// Time to spectate: 8 s have passed, or no enemy is within 40 tiles.
+    pub fn ready(&self, now_ms: u64, enemy_within_40_tiles: bool) -> bool {
+        !enemy_within_40_tiles || now_ms >= self.since_ms + BREAK_OFF_MS
+    }
+}
+
 /// The direction (0..40) from `a` to `b`, 0 being up and counting clockwise.
 pub fn direction(dx: f32, dy: f32) -> i32 {
     let a = dx.atan2(-dy).rem_euclid(TAU);
@@ -188,6 +208,29 @@ impl Brain {
             tile_of(target)
         };
         self.travel(v, nav, goal, 0.0)
+    }
+
+    /// Breaking off a fight: turn and run from the nearest enemy, afterburner
+    /// on, with no weapon pressed. With no enemy about, nothing to do.
+    pub fn disengage(&mut self, v: &View, nav: &mut Nav) -> ShipInput {
+        let Some(near) = v
+            .enemies
+            .iter()
+            .min_by(|a, b| len(sub(a.pos, v.pos)).total_cmp(&len(sub(b.pos, v.pos))))
+        else {
+            return ShipInput::default();
+        };
+        let away = sub(v.pos, near.pos);
+        let d = len(away).max(1.0);
+        let goal = tile_of((
+            v.pos.0 + away.0 / d * AWAY_PIXELS,
+            v.pos.1 + away.1 / d * AWAY_PIXELS,
+        ));
+        let mut input = self.travel(v, nav, goal, 1.0);
+        input.gun = false;
+        input.bomb = false;
+        input.afterburner = input.forward;
+        input
     }
 
     fn patrol(&mut self, v: &View, nav: &mut Nav) -> ShipInput {
@@ -513,6 +556,41 @@ mod tests {
             enemies,
             shots,
         }
+    }
+
+    #[test]
+    fn disengaging_flies_away_from_the_nearest_enemy() {
+        let mut nav = Nav::new(&TileMap::empty(), 14);
+        let mut brain = Brain::new(Behaviour::Fighter, Vec::new(), 30);
+        let far = Contact {
+            pos: (8000.0, 6000.0),
+            vel: (0.0, 0.0),
+        };
+        let east = Contact {
+            pos: (8300.0, 8000.0),
+            vel: (0.0, 0.0),
+        };
+        let enemies = [far, east];
+        let mut v = view(&enemies, &[]);
+        // Facing up with the enemy to the east: turn left, towards the west.
+        let i = brain.disengage(&v, &mut nav);
+        assert!(i.left && !i.right, "{i:?}");
+        assert!(!i.gun && !i.bomb);
+        // Facing west: thrust, afterburner, still no gun.
+        v.rotation = 30_500;
+        let i = brain.disengage(&v, &mut nav);
+        assert!(i.forward && i.afterburner && !i.gun && !i.bomb, "{i:?}");
+        let none = brain.disengage(&view(&[], &[]), &mut nav);
+        assert!(!none.forward && !none.left && !none.right && !none.gun);
+    }
+
+    #[test]
+    fn leaving_is_ready_after_eight_seconds_or_with_no_enemy_near() {
+        let l = Leaving { since_ms: 1000 };
+        assert!(!l.ready(1000, true));
+        assert!(!l.ready(8999, true));
+        assert!(l.ready(9000, true));
+        assert!(l.ready(1000, false));
     }
 
     #[test]

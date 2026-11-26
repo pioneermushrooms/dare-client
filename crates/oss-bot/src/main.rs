@@ -31,7 +31,7 @@ use oss_session::{SPECTATOR, Session, SessionConfig, SessionEvent, State, chat_t
 use oss_sim::fixed::Rng;
 use oss_sim::{Event, Pos, ShipInput, ShipState, VEL_SCALE, World, toggle};
 
-use brain::{Brain, Contact, View};
+use brain::{Brain, Contact, Leaving, SAFE_TILES, View};
 use host::{Host, Place, lineup_from_options};
 use lineup::{Entry, Seat};
 use nav::Nav;
@@ -302,6 +302,8 @@ struct Bot {
     siblings: Siblings,
     controller: Option<String>,
     flight_order: Option<FlightOrder>,
+    /// Told to spectate but still breaking off its fight.
+    leaving: Option<Leaving>,
     last_order_reply: Option<u64>,
     advertised_orders: bool,
     rng: Rng,
@@ -330,21 +332,41 @@ impl Bot {
             .is_ok_and(|s| s.iter().any(|n| n.eq_ignore_ascii_case(name)))
     }
 
-    /// Takes the seat the host gives: the bot's ship, or spectator mode.
+    /// Takes the seat the host gives: the bot's ship, or spectator mode. A bot
+    /// that is flying breaks off its fight first (see `fly`); going back in
+    /// cancels that.
     fn take_seat(&mut self, seat: Seat) {
-        let want = match seat {
-            Seat::In => self.seat_ship,
-            Seat::Spectating => SPECTATOR,
-        };
+        match seat {
+            Seat::In => {
+                self.leaving = None;
+                self.set_ship(self.seat_ship);
+            }
+            Seat::Spectating => {
+                let flying = self.brain.is_some() && self.nav.is_some() && self.own_ship_flying();
+                if flying && self.ship != SPECTATOR {
+                    if self.leaving.is_none() {
+                        self.log("breaking off before spectating");
+                        self.leaving = Some(Leaving {
+                            since_ms: self.driver.now_ms(),
+                        });
+                    }
+                } else {
+                    self.set_ship(SPECTATOR);
+                }
+            }
+        }
+    }
+
+    fn set_ship(&mut self, want: u8) {
         if want == self.ship {
             return;
         }
-        // Going to spectator: the one place a bot will break off a fight first.
         self.ship = want;
         self.flight_order = None;
-        self.log(match seat {
-            Seat::In => "taking my seat",
-            Seat::Spectating => "going to spectator",
+        self.log(if want == SPECTATOR {
+            "going to spectator"
+        } else {
+            "taking my seat"
         });
         if self.session.state() == State::Playing
             && self.session.me().is_some_and(|p| p.ship != want)
@@ -828,6 +850,7 @@ impl Bot {
         };
         let (mut enemies, mut shots) = (Vec::new(), Vec::new());
         let mut fired = false;
+        let mut spectate = false;
         // Far behind (the machine was asleep, say): skip ahead rather than racing.
         if now.saturating_sub(self.last_step_ms) > 2000 {
             self.last_step_ms = now - 10;
@@ -841,17 +864,28 @@ impl Bot {
                 Some(i) if world.ships[i].is_alive() => {
                     if let (Some(brain), Some(nav)) = (self.brain.as_mut(), self.nav.as_mut()) {
                         let v = view(world, i, &mut enemies, &mut shots);
-                        match self.flight_order {
-                            Some(FlightOrder::Position(at)) => brain.obey(&v, nav, at, false),
-                            Some(FlightOrder::Follow(id)) => {
-                                let at = world
-                                    .ship_index(id)
-                                    .map(|j| &world.ships[j])
-                                    .filter(|target| target.is_alive())
-                                    .map_or(v.pos, |target| px(target.pos));
-                                brain.obey(&v, nav, at, true)
+                        if let Some(l) = self.leaving {
+                            let near = v.enemies.iter().any(|e| {
+                                let (dx, dy) = (e.pos.0 - v.pos.0, e.pos.1 - v.pos.1);
+                                dx.hypot(dy) < SAFE_TILES * 16.0
+                            });
+                            if l.ready(self.last_step_ms, near) {
+                                spectate = true;
                             }
-                            None => brain.think(&v, nav),
+                            brain.disengage(&v, nav)
+                        } else {
+                            match self.flight_order {
+                                Some(FlightOrder::Position(at)) => brain.obey(&v, nav, at, false),
+                                Some(FlightOrder::Follow(id)) => {
+                                    let at = world
+                                        .ship_index(id)
+                                        .map(|j| &world.ships[j])
+                                        .filter(|target| target.is_alive())
+                                        .map_or(v.pos, |target| px(target.pos));
+                                    brain.obey(&v, nav, at, true)
+                                }
+                                None => brain.think(&v, nav),
+                            }
                         }
                     } else if self.fly {
                         random_walk(world.tick, self.rng.next_u32())
@@ -859,7 +893,11 @@ impl Bot {
                         ShipInput::default()
                     }
                 }
-                _ => ShipInput::default(),
+                _ => {
+                    // Dead (or gone) and told to spectate: nothing to break off.
+                    spectate |= self.leaving.is_some();
+                    ShipInput::default()
+                }
             };
             let mut inputs = vec![ShipInput::default(); world.ships.len()];
             if let Some(i) = me {
@@ -903,15 +941,18 @@ impl Bot {
                 }
             }
         }
-        let Some(i) = world
+        if let Some(i) = world
             .ship_index(self.me)
             .filter(|&i| !world.ships[i].remote)
-        else {
-            return;
-        };
-        if !fired && self.session.position_due(now) {
+            && !fired
+            && self.session.position_due(now)
+        {
             let pos = own_position(&world.ships[i], None);
             self.session.send_position(now, &pos);
+        }
+        if spectate {
+            self.leaving = None;
+            self.set_ship(SPECTATOR);
         }
     }
 
@@ -1070,6 +1111,7 @@ fn start_bot(
         siblings,
         controller: place.controller.clone().or(s.controller.clone()),
         flight_order: None,
+        leaving: None,
         last_order_reply: None,
         advertised_orders: false,
         rng: Rng::new(seed | 1),
