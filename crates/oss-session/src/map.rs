@@ -115,20 +115,80 @@ impl MapCache {
 
     /// The cached map `name`, if present (the caller checks the CRC).
     pub fn load(&self, name: &str) -> Option<Vec<u8>> {
-        let path = self.path(name)?;
-        let meta = std::fs::metadata(&path).ok()?;
-        if meta.len() > MAX_MAP {
-            return None;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = self.path(name)?;
+            web_cache::load(name)
         }
-        std::fs::read(path).ok()
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = self.path(name)?;
+            let meta = std::fs::metadata(&path).ok()?;
+            if meta.len() > MAX_MAP {
+                return None;
+            }
+            std::fs::read(path).ok()
+        }
     }
 
     pub fn store(&self, name: &str, data: &[u8]) -> std::io::Result<()> {
         let path = self
             .path(name)
             .ok_or_else(|| std::io::Error::other("unsafe map name"))?;
-        std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(path, data)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = path;
+            web_cache::store(name, data)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            std::fs::create_dir_all(&self.dir)?;
+            std::fs::write(path, data)
+        }
+    }
+}
+
+/// The browser has no files: there the cache is kept in memory, filled at start from what
+/// the page saved earlier (IndexedDB) and passing each new file to the page to save.
+#[cfg(target_arch = "wasm32")]
+pub mod web_cache {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn files() -> &'static Mutex<HashMap<String, Vec<u8>>> {
+        static FILES: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+        FILES.get_or_init(Default::default)
+    }
+
+    static SAVE: OnceLock<fn(&str, &[u8])> = OnceLock::new();
+
+    /// How a newly stored file reaches the page's own storage.
+    pub fn set_saver(save: fn(&str, &[u8])) {
+        let _ = SAVE.set(save);
+    }
+
+    /// A file the page saved on an earlier visit.
+    pub fn preload(name: &str, data: Vec<u8>) {
+        if data.len() as u64 <= super::MAX_MAP
+            && let Ok(mut files) = files().lock()
+        {
+            files.insert(name.to_owned(), data);
+        }
+    }
+
+    pub(super) fn load(name: &str) -> Option<Vec<u8>> {
+        files().lock().ok()?.get(name).cloned()
+    }
+
+    pub(super) fn store(name: &str, data: &[u8]) -> std::io::Result<()> {
+        let save = SAVE
+            .get()
+            .ok_or_else(|| std::io::Error::other("no storage on this page"))?;
+        if let Ok(mut files) = files().lock() {
+            files.insert(name.to_owned(), data.to_vec());
+        }
+        save(name, data);
+        Ok(())
     }
 }
 

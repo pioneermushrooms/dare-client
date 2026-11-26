@@ -91,6 +91,9 @@ pub struct Config {
     pub skin: String,
     /// Extra folders to look for skins in.
     pub skin_folders: Vec<PathBuf>,
+    /// Enter opens the chat line; with it closed, letters drive the voice menu (V).
+    /// Off: Continuum's way, every character types.
+    pub enter_to_chat: bool,
 }
 
 impl Default for Config {
@@ -112,6 +115,7 @@ impl Default for Config {
             identity: true,
             skin: crate::game::skin::DEFAULT_SKIN.to_owned(),
             skin_folders: Vec::new(),
+            enter_to_chat: true,
         }
     }
 }
@@ -215,6 +219,7 @@ impl Config {
                     Ok(())
                 }
                 ("audio", "mute") => flag(value).map(|b| c.mute = b),
+                ("chat", "enter_to_chat") => flag(value).map(|b| c.enter_to_chat = b),
                 ("audio", "volume") => number(value, 0, 100).map(|n| c.volume = n),
                 ("accessibility", "palette") => crate::game::palette::PaletteKind::from_name(value)
                     .map(|p| c.palette = p)
@@ -321,6 +326,13 @@ impl Config {
         s += &format!(
             "[audio]\nmute = {}\nvolume = {}         ; 0-100\n\n",
             self.mute, self.volume
+        );
+        s += &format!(
+            "[chat]\n\
+             ; yes: Enter opens the chat line, and V opens the voice menu. no: every\n\
+             ; key types straight into chat, as in Continuum.\n\
+             enter_to_chat = {}\n\n",
+            self.enter_to_chat
         );
         s += &format!(
             "[accessibility]\n\
@@ -635,6 +647,15 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(Config::parse(&custom.to_text()).0, custom);
+    }
+
+    #[test]
+    fn enter_to_chat_defaults_on_and_round_trips() {
+        assert!(Config::default().enter_to_chat);
+        let (c, warnings) = Config::parse("[chat]\nenter_to_chat = no\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!c.enter_to_chat);
+        assert_eq!(Config::parse(&c.to_text()).0, c);
     }
 
     /// A player who has just installed the client must have somewhere to play

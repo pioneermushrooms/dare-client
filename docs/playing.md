@@ -20,7 +20,8 @@ rather than "the keys".
 | Shift+Tab | Mines |
 | Delete | Multifire |
 | Esc | Menu — 1-8 change ship, S spectate, A arena list (in a zone), N zone news, O options, F frame rate, Q quit the game. F2 and F12 work with it open, and so do the flying keys |
-| Enter | Send what you have typed |
+| Enter | Open the chat line; Enter again sends, Esc throws it away (with *Enter to chat* off: send what you have typed) |
+| V | Voice menu (with *Enter to chat* on; see below) |
 | F1 | Help pages (F1 or Page Down turns the page, Page Up goes back, Esc closes). A zone that sends its own help pages, as some do inside their LVZ files, has them shown first, and this client's own page follows |
 | F2 | Cycle the stat box views |
 | Page Up / Page Down | Select a player in the stat box (and scroll the chat log while the menu is open) |
@@ -49,15 +50,27 @@ The game carries on underneath, so you can still fly and type while it is up.
 
 ## Chat
 
-There is no chat box to open. Type, and the characters go to the chat line; Enter sends it.
-That is how SubSpace and Continuum work, and the original client's own help says so: "To
-send a public message simply type it, then hit Enter."
+Press Enter to open the chat line, type, and press Enter to send it; Esc throws it away.
+That frees the letter keys for the voice menu (below). SubSpace and Continuum have no chat
+box to open — you type and the characters go straight to the chat line — and you can have
+that back by turning off **Enter to chat** under Settings > Accessibility (`[chat]
+enter_to_chat = no` in the settings file). The rest of this section holds either way.
 
 One key is both a character and a game key — the backquote, which is repel. It repels while
 the chat line is empty and types a backquote once there is something on the line, which is
 the rule the originals use for any such key, macro keys included. Everything else that flies
 the ship types nothing, so you keep flying, shooting and laying mines while you talk.
 Ctrl+Backspace clears the line.
+
+### Voice menu
+
+With the chat line closed, **V** opens the voice menu: a box above the chat log lists the
+keys at each level, and the last key of a line sends it — `V G W` says "Woohoo!" to the
+whole arena, `V T R` tells your team "He's red!", `V M L` "Break left!". The menu closes the
+moment a line goes. Backspace goes up a level, Esc closes it, and it closes itself after four
+seconds without a key. Everyone the line goes to hears it and sees it in chat with your
+name; zones that support it (`?v`) limit how often you can, and the box counts down while
+you are silenced. This menu is ours — Continuum has none.
 
 The prefixes are Continuum's:
 

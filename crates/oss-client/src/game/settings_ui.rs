@@ -135,6 +135,8 @@ enum Row {
     Vsync,
     Mute,
     Volume,
+    /// `[chat] enter_to_chat`: Enter opens chat, letters drive the voice menu.
+    EnterToChat,
     Palette,
     /// The start screen's skin, from the names given by [`SettingsUi::set_skins`].
     Skin,
@@ -190,7 +192,7 @@ impl Row {
     fn kind(self) -> Kind {
         match self {
             Row::Scale | Row::Volume | Row::InterfaceSize => Kind::Number,
-            Row::Fullscreen | Row::Vsync | Row::Mute => Kind::Toggle,
+            Row::Fullscreen | Row::Vsync | Row::Mute | Row::EnterToChat => Kind::Toggle,
             Row::Palette | Row::Skin => Kind::Choice,
             Row::Key(_) | Row::Pad(_) | Row::Macro(_) => Kind::Parts,
             Row::RestoreKeys | Row::RestorePad | Row::AddMacro => Kind::Button,
@@ -387,7 +389,7 @@ impl SettingsUi {
                 v
             }
             Section::Audio => vec![Row::Mute, Row::Volume],
-            Section::Accessibility => vec![Row::Palette, Row::InterfaceSize],
+            Section::Accessibility => vec![Row::Palette, Row::InterfaceSize, Row::EnterToChat],
             Section::Keys => Action::ALL
                 .into_iter()
                 .map(Row::Key)
@@ -643,6 +645,7 @@ impl SettingsUi {
             Row::Fullscreen => self.cfg.fullscreen = !self.cfg.fullscreen,
             Row::Vsync => self.cfg.vsync = !self.cfg.vsync,
             Row::Mute => self.cfg.mute = !self.cfg.mute,
+            Row::EnterToChat => self.cfg.enter_to_chat = !self.cfg.enter_to_chat,
             _ => {}
         }
     }
@@ -743,6 +746,7 @@ impl SettingsUi {
             Row::Fullscreen => "Fullscreen".into(),
             Row::Vsync => "Vsync".into(),
             Row::Mute => "Mute".into(),
+            Row::EnterToChat => "Enter to chat".into(),
             Row::Volume => "Volume".into(),
             Row::Palette => "Colour palette".into(),
             Row::Skin => "Start screen skin".into(),
@@ -770,6 +774,7 @@ impl SettingsUi {
             Row::Fullscreen => on(self.cfg.fullscreen),
             Row::Vsync => on(self.cfg.vsync),
             Row::Mute => on(self.cfg.mute),
+            Row::EnterToChat => on(self.cfg.enter_to_chat),
             Row::Volume => self.cfg.volume.to_string(),
             Row::Palette => self.cfg.palette.name().replace('_', " "),
             Row::Skin => self.cfg.skin.clone(),
@@ -820,6 +825,10 @@ impl SettingsUi {
             Row::Fullscreen => "Borderless fullscreen. Applies when saved.".into(),
             Row::Vsync => "Caps the frame rate to the display's. Applies at the next start.".into(),
             Row::Mute => "No sound at all. Applies at the next start.".into(),
+            Row::EnterToChat => {
+                "On: Enter opens chat and V opens the voice menu. Off: keys type straight into chat."
+                    .into()
+            }
             Row::Volume => "How loud, 0 to 100. Applies when saved.".into(),
             Row::Skin => {
                 "The start screen's look. Cmd-K or F7 cycles it there too. Applies when saved."

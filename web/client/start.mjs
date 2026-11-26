@@ -6,12 +6,15 @@
 // it fetches, so a browser holding an older copy of any of them can't mix the two.
 const version = new URL(import.meta.url).searchParams.get("v") ?? "";
 const here = (path) => new URL(version ? `${path}?v=${encodeURIComponent(version)}` : path, import.meta.url);
-// The game (its script, its 13 MB WebAssembly and the zone link) is fetched only when the
-// pilot presses Enter: opening the page downloads nothing of it.
+// The game (its script, its WebAssembly and the zone link) starts downloading and compiling in
+// the background once the page has loaded, so it is ready, or nearly, by the time the pilot
+// presses Enter. Its sounds come separately after the game has started.
 let game = null; // { init, start_dare_in } once its script is loaded
 let connectZone = null;
 
 const WASM = here("pkg/oss_client_bg.wasm");
+const SOUNDS = here("pkg/sounds.pack");
+const GATEWAY = "https://subspacefoundation.com:4443/play/transport";
 const BUILD = here("build.json");
 const ARENA_KEY = "foundation.arena";
 const HEADERS = { "Content-Type": "application/json", "X-Requested-With": "dare-arena" };
@@ -31,8 +34,31 @@ const signinMsg = $("signin-msg");
 const forgot = $("signin-forgot");
 
 // ---- the game's link to the zone (WebTransport to the Foundation gateway) ------------------
+// Opened when Enter is pressed, while the sign-in box and the download finish; the game takes
+// it over when it starts (one use only), or opens its own.
+let warmGateway = null; // { connecting, sink, fail } until the game takes it
+function warmUpGateway() {
+  if (warmGateway || !connectZone) return;
+  const warm = { sink: null, fail: null, early: [] };
+  warm.connecting = connectZone(
+    GATEWAY,
+    (packet) => (warm.sink ? warm.sink(packet) : warm.early.length < 256 && warm.early.push(packet)),
+    (error) => { warm.failed = error ?? new Error("Gateway disconnected."); warm.fail?.(warm.failed); },
+  );
+  warm.connecting.catch(() => {});
+  warmGateway = warm;
+  // Not used in time (the pilot went back): let it go rather than hold a slot at the gateway.
+  setTimeout(() => {
+    if (warmGateway === warm) {
+      warmGateway = null;
+      warm.connecting.then((link) => link.close(), () => {});
+    }
+  }, 40000); // inside the gateway's 45 s idle limit
+}
+
 globalThis.openDareGateway = () => {
   const queue = [];
+  const unsent = []; // what the game sends before the link is open (its first connect packet)
   let link;
   let closed = false;
   const bridge = {
@@ -40,7 +66,10 @@ globalThis.openDareGateway = () => {
     boundPort: 0,
     error: undefined,
     receive: () => queue.shift(),
-    send: (packet) => link?.send(packet),
+    send: (packet) => {
+      if (link) link.send(packet);
+      else if (!closed && unsent.length < 16) unsent.push(packet.slice());
+    },
     close() {
       closed = true;
       queue.length = 0;
@@ -50,13 +79,22 @@ globalThis.openDareGateway = () => {
   function failed(error) {
     if (!closed) bridge.error = error?.message ?? String(error ?? "Gateway disconnected.");
   }
-  void connectZone(
-    "https://subspacefoundation.com:4443/play/transport",
-    (packet) => {
-      if (!closed && queue.length < 256) queue.push(packet);
-    },
-    failed,
-  ).then((connected) => {
+  const onPacket = (packet) => {
+    if (!closed && queue.length < 256) queue.push(packet);
+  };
+  const warm = warmGateway && !warmGateway.failed ? warmGateway : null;
+  warmGateway = null;
+  let connecting;
+  if (warm) {
+    warm.sink = onPacket;
+    warm.fail = failed;
+    for (const packet of warm.early.splice(0)) onPacket(packet);
+    // (if it failed meanwhile, a fresh one)
+    connecting = warm.connecting.catch(() => connectZone(GATEWAY, onPacket, failed));
+  } else {
+    connecting = connectZone(GATEWAY, onPacket, failed);
+  }
+  void connecting.then((connected) => {
     if (closed) {
       connected.close();
       return;
@@ -64,6 +102,7 @@ globalThis.openDareGateway = () => {
     link = connected;
     bridge.serverIp = link.serverIp;
     bridge.boundPort = link.boundPort;
+    for (const packet of unsent.splice(0)) link.send(packet);
   }).catch(failed);
   return bridge;
 };
@@ -268,6 +307,7 @@ const SIGNIN_WORDS = {
   account: ["Sign in", "Sign in"],
 };
 let flyAsGuest = false; // the sign-in box's "Fly as a guest" was chosen
+let signedInOrNot = () => {}; // ends the wait for the sign-in box
 function askToSignIn(why = "fly") {
   const [title, button] = SIGNIN_WORDS[why] ?? SIGNIN_WORDS.fly;
   $("signin-title").textContent = title;
@@ -280,6 +320,9 @@ function askToSignIn(why = "fly") {
   dialog.showModal();
   $("signin-name").focus();
   return new Promise((resolve) => {
+    // Resolved by the box's own buttons as well as its close event, which a browser may hold
+    // back until it next draws the page.
+    signedInOrNot = resolve;
     dialog.addEventListener("close", () => resolve(), { once: true });
   });
 }
@@ -302,6 +345,7 @@ form.addEventListener("submit", async (event) => {
       $("signin-password").value = "";
       showPilot();
       dialog.close();
+      signedInOrNot();
     } else {
       signinMsg.textContent = body.message || "Couldn't sign in.";
       forgot.hidden = false; // only after a failed try
@@ -317,6 +361,7 @@ $("signin-cancel").addEventListener("click", () => dialog.close());
 $("signin-guest")?.addEventListener("click", () => {
   flyAsGuest = true;
   dialog.close();
+  signedInOrNot();
 });
 
 // ---- the download ------------------------------------------------------------------------
@@ -350,34 +395,98 @@ async function expectedSize() {
 }
 
 let percent = 0;
+let showProgress = false; // after Enter: the button shows how far the download is
 // While the game downloads (after Enter), the button says how far along it is.
 function progress(value) {
   percent = value;
+  if (!showProgress) return;
   button.style.setProperty("--p", `${value}%`);
   button.classList.toggle("downloading", value < 100);
   label.textContent = value < 100 ? `Loading ${value}%` : "Enter";
 }
 
+// Downloads and compiles the game in one go (the browser compiles as the bytes arrive).
 async function download() {
   const [total, response] = await Promise.all([expectedSize(), fetch(WASM)]);
   if (!response.ok || !response.body) throw new Error(`The game download failed (${response.status}).`);
-  const reader = response.body.getReader();
-  const chunks = [];
   let received = 0;
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    if (total > 0) progress(Math.min(99, Math.floor((received / total) * 100)));
+  const counted = response.body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      received += chunk.length;
+      if (total > 0) progress(Math.min(99, Math.floor((received / total) * 100)));
+      controller.enqueue(chunk);
+    },
+  }));
+  return WebAssembly.compileStreaming(new Response(counted, { headers: { "Content-Type": "application/wasm" } }));
+}
+
+// ---- what the browser keeps between visits: the zone's maps, LVZ and news -------------------
+// The game can't write files here; it hands each download to dareCacheSave, kept in IndexedDB,
+// and gets them all back before it starts, so a return visit needn't download them again.
+const CACHE_DB = "dare-zone-files";
+function cacheDb() {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open(CACHE_DB, 2);
+    open.onupgradeneeded = () => {
+      if (!open.result.objectStoreNames.contains("files")) open.result.createObjectStore("files");
+    };
+    open.onsuccess = () => resolve(open.result);
+    open.onerror = () => reject(open.error);
+  });
+}
+// (never holding up the start: storage that is slow, blocked or broken just means downloading)
+function cachedFiles() {
+  return Promise.race([readCachedFiles(), new Promise((resolve) => setTimeout(() => resolve([]), 2000))]);
+}
+async function readCachedFiles() {
+  try {
+    const db = await cacheDb();
+    const files = await new Promise((resolve, reject) => {
+      const store = db.transaction("files").objectStore("files");
+      const keys = store.getAllKeys();
+      const values = store.getAll();
+      values.onsuccess = () => resolve(keys.result.map((key, i) => [key, values.result[i]]));
+      values.onerror = () => reject(values.error);
+    });
+    db.close();
+    return files;
+  } catch {
+    return [];
   }
-  const bytes = new Uint8Array(received);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
+}
+globalThis.dareCacheSave = (name, data) => {
+  const bytes = data.slice(); // a copy: the game's memory may move
+  void cacheDb().then((db) => {
+    const tx = db.transaction("files", "readwrite");
+    tx.objectStore("files").put(bytes, String(name));
+    tx.oncomplete = tx.onerror = () => db.close();
+  }).catch(() => {});
+};
+
+// ---- the game's sounds: fetched once the game has started, then handed to it ------------------
+// (pkg/sounds.pack, from build-client.sh: a 1-byte name length, the name, a 4-byte size, the file)
+async function loadSounds() {
+  try {
+    const response = await fetch(SOUNDS, { priority: "low" });
+    if (!response.ok) throw new Error(`sounds: ${response.status}`);
+    const pack = new Uint8Array(await response.arrayBuffer());
+    const view = new DataView(pack.buffer);
+    const names = new TextDecoder();
+    let at = 0;
+    while (at < pack.length) {
+      const nameLength = pack[at];
+      const name = names.decode(pack.subarray(at + 1, at + 1 + nameLength));
+      at += 1 + nameLength;
+      const size = view.getUint32(at, true);
+      at += 4;
+      game.provide_asset(name, pack.subarray(at, at + size));
+      at += size;
+    }
+  } catch (error) {
+    console.warn(`sounds: ${error?.message ?? error}`);
+  } finally {
+    game.assets_provided();
   }
-  return bytes;
 }
 
 // ---- the pilot's own ship graphics ----------------------------------------------------------
@@ -401,21 +510,36 @@ function shareShips() {
 }
 
 // ---- Enter --------------------------------------------------------------------------------
-let loading = null; // the game's download and start-up, begun by the first Enter
+let loading = null; // the game's download and start-up, begun once the page has loaded
+let sounds = null;
 
 function loadGame() {
   loading ??= (async () => {
     progress(0);
-    const [glue, transport] = await Promise.all([import(here("pkg/oss_client.js")), import(here("transport.mjs"))]);
-    connectZone = transport.connectZone;
-    const bytes = await download();
-    await glue.default({ module_or_path: bytes });
+    const [glue, transport, module, files] = await Promise.all([
+      import(here("pkg/oss_client.js")),
+      import(here("transport.mjs")).then((t) => { connectZone = t.connectZone; return t; }),
+      download(),
+      cachedFiles(),
+    ]);
+    await glue.default({ module_or_path: module });
     game = glue;
+    game.use_page_cache();
+    for (const [name, data] of files) game.preload_cached_file(name, data);
     shareShips();
     progress(100);
   })();
   loading.catch(() => { loading = null; button.classList.remove("downloading"); label.textContent = "Enter"; });
   return loading;
+}
+
+// After Enter: the download so far shows on the button, and the zone link opens meanwhile.
+function showLoading() {
+  showProgress = true;
+  if (!game) progress(percent);
+  const transportReady = import(here("transport.mjs")).then((t) => { connectZone = t.connectZone; });
+  void transportReady.then(warmUpGateway, () => {});
+  return loadGame();
 }
 
 async function gamePass() {
@@ -430,14 +554,21 @@ async function play() {
   button.disabled = true;
   say("");
   try {
+    const loaded = showLoading();
+    loaded.catch(() => {});
     if (!me) await askToSignIn();
     if (!me && flyAsGuest) {
-      await loadGame();
+      await loaded;
       enter("guest", "guest", picker.value, "");
       return;
     }
-    if (!me) return; // cancelled
-    await loadGame();
+    if (!me) { // cancelled: the download carries on unseen
+      showProgress = false;
+      button.classList.remove("downloading");
+      label.textContent = "Enter";
+      return;
+    }
+    await loaded;
     await globalThis.foundationChatLeave?.(); // the same name can't be in the zone twice
     let pass = await gamePass();
     if (!pass) { // the site session ended: sign in again
@@ -470,6 +601,13 @@ function enter(name, pass, arena, settings) {
     });
     observer.observe(document.body, { childList: true, subtree: true });
     startReport(name, arena);
+    // The sounds once the pilot is in the arena, so they don't slow the map's download.
+    const stage = globalThis.dareLoadingStage;
+    globalThis.dareLoadingStage = (step, ...rest) => {
+      if (step === "playing") sounds ??= loadSounds();
+      return stage?.(step, ...rest);
+    };
+    setTimeout(() => { sounds ??= loadSounds(); }, 30000); // (a game that never says)
     game.start_dare_in(name, pass, arena, settings);
   } catch (error) {
     entry.hidden = false;
@@ -545,4 +683,8 @@ if (missing) {
 } else {
   button.disabled = false;
   button.addEventListener("click", play);
+  // Get the game ready while the pilot looks around (a failure here is retried on Enter).
+  const prepare = () => { loadGame().catch(() => {}); };
+  if (document.readyState === "complete") setTimeout(prepare, 0);
+  else addEventListener("load", () => setTimeout(prepare, 0), { once: true });
 }

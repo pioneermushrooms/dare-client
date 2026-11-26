@@ -34,6 +34,8 @@
 //! SubSpace form, whose arithmetic has been public for twenty years.
 //!
 //! [`VieClient`] is the default and is what the tests in this repository exercise.
+//! [`KeyedVieClient`] is the same client answering with the keyed executable
+//! checksum, for zones that verify it.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -152,10 +154,38 @@ impl ClientProfile for VieClient {
         // away: it is what a *bot* presenting itself as a VIE client sends
         // (MervBot computes it by walking `SUBSPACE.EXE`), and what a server
         // verifies such a bot against. It is simply not what the client sends,
-        // and this profile exists to be the client.
+        // and this profile exists to be the client. A zone that does verify the
+        // field gets the keyed value from `KeyedVieClient` instead.
         SecurityAnswer {
             exe_checksum: 0,
             continuum: None,
+        }
+    }
+}
+
+/// A SubSpace/VIE client that answers security checks with the keyed executable
+/// checksum, [`oss_proto::checksum::vie_exe_checksum`], instead of zero.
+///
+/// It logs in exactly as [`VieClient`] does; only the `exe_checksum` field of C2S
+/// `0x1A` differs. This is for zones that verify that field: ASSS and
+/// SubspaceServer both compare a VIE client's answer with the keyed value, and a
+/// zero (what the 1.34 client really sends) fails the comparison. SubspaceServer
+/// logs every failure at its malicious level, which forwards it to the zone's
+/// sysops as "Exe checksum mismatch." about once a minute per pilot. Use this
+/// profile for those zones; keep [`VieClient`] wherever the client should behave
+/// as the 1998 binary does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyedVieClient;
+
+impl ClientProfile for KeyedVieClient {
+    fn login(&self) -> LoginForm {
+        VieClient.login()
+    }
+
+    fn security(&self, challenge: SecurityChallenge) -> SecurityAnswer {
+        SecurityAnswer {
+            exe_checksum: oss_proto::checksum::vie_exe_checksum(challenge.key),
+            ..VieClient.security(challenge)
         }
     }
 }
@@ -166,6 +196,12 @@ pub type Profile = Arc<dyn ClientProfile>;
 /// The default profile: a SubSpace/VIE client.
 pub fn vie() -> Profile {
     Arc::new(VieClient)
+}
+
+/// The SubSpace/VIE client that answers with the keyed executable checksum: see
+/// [`KeyedVieClient`].
+pub fn vie_keyed() -> Profile {
+    Arc::new(KeyedVieClient)
 }
 
 #[cfg(test)]
@@ -236,6 +272,52 @@ mod tests {
         assert_eq!(
             answer.continuum, None,
             "a VIE client sends no trailer, whatever it was told about the map"
+        );
+    }
+
+    /// The keyed profile is the SubSpace client in every respect but one: its
+    /// executable checksum is the keyed value a verifying zone computes, and so
+    /// changes with the key.
+    #[test]
+    fn the_keyed_profile_answers_what_a_verifying_zone_computes() {
+        let keyed = vie_keyed();
+        let plain = vie();
+
+        let form = keyed.login();
+        let want = plain.login();
+        assert_eq!(
+            (form.kind, form.version, form.continuum_id),
+            (want.kind, want.version, want.continuum_id),
+            "it logs in as the SubSpace client"
+        );
+
+        for key in [0x1234_5678, 0xDEAD_BEEF, 1, u32::MAX] {
+            for map_crc32 in [None, Some(0xDEAD_BEEF)] {
+                let c = SecurityChallenge { key, map_crc32 };
+                let answer = keyed.security(c);
+                assert_eq!(
+                    answer.exe_checksum,
+                    oss_proto::checksum::vie_exe_checksum(key),
+                    "key {key:#x}"
+                );
+                assert_ne!(answer.exe_checksum, 0, "not the 1.34 client's zero");
+                assert_eq!(answer.continuum, None, "still the 40-byte SubSpace form");
+            }
+        }
+        assert_ne!(
+            keyed
+                .security(SecurityChallenge {
+                    key: 1,
+                    map_crc32: None
+                })
+                .exe_checksum,
+            keyed
+                .security(SecurityChallenge {
+                    key: 2,
+                    map_crc32: None
+                })
+                .exe_checksum,
+            "keyed, so it cannot be precomputed"
         );
     }
 

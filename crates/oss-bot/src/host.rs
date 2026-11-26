@@ -211,9 +211,7 @@ fn run_hosted(
             log::info!("[{}] logging in again", entry.name);
             bot = connect(&entry, &place);
         }
-        let open = bot
-            .as_mut()
-            .is_some_and(|b| b.step(&cache, opts.chat.as_deref()));
+        let open = bot.as_mut().is_some_and(|b| b.step(&cache, &opts.chat));
         std::thread::sleep(Duration::from_millis(if open { 5 } else { 50 }));
     }
 }

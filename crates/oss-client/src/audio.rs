@@ -192,6 +192,9 @@ impl Audio {
         }
         let loaded = match self.dir.load_sound(name) {
             Ok(snd) => Some(to_mono_resampled(&snd, self.rate)),
+            // The browser's sounds arrive after the game starts: silent until then,
+            // without remembering the miss.
+            Err(oss_assets::AssetError::Missing(_)) if oss_assets::assets_pending() => return None,
             Err(e) => {
                 log::warn!("{e}");
                 None

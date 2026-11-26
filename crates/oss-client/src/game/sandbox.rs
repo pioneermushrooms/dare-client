@@ -32,6 +32,7 @@ use super::online::Online;
 use super::start_spots::Rect;
 use super::statbox::{self, StatBox};
 use super::view::{self, Canvas, color};
+use super::voice;
 use crate::audio::Audio;
 use crate::gfx::{Renderer, StarParams, TextureId};
 
@@ -117,6 +118,13 @@ pub struct Sandbox {
     pub(super) balls: Balls,
     /// The chat box, its log and its history.
     pub(super) chat: ChatLog,
+    /// Enter opens the chat line; with it closed, letters drive the voice menu.
+    pub enter_to_chat: bool,
+    /// The voice menu (V).
+    pub(super) voice: super::voice::VoiceMenu,
+    /// How to talk is said on the first frame, once the Enter-to-chat setting is known
+    /// (it is set after the screen is built).
+    chat_help_due: bool,
     /// The last player you killed and the last who killed you (,
     /// ).
     last_killed: Option<String>,
@@ -258,10 +266,7 @@ impl Sandbox {
             renderer, dir, tileset, world, objects, 0, scale, audio, None,
         )?;
         s.last_ship = ship.min(7);
-        s.message(
-            "Welcome to the Open SubSpace sandbox. Type to chat, Esc for the menu.",
-            color::GREEN,
-        );
+        s.message("Welcome to the Open SubSpace sandbox.", color::GREEN);
         Ok(s)
     }
 
@@ -360,11 +365,9 @@ impl Sandbox {
                 "Playing a replay. Arrows move the camera, Ctrl follows the stat box selection.",
                 color::GREEN,
             );
+            s.chat_help_due = false;
         } else {
-            s.message(
-                format!("Entered arena {arena}. Type to chat, Esc for the menu."),
-                color::GREEN,
-            );
+            s.message(format!("Entered arena {arena}."), color::GREEN);
             // Said here as well as in `?status`, because a session that quietly
             // fell back to VIE is exactly the thing a player should not have to
             // think to ask about.
@@ -424,6 +427,9 @@ impl Sandbox {
             attached_to: None,
             attachments: Default::default(),
             chat: ChatLog::default(),
+            enter_to_chat: true,
+            voice: super::voice::VoiceMenu::new(),
+            chat_help_due: true,
             last_killed: None,
             last_killer: None,
             news: Vec::new(),
@@ -716,6 +722,9 @@ impl Sandbox {
         let dt = gap.min(Duration::from_millis(250));
         self.last = now;
         self.clock += dt.as_secs_f32();
+        if std::mem::take(&mut self.chat_help_due) {
+            self.message(voice::chat_help(self.enter_to_chat), color::GREEN);
+        }
         while self.scripted.last().is_some_and(|(t, _)| self.clock >= *t) {
             if let Some((_, line)) = self.scripted.pop() {
                 log::info!("--send: {line}");
@@ -731,7 +740,7 @@ impl Sandbox {
         // same keystroke all the way from the window event, so this holds on any
         // keyboard layout — and only the character goes, never the key, so a key
         // that is both still does its other job.
-        let typing = !self.chat.input.is_empty();
+        let typing = self.keys_type();
         let strokes: Vec<Stroke> = input
             .take_strokes()
             .into_iter()
@@ -752,7 +761,8 @@ impl Sandbox {
         // "Message history (ESC) displays more chat, and you can fly while it
         // is on". The chat line's rule already draws exactly that line between
         // the two kinds of key, so the menu borrows it.
-        input.set_typing(self.menu || !self.chat.input.is_empty());
+        input.set_typing(self.menu || self.keys_type());
+        self.voice.tick(self.clock);
         // The help shows the player's own keys, so it reads the live table. Copied
         // only while it is open, which is the only time anything looks at it.
         if self.help_open && self.bindings != input.bindings {
@@ -1046,6 +1056,20 @@ impl Sandbox {
         }
         let kept = self.arena_list_input(edges, strokes);
         let strokes = kept.as_slice();
+        // Esc closes the voice menu, or throws away an Enter-opened chat line, and
+        // does nothing else that frame (the game menu stays shut).
+        let esc = strokes
+            .iter()
+            .any(|s| s.first_press() == Some(KeyCode::Escape));
+        if esc && (self.voice.is_open() || (self.enter_to_chat && self.chat.open)) {
+            if self.voice.is_open() {
+                self.voice.close();
+            } else {
+                self.chat.cancel();
+            }
+            edges.retain(|a| *a != Action::Menu);
+            return;
+        }
         if edges.contains(&Action::Menu) {
             if self.bot_menu {
                 self.bot_menu = false;
@@ -1066,6 +1090,9 @@ impl Sandbox {
             return;
         }
         let mut send = false;
+        // Taken before the keys below: a key that sends a voice line closes the menu,
+        // and must not then also fire a macro bound to the same key.
+        let keys_typed = self.keys_type();
         for stroke in strokes {
             // The chat line is always live. Tab finishes a name on it rather than
             // dropping a bomb, but only once there is something to finish.
@@ -1074,14 +1101,42 @@ impl Sandbox {
                 continue;
             }
             if let Some(c) = stroke.text {
-                self.chat.type_char(c);
+                let route =
+                    voice::route_char(self.enter_to_chat, self.chat.open, self.voice.is_open());
+                match route {
+                    voice::CharRoute::Chat => self.chat.type_char(c),
+                    voice::CharRoute::Voice => match self.voice.press(c, self.clock) {
+                        voice::VoiceStep::Send(code) => self.send_voice(code),
+                        // A letter with nothing open: someone typing the old way.
+                        voice::VoiceStep::Ignored
+                            if !self.voice.is_open() && self.voice.hint_due(self.clock) =>
+                        {
+                            self.message(
+                                "Press Enter to chat, or V for voice lines (Settings > Accessibility).",
+                                color::YELLOW,
+                            );
+                        }
+                        _ => {}
+                    },
+                }
             }
             // Backspace takes the repeats, so a held Backspace clears the line;
-            // Enter and F1 act once, so a held Enter sends one message.
-            if stroke.key == Some(KeyCode::Backspace) {
+            // Enter and F1 act once, so a held Enter sends one message. In the
+            // voice menu Backspace goes up a level, once per press.
+            if self.voice.is_open() {
+                if stroke.first_press() == Some(KeyCode::Backspace) {
+                    self.voice.back(self.clock);
+                }
+            } else if stroke.key == Some(KeyCode::Backspace) {
                 self.chat.backspace(ctrl);
             }
             match stroke.first_press() {
+                Some(KeyCode::Enter | KeyCode::NumpadEnter)
+                    if self.enter_to_chat && !self.chat.open =>
+                {
+                    self.voice.close();
+                    self.chat.open();
+                }
                 Some(KeyCode::Enter | KeyCode::NumpadEnter) => send = true,
                 Some(KeyCode::F1) => {
                     self.help_open = true;
@@ -1094,7 +1149,7 @@ impl Sandbox {
             let line = self.chat.submit();
             self.send_chat_line(&line);
         }
-        self.run_macros(strokes, shift, ctrl);
+        self.run_macros(strokes, shift, ctrl, keys_typed);
         for e in edges.iter() {
             match e {
                 Action::ShowFps => self.fps_view = self.fps_view.next(),
@@ -1131,6 +1186,41 @@ impl Sandbox {
     }
 
     /// Sends (or, offline, handles) a typed chat line; see [`chat`] for the prefixes.
+    /// Settings changed mid-game. Turning Enter-to-chat off closes the voice menu
+    /// and leaves any open line as a plain Continuum-style line.
+    pub fn set_enter_to_chat(&mut self, on: bool) {
+        self.enter_to_chat = on;
+        if !on {
+            self.voice.close();
+            self.chat.open = false;
+        }
+    }
+
+    /// The voice menu chose a line: the zone says it for us (`?v`, see the voice module).
+    /// Offline there is no zone to answer, so the line is played and shown here.
+    fn send_voice(&mut self, code: &str) {
+        if self.net.is_some() {
+            self.send_chat_line(&format!("?v {code}"));
+            return;
+        }
+        if let Some(p) = voice::PHRASES.iter().find(|p| p.code == code) {
+            if let Some(clip) = voice::clip_name(p.sound) {
+                self.sound(&clip, 1.0, None);
+            }
+            self.message(p.label, color::WHITE);
+        }
+    }
+
+    /// Whether keys that type belong to the chat line or the voice menu right now.
+    fn keys_type(&self) -> bool {
+        voice::keys_type(
+            self.enter_to_chat,
+            self.chat.open,
+            !self.chat.input.is_empty(),
+            self.voice.is_open(),
+        )
+    }
+
     fn send_chat_line(&mut self, line: &str) {
         self.send_chat_as(line, false);
     }
@@ -1226,8 +1316,7 @@ impl Sandbox {
     /// Macro keys (from the settings file): send their line when pressed. A macro on
     /// a key that types gives way to the chat line once that line has something on
     /// it, exactly as a binding does.
-    fn run_macros(&mut self, strokes: &[Stroke], shift: bool, ctrl: bool) {
-        let typing = !self.chat.input.is_empty();
+    fn run_macros(&mut self, strokes: &[Stroke], shift: bool, ctrl: bool, typing: bool) {
         // A macro key fires on the key going down, not on the OS repeating it:
         // leaning on one must not send the line thirty times a second.
         let lines: Vec<String> = self
@@ -1567,8 +1656,21 @@ impl Sandbox {
                     }
                 }
                 SessionEvent::Chat {
-                    kind, name, text, ..
+                    kind,
+                    name,
+                    text,
+                    sound,
+                    ..
                 } => {
+                    // Voice lines (128-255) and Continuum's classic chat sounds.
+                    if let Some(clip) = voice::clip_name(sound) {
+                        self.sound(&clip, 1.0, None);
+                    }
+                    if name.is_none()
+                        && let Some(secs) = voice::silence_from_notice(&text)
+                    {
+                        self.voice.silenced_until = self.clock + secs as f32;
+                    }
                     if let Some(from) = chat::private_sender(kind, name.as_deref(), &text) {
                         self.chat.saw_private(&from);
                     }
@@ -2745,17 +2847,52 @@ impl Sandbox {
         }
     }
 
+    /// The voice menu, while open: a box just above the chat log listing the
+    /// current level (`KEY  Label`, sub-menus marked), and the silence countdown.
+    fn draw_voice_panel(&self, c: &Canvas, r: &mut Renderer, bottom: f32) {
+        let Some(header) = self.voice.header() else {
+            return;
+        };
+        let mut rows: Vec<(u32, String)> = vec![(color::YELLOW, header)];
+        for (key, label, menu) in self.voice.entries() {
+            let more = if menu { " >" } else { "" };
+            rows.push((
+                color::WHITE,
+                format!("{}  {label}{more}", key.to_ascii_uppercase()),
+            ));
+        }
+        let left = self.voice.silenced_until - self.clock;
+        if left > 0.0 {
+            rows.push((color::YELLOW, format!("Silenced - {}s", left.ceil() as u32)));
+        }
+        let chars = rows
+            .iter()
+            .map(|(_, t)| t.chars().count())
+            .max()
+            .unwrap_or(0);
+        let (w, h) = (chars as f32 * 8.0 + 8.0, rows.len() as f32 * 12.0 + 4.0);
+        let (x, top) = (8.0, (bottom - h - 4.0).max(4.0));
+        c.panel(r, x, top, w, h);
+        for (i, (colour, text)) in rows.iter().enumerate() {
+            c.text(r, x + 4.0, top + 2.0 + i as f32 * 12.0, *colour, text);
+        }
+    }
+
     fn draw_log(&self, c: &Canvas, r: &mut Renderer) {
         let mut y = c.view_h - 16.0;
         // The log stops short of the radar, as in Continuum, and wraps there.
         let width = chat_width(c);
         let mut rows = self.chat.visible_rows(c.view_h, self.menu);
-        if !self.chat.input.is_empty() {
+        if !self.chat.input.is_empty() || self.chat.open {
             let line = &self.chat.input;
             // The line being typed wraps too, but cuts at the edge instead of at a
             // space so the cursor stays with the characters (nullspace).
             let colour = chat::input_color(line);
-            let wrapped = chat::wrap(line, width, false);
+            let wrapped = if line.is_empty() {
+                vec![String::new()] // Enter-opened and empty: just the cursor
+            } else {
+                chat::wrap(line, width, false)
+            };
             rows = rows.saturating_sub(wrapped.len());
             y -= 12.0 * (wrapped.len() - 1) as f32;
             for (i, part) in wrapped.iter().enumerate() {
@@ -2782,6 +2919,7 @@ impl Sandbox {
             c.text(r, x, y, line.color, &line.text);
             y -= 12.0;
         }
+        self.draw_voice_panel(c, r, y);
         // The spectator line sits where the arena list's box does; the list is
         // what the player has just asked for, so it has the place to itself.
         if self.arena_list.is_some() {
