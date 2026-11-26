@@ -718,7 +718,6 @@ impl Sandbox {
             .min(Duration::from_millis(250));
         self.last = now;
         self.clock += dt.as_secs_f32();
-        self.fps.frame(now);
         while self.scripted.last().is_some_and(|(t, _)| self.clock >= *t) {
             if let Some((_, line)) = self.scripted.pop() {
                 log::info!("--send: {line}");
@@ -2607,6 +2606,9 @@ impl Sandbox {
 
     /// Queues the whole frame on the renderer and returns the starfield parameters.
     pub fn draw(&mut self, r: &mut Renderer) -> StarParams {
+        // Counted here rather than in `update`, which a browser also runs
+        // between redraws: the figure is frames drawn.
+        self.fps.frame(Instant::now());
         let alpha = self.acc.as_secs_f32() / TICK.as_secs_f32();
         let cam = self.camera(alpha);
         let tints = self.palette.text_tints();
