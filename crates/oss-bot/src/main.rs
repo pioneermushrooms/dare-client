@@ -8,6 +8,8 @@
 //! the behaviours in `brain` and talks (`talk`).
 
 mod brain;
+#[allow(dead_code)] // used by the host (next task)
+mod lineup;
 mod nav;
 mod script;
 mod talk;
