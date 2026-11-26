@@ -27,7 +27,8 @@ Options:
   --count <n>            Run n bots (default 1)
   --fly                  Fly around (needs a ship): thrust, turn and shoot at random
   --chat <text>          Say this in public chat once in the arena; :name:text
-                         sends it privately to that player once they're here
+                         sends it privately to that player once they're here.
+                         Repeat it to say several lines, in order
   --new-user             Create the name when the zone offers to (it does not
                          know it). Without this a bot declines and disconnects.
                          Subgame forgets its accounts when the zone restarts, so a
@@ -52,7 +53,7 @@ struct Options {
     ship: u8,
     count: usize,
     fly: bool,
-    chat: Option<String>,
+    chat: Vec<String>,
     duration: Option<Duration>,
     map_cache: Option<PathBuf>,
     verbose: bool,
@@ -70,7 +71,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
         ship: SPECTATOR,
         count: 1,
         fly: false,
-        chat: None,
+        chat: Vec::new(),
         duration: None,
         map_cache: None,
         verbose: false,
@@ -112,7 +113,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
                     .ok_or("--security must be vie, opensec, auto or none")?
             }
             "--identity" => o.identity = Some(value("--identity")?.into()),
-            "--chat" => o.chat = Some(value("--chat")?),
+            "--chat" => o.chat.push(value("--chat")?),
             "--duration" => {
                 let s: f64 = value("--duration")?
                     .parse()
@@ -140,7 +141,8 @@ struct Bot {
     green_seed: u32,
     world: Option<World>,
     rng: Rng,
-    chatted: bool,
+    /// How many `--chat` lines have been said.
+    chatted: usize,
     last_step_ms: u64,
 }
 
@@ -237,10 +239,17 @@ impl Bot {
                     }
                 }
                 SessionEvent::Chat {
-                    kind, name, text, ..
+                    kind,
+                    name,
+                    text,
+                    sound,
+                    ..
                 } => {
                     let who = name.unwrap_or_default();
-                    self.log(format_args!("chat({kind}) {who}> {text}"));
+                    match sound {
+                        0 => self.log(format_args!("chat({kind}) {who}> {text}")),
+                        _ => self.log(format_args!("chat({kind}, sound {sound}) {who}> {text}")),
+                    }
                 }
                 SessionEvent::Kill { killer, killed, .. } => {
                     self.log(format_args!("{killer} killed {killed}"))
@@ -384,7 +393,7 @@ fn main() {
             green_seed: 0,
             world: None,
             rng: Rng::new(seed | 1),
-            chatted: false,
+            chatted: 0,
             last_step_ms: 0,
         });
     }
@@ -408,7 +417,7 @@ fn main() {
                 bot.last_step_ms = now;
             }
             if bot.session.state() == State::Playing {
-                if let Some(text) = opts.chat.as_ref().filter(|_| !bot.chatted) {
+                if let Some(text) = opts.chat.get(bot.chatted) {
                     match private_chat(text) {
                         // :name:text waits until that player is in the arena.
                         Some((to, msg)) => {
@@ -419,12 +428,12 @@ fn main() {
                                 .map(|p| p.pid);
                             if let Some(pid) = pid {
                                 bot.session.send_chat(chat_type::PRIVATE, pid, msg);
-                                bot.chatted = true;
+                                bot.chatted += 1;
                             }
                         }
                         None => {
                             bot.session.send_chat(chat_type::PUBLIC, 0, text);
-                            bot.chatted = true;
+                            bot.chatted += 1;
                         }
                     }
                 }

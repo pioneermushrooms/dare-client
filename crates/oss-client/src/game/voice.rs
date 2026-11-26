@@ -151,7 +151,7 @@ impl VoiceMenu {
     }
 }
 
-/// The zone's notice when it silences our voice lines (`Voice silenced for N s — ...`):
+/// The zone's notice when it silences our voice lines (`Voice silenced for N s - ...`):
 /// the seconds, so the menu can count down.
 pub fn silence_from_notice(text: &str) -> Option<u32> {
     let rest = text.strip_prefix("Voice silenced for ")?;
@@ -298,11 +298,11 @@ mod tests {
     #[test]
     fn silence_notice_parses() {
         assert_eq!(
-            silence_from_notice("Voice silenced for 10 s — too many voice lines."),
+            silence_from_notice("Voice silenced for 10 s - too many voice lines."),
             Some(10)
         );
         assert_eq!(
-            silence_from_notice("Voice silenced for 0 s — too many voice lines."),
+            silence_from_notice("Voice silenced for 0 s - too many voice lines."),
             Some(0)
         );
         assert_eq!(silence_from_notice("Voice is off in this arena."), None);
