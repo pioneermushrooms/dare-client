@@ -4,8 +4,8 @@
 use oss_proto::position::weapon_type;
 use oss_proto::{ClientSettings, WeaponInfo};
 use oss_sim::{
-    ArenaSettings, Event, MapObject, RemoteState, RemoteWeapon, RemoteWeaponKind, Ship, TileMap,
-    World, cap,
+    ArenaSettings, Event, MapObject, RemoteState, RemoteWeapon, RemoteWeaponKind, Ship, ShipInput,
+    TileMap, World, cap,
 };
 
 use crate::{OwnPosition, RemotePosition};
@@ -64,6 +64,66 @@ pub fn own_position(ship: &Ship, weapon: Option<WeaponInfo>) -> OwnPosition {
         energy: ship.energy_points().clamp(0, i16::MAX as i32) as i16,
         weapon: weapon.unwrap_or_default(),
         dead: !ship.is_alive(),
+    }
+}
+
+/// Fewest ticks between two extra position updates for a motion change (20 ms).
+pub const MOTION_SEND_GAP: u32 = 2;
+
+/// What other clients can't predict between updates: whether you thrust (and which
+/// way), burn afterburners, or turn. Between updates every client carries your ship
+/// on at its last velocity, so a change here is exactly where they go wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Motion {
+    pub thrust: i8,
+    pub afterburner: bool,
+    pub turn: i8,
+}
+
+impl Motion {
+    /// The motion of `ship` on a tick it was steered with `input`.
+    pub fn of(ship: &Ship, input: &ShipInput) -> Self {
+        Self {
+            thrust: ship.thrusting,
+            afterburner: ship.afterburning,
+            turn: i8::from(input.right) - i8::from(input.left),
+        }
+    }
+}
+
+/// When to send an extra position update for a change of [`Motion`], on top of the
+/// regular timed ones, so every other client corrects its prediction of your ship
+/// at once instead of up to `SendPositionDelay` later. At most one per
+/// [`MOTION_SEND_GAP`]; a change inside the gap goes out when it ends, if it still
+/// stands. Shared by the game client and the bots so both report alike.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MotionReports {
+    sent: Option<Motion>,
+    sent_tick: u32,
+}
+
+impl MotionReports {
+    /// Your ship is dead or gone: the next motion starts afresh.
+    pub fn reset(&mut self) {
+        self.sent = None;
+    }
+
+    /// Whether `motion` on `tick` differs from what was last reported and the gap
+    /// has passed. The first tick alive only records it (the regular update covers
+    /// it). Call [`MotionReports::sent`] once the change has gone out (or is
+    /// covered by a regular update going out anyway).
+    pub fn due(&mut self, tick: u32, motion: Motion) -> bool {
+        let Some(sent) = self.sent else {
+            self.sent = Some(motion);
+            return false;
+        };
+        motion != sent && tick.wrapping_sub(self.sent_tick) >= MOTION_SEND_GAP
+    }
+
+    /// `motion` was reported on `tick`.
+    pub fn sent(&mut self, tick: u32, motion: Motion) {
+        self.sent = Some(motion);
+        self.sent_tick = tick;
     }
 }
 

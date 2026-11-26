@@ -13,6 +13,7 @@ mod brain;
 mod host;
 mod lineup;
 mod nav;
+mod report;
 mod script;
 mod talk;
 
@@ -25,9 +26,9 @@ use std::time::{Duration, Instant};
 
 use oss_proto::ClientSettings;
 use oss_session::map::{MapCache, default_cache_dir};
-use oss_session::sim::{arena_world, own_position, remote_state, remote_weapon, weapon_for};
+use oss_session::sim::{arena_world, remote_state, remote_weapon};
 use oss_session::udp::UdpDriver;
-use oss_session::{SPECTATOR, Session, SessionConfig, SessionEvent, State, chat_type};
+use oss_session::{SPECTATOR, Session, SessionConfig, SessionEvent, State, VieClient, chat_type};
 use oss_sim::fixed::Rng;
 use oss_sim::{Event, Pos, ShipInput, ShipState, VEL_SCALE, World, toggle};
 
@@ -35,6 +36,7 @@ use brain::{Brain, Contact, Leaving, SAFE_TILES, View};
 use host::{Host, Place, lineup_from_options};
 use lineup::{Entry, Seat};
 use nav::Nav;
+use report::{Reports, run_ticks};
 use script::Script;
 use talk::Talk;
 
@@ -309,6 +311,8 @@ struct Bot {
     rng: Rng,
     chatted: bool,
     last_step_ms: u64,
+    /// Its position reports (see `report`).
+    reports: Reports,
 }
 
 impl Bot {
@@ -392,6 +396,9 @@ impl Bot {
             self.session.disconnect();
         }
         self.handle_events(cache);
+        // Acks and answers to what just came in go out now, before the brain runs,
+        // so the zone's view of the bot's ping never includes its thinking.
+        let _ = self.driver.send_pending(&mut self.session);
         let now = self.driver.now_ms();
         if self.world.is_none() {
             self.last_step_ms = now;
@@ -849,14 +856,8 @@ impl Bot {
             return;
         };
         let (mut enemies, mut shots) = (Vec::new(), Vec::new());
-        let mut fired = false;
         let mut spectate = false;
-        // Far behind (the machine was asleep, say): skip ahead rather than racing.
-        if now.saturating_sub(self.last_step_ms) > 2000 {
-            self.last_step_ms = now - 10;
-        }
-        while self.last_step_ms + 10 <= now {
-            self.last_step_ms += 10;
+        run_ticks(&mut self.last_step_ms, now, |tick_ms| {
             let me = world
                 .ship_index(self.me)
                 .filter(|&i| !world.ships[i].remote);
@@ -869,7 +870,7 @@ impl Bot {
                                 let (dx, dy) = (e.pos.0 - v.pos.0, e.pos.1 - v.pos.1);
                                 dx.hypot(dy) < SAFE_TILES * 16.0
                             });
-                            if l.ready(self.last_step_ms, near) {
+                            if l.ready(tick_ms, near) {
                                 spectate = true;
                             }
                             brain.disengage(&v, nav)
@@ -903,17 +904,23 @@ impl Bot {
             if let Some(i) = me {
                 inputs[i] = input;
             }
-            for ev in world.step(&inputs) {
-                let Some(i) = me.and_then(|_| world.ship_index(self.me)) else {
-                    continue;
-                };
-                let ship = &world.ships[i];
-                if let Some(w) = weapon_for(&ev, ship) {
-                    // Each shot goes out at once, from where it was fired.
-                    self.session
-                        .send_position(now, &own_position(ship, Some(w)));
-                    fired = true;
-                }
+            let events = world.step(&inputs);
+            let own = me.and_then(|_| world.ship_index(self.me));
+            // Shots and motion changes go out at once, dated to this tick.
+            self.reports.tick(
+                &mut self.session,
+                now,
+                world.tick,
+                tick_ms,
+                own.map(|i| &world.ships[i]),
+                &input,
+                &events,
+            );
+            let Some(i) = own else {
+                return;
+            };
+            let ship = &world.ships[i];
+            for ev in events {
                 match ev {
                     Event::ShipKilled {
                         ship: id, killer, ..
@@ -940,16 +947,13 @@ impl Bot {
                     _ => {}
                 }
             }
-        }
-        if let Some(i) = world
+        });
+        let own = world
             .ship_index(self.me)
             .filter(|&i| !world.ships[i].remote)
-            && !fired
-            && self.session.position_due(now)
-        {
-            let pos = own_position(&world.ships[i], None);
-            self.session.send_position(now, &pos);
-        }
+            .map(|i| &world.ships[i]);
+        self.reports
+            .regular(&mut self.session, now, self.last_step_ms, own);
         if spectate {
             self.leaving = None;
             self.set_ship(SPECTATOR);
@@ -1031,6 +1035,28 @@ fn view<'a>(
     }
 }
 
+/// Bot number `n`'s login. It presents itself as the game client does, with the
+/// same [`VieClient`] profile and so the same security answers: a bot is a player
+/// to the zone, checked like one.
+fn session_config(
+    entry: &Entry,
+    place: &Place,
+    opts: &Options,
+    n: usize,
+    ship: u8,
+) -> SessionConfig {
+    SessionConfig {
+        name: entry.name.clone(),
+        password: entry.password.clone(),
+        arena: Some(place.arena.clone()).filter(|a| !a.is_empty()),
+        ship,
+        machine_id: 0x0B07_0000 + n as u32,
+        new_user: opts.new_user,
+        client: Arc::new(VieClient),
+        ..Default::default()
+    }
+}
+
 /// Connects bot number `n` of a lineup: its own socket and session, and, when
 /// scripted (`--script` or `--host`), its brain and chat.
 fn start_bot(
@@ -1047,15 +1073,7 @@ fn start_bot(
         Seat::In => seat_ship,
         Seat::Spectating => SPECTATOR,
     };
-    let cfg = SessionConfig {
-        name: entry.name.clone(),
-        password: entry.password.clone(),
-        arena: Some(place.arena.clone()).filter(|a| !a.is_empty()),
-        ship,
-        machine_id: 0x0B07_0000 + n as u32,
-        new_user: opts.new_user,
-        ..Default::default()
-    };
+    let cfg = session_config(entry, place, opts, n, ship);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -1117,6 +1135,7 @@ fn start_bot(
         rng: Rng::new(seed | 1),
         chatted: false,
         last_step_ms: 0,
+        reports: Reports::default(),
     })
 }
 
@@ -1267,6 +1286,24 @@ mod tests {
         assert!(parse("--host").is_err(), "--host still needs --server");
         assert!(parse("--host --server a:1 --script -").is_err());
         assert!(parse("--host --server a:1 --count 2").is_err());
+    }
+
+    /// Bots answer a security check exactly as the game client's profile does.
+    #[test]
+    fn bots_answer_security_checks_as_the_game_client() {
+        use oss_session::{ClientProfile, SecurityChallenge};
+        let opts = parse("--server a:1 --name Rex").unwrap().unwrap();
+        let lineup = lineup_from_options(&opts, None);
+        let cfg = session_config(&lineup.bots[0], &Place::of(&lineup), &opts, 0, 0);
+        for key in [1, 0xDEAD_BEEF] {
+            let challenge = SecurityChallenge {
+                key,
+                map_crc32: Some(7),
+            };
+            let game = SessionConfig::default().client.security(challenge);
+            assert_eq!(cfg.client.security(challenge), game);
+            assert_eq!(game, VieClient.security(challenge));
+        }
     }
 
     #[test]

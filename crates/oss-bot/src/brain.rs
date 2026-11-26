@@ -51,12 +51,19 @@ const REACHED: f32 = 40.0;
 /// picking another.
 const ROAM_REACH: i32 = 48;
 const ROAM_PACE: f32 = 0.55;
-const ROAM_SEARCH: usize = 30_000;
+/// A pick tries up to four spots, so all four together look at no more tiles
+/// than one route search.
+const ROAM_SEARCH: usize = SEARCH / 4;
 const ROAM_GIVE_UP: u32 = 2_000;
+/// Ticks to wait after finding no roaming spot before trying again.
+const ROAM_RETRY: u32 = 100;
 /// How far along a path to look for a corner to cut to.
 const LOOKAHEAD: usize = 14;
-/// Tiles one path search may look at.
-const SEARCH: usize = 120_000;
+/// Tiles one path search may look at: a few milliseconds at most in a release
+/// build (one that runs its whole budget took 2.3 ms here, 14.7 ms at the old
+/// 120 000), so no brain step holds up the bot's thread for long. Further than
+/// that, the bot heads straight for the goal and searches again as it nears.
+const SEARCH: usize = 20_000;
 /// Fire only with at least this much energy left, so a bot doesn't shoot itself
 /// to death.
 const FIRE_ENERGY: f32 = 0.35;
@@ -148,6 +155,9 @@ pub struct Brain {
     path: Vec<(i32, i32)>,
     path_goal: Option<(i32, i32)>,
     planned_tick: u32,
+    /// The last search for `path_goal` found no route: wait for the plan to go
+    /// stale before searching again rather than searching every tick.
+    no_route: bool,
     /// Where a sentry with no point of its own stands: where it first came in.
     home: Option<(f32, f32)>,
     dodge: Option<(u32, bool)>,
@@ -155,6 +165,8 @@ pub struct Brain {
     /// nobody to fight and no route, or a patrol with no waypoints, flies about
     /// the map rather than sitting where it spawned.
     roam: Option<((i32, i32), u32)>,
+    /// When the last pick of a roaming spot found none: the next waits a while.
+    roam_failed: Option<u32>,
     /// State of the little generator that picks roaming spots.
     seed: u32,
 }
@@ -169,9 +181,11 @@ impl Brain {
             path: Vec::new(),
             path_goal: None,
             planned_tick: 0,
+            no_route: false,
             home: None,
             dodge: None,
             roam: None,
+            roam_failed: None,
             seed: 0,
         }
     }
@@ -180,6 +194,8 @@ impl Brain {
     pub fn respawned(&mut self) {
         self.path.clear();
         self.path_goal = None;
+        self.no_route = false;
+        self.roam_failed = None;
         self.dodge = None;
         self.roam = None;
     }
@@ -380,7 +396,9 @@ impl Brain {
     fn wander(&mut self, v: &View, nav: &mut Nav) -> ShipInput {
         let here = tile_of(v.pos);
         let due = match self.roam {
-            None => true,
+            None => self
+                .roam_failed
+                .is_none_or(|t| v.tick.wrapping_sub(t) > ROAM_RETRY),
             Some((goal, since)) => {
                 len(sub(centre(goal), v.pos)) < REACHED * 2.0
                     || v.tick.wrapping_sub(since) > ROAM_GIVE_UP
@@ -409,6 +427,7 @@ impl Brain {
                     break;
                 }
             }
+            self.roam_failed = self.roam.is_none().then_some(v.tick);
         }
         match self.roam {
             Some((goal, _)) => self.travel(v, nav, goal, ROAM_PACE),
@@ -435,10 +454,12 @@ impl Brain {
             goal_px
         } else {
             let stale = v.tick.wrapping_sub(self.planned_tick) > 150;
-            if self.path.is_empty() || self.path_goal != Some(goal) || stale {
+            if (self.path.is_empty() && !self.no_route) || self.path_goal != Some(goal) || stale {
                 self.path = nav.path(tile_of(v.pos), goal, SEARCH).unwrap_or_default();
                 self.path_goal = Some(goal);
                 self.planned_tick = v.tick;
+                // No route within the budget: head straight for it meanwhile.
+                self.no_route = self.path.is_empty();
             }
             // Drop the tiles already passed, then head for the furthest one still
             // in a straight, open line.
@@ -653,6 +674,32 @@ mod tests {
         let mut nav = Nav::new(&TileMap::empty(), 14);
         let mut idle = Brain::new(Behaviour::Idle, vec![], 30);
         assert_eq!(idle.think(&view(&[], &[]), &mut nav), ShipInput::default());
+    }
+
+    /// A goal no route reaches is searched for once per plan, not every tick: each
+    /// failed search runs its whole budget.
+    #[test]
+    fn a_route_that_cannot_be_found_is_not_searched_for_every_tick() {
+        // The patrol point (500, 470) sits inside a closed ring of wall.
+        let mut cells = vec![0u8; 1024 * 1024];
+        for d in -12i32..=12 {
+            for (x, y) in [
+                (500 + d, 458),
+                (500 + d, 482),
+                (488, 470 + d),
+                (512, 470 + d),
+            ] {
+                cells[(y * 1024 + x) as usize] = 1;
+            }
+        }
+        let mut nav = Nav::new(&TileMap::from_cells(&cells), 14);
+        let mut patrol = Brain::new(Behaviour::Patrol, vec![(500, 470)], 30);
+        for tick in 0..100 {
+            let mut v = view(&[], &[]);
+            v.tick = tick;
+            patrol.think(&v, &mut nav);
+        }
+        assert_eq!(nav.searches, 1);
     }
 
     #[test]

@@ -23,6 +23,8 @@ pub struct Nav {
     cost: Vec<u32>,
     from: Vec<u32>,
     touched: Vec<u32>,
+    /// Path searches run so far.
+    pub searches: usize,
 }
 
 fn index(x: i32, y: i32) -> usize {
@@ -65,6 +67,7 @@ impl Nav {
             cost: vec![u32::MAX; CELLS],
             from: vec![u32::MAX; CELLS],
             touched: Vec::new(),
+            searches: 0,
         }
     }
 
@@ -127,6 +130,7 @@ impl Nav {
         goal: (i32, i32),
         budget: usize,
     ) -> Option<Vec<(i32, i32)>> {
+        self.searches += 1;
         let start = self.nearest_open(start, 4)?;
         let goal = self.nearest_open(goal, 8)?;
         for &i in &self.touched {

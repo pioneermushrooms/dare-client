@@ -10,7 +10,9 @@ use web_time::{Duration, Instant};
 
 use oss_assets::AssetDirs;
 use oss_proto::objects::layer;
-use oss_session::sim::{arena_world, own_position, remote_state, remote_weapon, weapon_for};
+use oss_session::sim::{
+    Motion, MotionReports, arena_world, own_position, remote_state, remote_weapon, weapon_for,
+};
 use oss_session::{SPECTATOR, SessionEvent, chat_type};
 use oss_sim::{
     ArenaSettings, Event, MapObject, Pos, Prize, ProjectileKind, Ship, ShipInput, ShipState,
@@ -43,19 +45,6 @@ const TICK: Duration = Duration::from_millis(10);
 const MAX_TICKS_PER_FRAME: u32 = 25;
 /// How much a frame's clock is stretched or squeezed toward the server's.
 const SLEW_PER_FRAME: Duration = Duration::from_micros(500);
-
-/// Closest gap between two updates sent because your controls changed (20 ms).
-const MOTION_SEND_GAP: u32 = 2;
-
-/// What other clients can't predict between updates: whether you thrust (and which
-/// way), burn afterburners, or turn. Between updates every client carries your ship
-/// on at its last velocity, so a change here is exactly where they go wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Motion {
-    thrust: i8,
-    afterburner: bool,
-    turn: i8,
-}
 
 /// The session time a simulated state stands for: the world runs in fixed ticks that
 /// a frame catches up all at once, so the newest tick is `behind` real time (the
@@ -176,8 +165,7 @@ pub struct Sandbox {
     slewing: bool,
     /// Your motion (thrust, afterburner, turn) as last reported to the server, and
     /// the tick of the last report sent because it changed.
-    sent_motion: Option<Motion>,
-    motion_sent_tick: u32,
+    motion: MotionReports,
     /// Online: how well other ships are being tracked (logged every 10 s).
     tracking: super::tracking::Tracking,
     brick_count: usize,
@@ -458,8 +446,7 @@ impl Sandbox {
             screen_refs: [(0.0, 0.0); 12],
             radar_line: String::new(),
             slewing: false,
-            sent_motion: None,
-            motion_sent_tick: 0,
+            motion: MotionReports::default(),
             tracking: Default::default(),
             brick_count: 0,
             last: Instant::now(),
@@ -2322,8 +2309,10 @@ impl Sandbox {
     /// Sends an extra position update the tick your motion changes (start or stop
     /// thrusting, afterburners, turning), on top of the regular timed ones, so every
     /// other client corrects its prediction of your ship at once instead of up to
-    /// `SendPositionDelay` later. At most one per [`MOTION_SEND_GAP`]; a change inside
-    /// the gap goes out when it ends, if it still stands.
+    /// `SendPositionDelay` later. At most one per
+    /// [`oss_session::sim::MOTION_SEND_GAP`]; a change inside the gap goes out when it
+    /// ends, if it still stands (the rule lives in [`MotionReports`], shared with the
+    /// bots).
     fn report_motion_change(&mut self, input: ShipInput) {
         if self.spectating {
             return;
@@ -2333,20 +2322,12 @@ impl Sandbox {
         };
         let ship = &self.world.ships[i];
         if !ship.is_alive() {
-            self.sent_motion = None;
+            self.motion.reset();
             return;
         }
-        let motion = Motion {
-            thrust: ship.thrusting,
-            afterburner: ship.afterburning,
-            turn: i8::from(input.right) - i8::from(input.left),
-        };
-        let Some(sent) = self.sent_motion else {
-            // First tick alive: the regular update covers it.
-            self.sent_motion = Some(motion);
-            return;
-        };
-        if motion == sent || self.world.tick.wrapping_sub(self.motion_sent_tick) < MOTION_SEND_GAP {
+        let motion = Motion::of(ship, &input);
+        let tick = self.world.tick;
+        if !self.motion.due(tick, motion) {
             return;
         }
         let behind = self.acc.saturating_sub(TICK);
@@ -2363,8 +2344,7 @@ impl Sandbox {
             net.session
                 .send_position_at(now, state_ms(now, behind), &own_position(ship, None));
         }
-        self.sent_motion = Some(motion);
-        self.motion_sent_tick = self.world.tick;
+        self.motion.sent(tick, motion);
     }
 
     /// Reports what your ship did this tick (weapons, death) to the server.
