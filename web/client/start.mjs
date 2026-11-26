@@ -390,6 +390,13 @@ function shareShips() {
     clear: (ship) => game.clear_custom_ship(ship),
     sheet: (ship) => game.ship_sheet(ship), // { width, height, rgba } or null before the game draws
   };
+  // Every other graphic the arena could replace (bombs, bullets, prizes...), and whether the
+  // pilot's own are shown or the arena's.
+  globalThis.dareGraphics = {
+    set: (name, sheetBytes) => game.set_custom_graphic(name, sheetBytes), // PNG or BMP bytes
+    clear: (name) => game.clear_custom_graphic(name),
+    useOwn: (on) => game.use_own_graphics(!!on),
+  };
   globalThis.dispatchEvent(new Event("dare-ships-ready"));
 }
 

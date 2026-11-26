@@ -93,6 +93,27 @@ pub fn ship_sheet(ship: u8) -> Result<JsValue, JsValue> {
     Ok(out.into())
 }
 
+/// Uses `sheet` (PNG or BMP bytes, laid out like the game's own sheet of that
+/// name) for the graphic `name` (bombs, bullets, prizes...; not ships, which are
+/// set one by one) for this player. The game picks it up on its next frame.
+#[wasm_bindgen]
+pub fn set_custom_graphic(name: &str, sheet: &[u8]) -> Result<(), JsValue> {
+    let img = oss_assets::decode_image(sheet).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    crate::game::custom_ships::set_graphic(name, Some(img)).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Gives the graphic `name` back to the arena's or the game's own.
+#[wasm_bindgen]
+pub fn clear_custom_graphic(name: &str) -> Result<(), JsValue> {
+    crate::game::custom_ships::set_graphic(name, None).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Whether the pilot's own ships and graphics are shown (true) or the arena's.
+#[wasm_bindgen]
+pub fn use_own_graphics(on: bool) {
+    crate::game::custom_ships::set_use_own(on);
+}
+
 fn slot(ship: u8) -> Result<usize, JsValue> {
     match ship {
         1..=8 => Ok(ship as usize - 1),
