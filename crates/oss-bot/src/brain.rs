@@ -46,6 +46,13 @@ const FULL: i32 = 40_000;
 const STEP: i32 = 1000;
 /// Waypoints count as reached this close (pixels).
 const REACHED: f32 = 40.0;
+/// Roaming: how far off (tiles) to pick the next spot, how fast to go, how many
+/// tiles a search for one may look at, and how long (ticks) to try before
+/// picking another.
+const ROAM_REACH: i32 = 48;
+const ROAM_PACE: f32 = 0.55;
+const ROAM_SEARCH: usize = 30_000;
+const ROAM_GIVE_UP: u32 = 2_000;
 /// How far along a path to look for a corner to cut to.
 const LOOKAHEAD: usize = 14;
 /// Tiles one path search may look at.
@@ -124,6 +131,12 @@ pub struct Brain {
     /// Where a sentry with no point of its own stands: where it first came in.
     home: Option<(f32, f32)>,
     dodge: Option<(u32, bool)>,
+    /// Where the bot is roaming to, and the tick it set off: a fighter with
+    /// nobody to fight and no route, or a patrol with no waypoints, flies about
+    /// the map rather than sitting where it spawned.
+    roam: Option<((i32, i32), u32)>,
+    /// State of the little generator that picks roaming spots.
+    seed: u32,
 }
 
 impl Brain {
@@ -138,6 +151,8 @@ impl Brain {
             planned_tick: 0,
             home: None,
             dodge: None,
+            roam: None,
+            seed: 0,
         }
     }
 
@@ -146,6 +161,7 @@ impl Brain {
         self.path.clear();
         self.path_goal = None;
         self.dodge = None;
+        self.roam = None;
     }
 
     /// The keys to press this tick.
@@ -176,7 +192,7 @@ impl Brain {
 
     fn patrol(&mut self, v: &View, nav: &mut Nav) -> ShipInput {
         if self.points.is_empty() {
-            return ShipInput::default();
+            return self.wander(v, nav);
         }
         let goal = self.points[self.next_point % self.points.len()];
         if len(sub(centre(goal), v.pos)) < REACHED && self.points.len() > 1 {
@@ -223,9 +239,9 @@ impl Brain {
             .min_by(|a, b| len(sub(a.pos, v.pos)).total_cmp(&len(sub(b.pos, v.pos))))
             .copied();
         let Some(t) = target else {
-            // Nobody to fight: fly the route if it has one, else wait.
+            // Nobody to fight: fly the route if it has one, else roam and look for someone.
             return if self.points.is_empty() {
-                ShipInput::default()
+                self.wander(v, nav)
             } else {
                 self.patrol(v, nav)
             };
@@ -314,6 +330,57 @@ impl Brain {
             && dist < v.bullet_range * 0.8
             && v.energy > FIRE_ENERGY;
         input
+    }
+
+    /// Roams: flies at an easy pace to a reachable open spot some way off, and
+    /// picks another on arrival, or after a while if it cannot get there.
+    fn wander(&mut self, v: &View, nav: &mut Nav) -> ShipInput {
+        let here = tile_of(v.pos);
+        let due = match self.roam {
+            None => true,
+            Some((goal, since)) => {
+                len(sub(centre(goal), v.pos)) < REACHED * 2.0
+                    || v.tick.wrapping_sub(since) > ROAM_GIVE_UP
+            }
+        };
+        if due {
+            self.roam = None;
+            if self.seed == 0 {
+                self.seed =
+                    (v.pos.0 as u32).wrapping_mul(2_654_435_761) ^ (v.pos.1 as u32) ^ v.tick | 1;
+            }
+            for _ in 0..4 {
+                let dx = self.random(ROAM_REACH * 2 + 1) - ROAM_REACH;
+                let dy = self.random(ROAM_REACH * 2 + 1) - ROAM_REACH;
+                let want = ((here.0 + dx).clamp(1, 1022), (here.1 + dy).clamp(1, 1022));
+                if (dx.abs().max(dy.abs())) < ROAM_REACH / 3 {
+                    continue;
+                }
+                if let Some(path) = nav.path(here, want, ROAM_SEARCH)
+                    && let Some(&end) = path.last()
+                {
+                    self.roam = Some((end, v.tick));
+                    self.path = path;
+                    self.path_goal = Some(end);
+                    self.planned_tick = v.tick;
+                    break;
+                }
+            }
+        }
+        match self.roam {
+            Some((goal, _)) => self.travel(v, nav, goal, ROAM_PACE),
+            None => ShipInput::default(),
+        }
+    }
+
+    /// 0..n from a xorshift generator.
+    fn random(&mut self, n: i32) -> i32 {
+        let mut x = self.seed;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.seed = x;
+        (x % n.max(1) as u32) as i32
     }
 
     /// Flies to tile `goal`, round walls where needed, at `pace` of top speed;
@@ -485,6 +552,29 @@ mod tests {
         // A patrol heading for a point straight above thrusts.
         let mut patrol = Brain::new(Behaviour::Patrol, vec![(500, 480), (520, 480)], 30);
         assert!(patrol.think(&view(&[], &[]), &mut nav).forward);
+    }
+
+    /// A fighter with nobody to fight and no route, and a patrol with no
+    /// waypoints, fly about rather than sit where they spawned.
+    #[test]
+    fn with_nothing_to_do_fighters_and_patrols_roam() {
+        for behaviour in [Behaviour::Fighter, Behaviour::Patrol] {
+            let mut nav = Nav::new(&TileMap::empty(), 14);
+            let mut brain = Brain::new(behaviour, vec![], 30);
+            let mut pressed = false;
+            for tick in 0..200 {
+                let mut v = view(&[], &[]);
+                v.tick = tick;
+                let i = brain.think(&v, &mut nav);
+                pressed |= i.forward || i.left || i.right;
+            }
+            assert!(pressed, "{behaviour:?} sat still");
+            assert!(brain.roam.is_some(), "{behaviour:?} picked nowhere to go");
+        }
+        // Idle still sits still.
+        let mut nav = Nav::new(&TileMap::empty(), 14);
+        let mut idle = Brain::new(Behaviour::Idle, vec![], 30);
+        assert_eq!(idle.think(&view(&[], &[]), &mut nav), ShipInput::default());
     }
 
     #[test]
