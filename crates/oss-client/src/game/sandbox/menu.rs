@@ -12,6 +12,10 @@ use crate::gfx::Renderer;
 impl Sandbox {
     /// Keys while the menu is up.
     pub(super) fn menu_input(&mut self, edges: &[Action], strokes: &[Stroke]) {
+        if self.bot_menu {
+            self.bot_menu_input(strokes);
+            return;
+        }
         // The menu lists F2 and F12, so they work while it is up -- they used to
         // be thrown away unread here -- and it stays up, because in Continuum the
         // menu is where display switches are flipped. F11 changes ship, so it
@@ -46,7 +50,7 @@ impl Sandbox {
             // usual.
             if let Some(c) = stroke.text {
                 let handled = self.menu_key(c);
-                self.menu = false;
+                self.menu = self.bot_menu;
                 if !handled {
                     self.chat.type_char(c);
                 }
@@ -121,8 +125,73 @@ impl Sandbox {
             MenuChoice::Ship(kind) => self.request_ship(kind),
             MenuChoice::FrameRate => self.fps_view = self.fps_view.next(),
             MenuChoice::Arenas => self.ask_for_arenas(),
+            MenuChoice::Bots => {
+                self.bot_menu = true;
+                self.send_chat_line("?bots list");
+            }
         }
         true
+    }
+
+    fn bot_menu_input(&mut self, strokes: &[Stroke]) {
+        for stroke in strokes {
+            match stroke.text.map(|c| c.to_ascii_lowercase()) {
+                Some('l') => self.send_chat_line("?bots list"),
+                Some('s') => {
+                    self.chat.input = "?bots save ".into();
+                    self.bot_menu = false;
+                    self.menu = false;
+                    self.message(
+                        "Enter a behavior and bot label, then press Enter.",
+                        color::YELLOW,
+                    );
+                    break;
+                }
+                Some('r') => {
+                    self.chat.input = "?bots remove ".into();
+                    self.bot_menu = false;
+                    self.menu = false;
+                    self.message("Enter the bot label, then press Enter.", color::YELLOW);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn draw_bot_menu(&mut self, c: &Canvas, r: &mut Renderer) {
+        let w = 320.0;
+        let x = ((c.view_w - w) / 2.0).floor();
+        let y = 4.0;
+        c.panel(r, x, y, w, 116.0);
+        c.text_center(r, x + w / 2.0, y + 2.0, color::GREEN, "Arena bots");
+        c.separator(r, x, y + 14.0, w);
+        self.menu_spots.clear();
+        for (i, (label, key, ch)) in [
+            ("L = List bots", KeyCode::KeyL, 'l'),
+            ("S = Save bot", KeyCode::KeyS, 's'),
+            ("R = Remove bot", KeyCode::KeyR, 'r'),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = y + 20.0 + i as f32 * 12.0;
+            c.text(r, x + 4.0, row, color::WHITE, label);
+            self.menu_spots.push((
+                Rect::new(x, row - 1.0, w, 12.0),
+                Stroke::press(key).typing(ch),
+            ));
+        }
+        for (i, line) in [
+            "Modes: idle patrol sentry fighter",
+            "Results appear in chat",
+            "Esc = Back",
+        ]
+        .iter()
+        .enumerate()
+        {
+            c.text(r, x + 4.0, y + 62.0 + i as f32 * 12.0, color::YELLOW, line);
+        }
     }
 
     /// The digit keys the menu's eight ships answer to, in order, so a click on
@@ -152,6 +221,10 @@ impl Sandbox {
     /// the menu reads characters, so a click that could only press a key code
     /// would do nothing here, exactly as `--press` could not.
     pub(super) fn draw_menu(&mut self, c: &Canvas, r: &mut Renderer) {
+        if self.bot_menu {
+            self.draw_bot_menu(c, r);
+            return;
+        }
         let ships = [
             "Ships",
             "1 = Warbird",
@@ -170,6 +243,7 @@ impl Sandbox {
         ];
         if self.online() {
             keys.push((" A = Arena list", Stroke::press(KeyCode::KeyA).typing('a')));
+            keys.push((" B = Manage bots", Stroke::press(KeyCode::KeyB).typing('b')));
         }
         if !self.news.is_empty() {
             keys.push((" N = Zone news", Stroke::press(KeyCode::KeyN).typing('n')));
@@ -267,6 +341,7 @@ enum MenuChoice {
     FrameRate,
     /// Esc then A: the zone's arena list.
     Arenas,
+    Bots,
 }
 
 /// What a character typed on the menu does, or `None` for "any other key to
@@ -285,6 +360,7 @@ fn menu_choice(ch: char, has_news: bool, online: bool) -> Option<MenuChoice> {
         'n' if has_news => Some(MenuChoice::News),
         'f' => Some(MenuChoice::FrameRate),
         'a' if online => Some(MenuChoice::Arenas),
+        'b' if online => Some(MenuChoice::Bots),
         d @ '1'..='8' => Some(MenuChoice::Ship(d as u8 - b'1')),
         _ => None,
     }

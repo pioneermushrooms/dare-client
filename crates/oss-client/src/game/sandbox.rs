@@ -185,6 +185,7 @@ pub struct Sandbox {
     pub(super) clock: f32,
     pub(super) effects: Vec<Effect>,
     pub(super) menu: bool,
+    bot_menu: bool,
     pub(super) fps_view: hud::FpsView,
     /// The zone's arena list, while it is on screen (Esc then A, or `?arena`).
     arena_list: Option<arenas::ArenaList>,
@@ -457,6 +458,7 @@ impl Sandbox {
             clock: 0.0,
             effects: Vec::new(),
             menu: false,
+            bot_menu: false,
             fps_view: Default::default(),
             arena_list: None,
             last_ship: 0,
@@ -1038,7 +1040,11 @@ impl Sandbox {
         let kept = self.arena_list_input(edges, strokes);
         let strokes = kept.as_slice();
         if edges.contains(&Action::Menu) {
-            self.menu = !self.menu;
+            if self.bot_menu {
+                self.bot_menu = false;
+            } else {
+                self.menu = !self.menu;
+            }
             // Continuum shows the whole chat buffer while the menu is open
             // (nullspace `Game.cpp`); leaving it puts the log back at the newest.
             if !self.menu {

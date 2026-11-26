@@ -158,6 +158,22 @@ impl Brain {
         }
     }
 
+    /// Move to the target and brake near it, with no combat input.
+    pub fn obey(
+        &mut self,
+        v: &View,
+        nav: &mut Nav,
+        target: (f32, f32),
+        following: bool,
+    ) -> ShipInput {
+        let goal = if following && len(sub(v.pos, target)) < 96.0 {
+            tile_of(v.pos)
+        } else {
+            tile_of(target)
+        };
+        self.travel(v, nav, goal, 0.0)
+    }
+
     fn patrol(&mut self, v: &View, nav: &mut Nav) -> ShipInput {
         if self.points.is_empty() {
             return ShipInput::default();

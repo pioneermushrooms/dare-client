@@ -231,6 +231,36 @@ fn ends_with(name: &str, suffix: &str) -> bool {
 }
 
 /// One bot: a session, its socket, and (when flying) a simulation of the arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderRequest {
+    Come,
+    Follow,
+    Hold,
+    Resume,
+}
+
+fn parse_order(text: &str) -> Option<OrderRequest> {
+    let clean = text
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .to_ascii_lowercase();
+    match clean.as_str() {
+        "come here" | "come to me" | "cme here" => Some(OrderRequest::Come),
+        "follow" | "follow me" => Some(OrderRequest::Follow),
+        "hold" | "hold position" | "stay here" | "stay here until i say go" => {
+            Some(OrderRequest::Hold)
+        }
+        "go" | "resume" | "resume patrol" => Some(OrderRequest::Resume),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FlightOrder {
+    Position((f32, f32)),
+    Follow(u16),
+}
+
 struct Bot {
     label: String,
     session: Session,
@@ -252,6 +282,10 @@ struct Bot {
     talk: Option<Talk>,
     /// Names ending in this belong to other bots: not greeted, answered or fought.
     peer_suffix: Option<String>,
+    controller: Option<String>,
+    flight_order: Option<FlightOrder>,
+    last_order_reply: Option<u64>,
+    advertised_orders: bool,
     rng: Rng,
     chatted: bool,
     last_step_ms: u64,
@@ -275,6 +309,75 @@ impl Bot {
         self.peer_suffix
             .as_deref()
             .is_some_and(|s| ends_with(name, s))
+    }
+
+    fn handle_order(&mut self, pid: i16, text: &str, now: u64) -> bool {
+        let Some(controller) = self.controller.as_deref() else {
+            return false;
+        };
+        if pid < 0 || pid as u16 == self.me {
+            return false;
+        }
+        if text.trim().eq_ignore_ascii_case("help") {
+            self.reply_to_order(
+                pid,
+                "Arena owner orders: come here, follow me, stay here, resume.",
+                now,
+            );
+            return true;
+        }
+        if !self
+            .session
+            .player(pid)
+            .is_some_and(|p| p.name.eq_ignore_ascii_case(controller))
+        {
+            return false;
+        }
+        let Some(request) = parse_order(text) else {
+            return false;
+        };
+        let position = |id: u16| {
+            let world = self.world.as_ref()?;
+            let ship = &world.ships[world.ship_index(id)?];
+            ship.is_alive().then(|| px(ship.pos))
+        };
+        let reply = match request {
+            OrderRequest::Come => match position(pid as u16) {
+                Some(at) => {
+                    self.flight_order = Some(FlightOrder::Position(at));
+                    "On my way. I'll hold there."
+                }
+                None => "I need to see your ship first.",
+            },
+            OrderRequest::Follow if position(pid as u16).is_some() => {
+                self.flight_order = Some(FlightOrder::Follow(pid as u16));
+                "Following you."
+            }
+            OrderRequest::Follow => "I need to see your ship first.",
+            OrderRequest::Hold => match position(self.me) {
+                Some(at) => {
+                    self.flight_order = Some(FlightOrder::Position(at));
+                    "Holding here until you say go."
+                }
+                None => "I need to be in a ship to hold here.",
+            },
+            OrderRequest::Resume => {
+                self.flight_order = None;
+                "Resuming my usual behavior."
+            }
+        };
+        self.reply_to_order(pid, reply, now);
+        true
+    }
+
+    fn reply_to_order(&mut self, pid: i16, reply: &str, now: u64) {
+        if self
+            .last_order_reply
+            .is_none_or(|last| now.saturating_sub(last) >= talk::GAP_MS)
+        {
+            self.session.send_chat(chat_type::PRIVATE, pid, reply);
+            self.last_order_reply = Some(now);
+        }
     }
 
     fn handle_events(&mut self, cache: &MapCache) {
@@ -312,6 +415,8 @@ impl Bot {
                 SessionEvent::EnteredArena { pid } => {
                     self.me = pid as u16;
                     self.world = None;
+                    self.flight_order = None;
+                    self.advertised_orders = false;
                     self.log(format_args!("entering arena as pid {pid}"))
                 }
                 SessionEvent::MapNeeded { name, checksum } => {
@@ -388,6 +493,10 @@ impl Bot {
                     }
                 }
                 SessionEvent::PlayerLeft(pid) => {
+                    if matches!(self.flight_order, Some(FlightOrder::Follow(target)) if target == pid as u16)
+                    {
+                        self.flight_order = None;
+                    }
                     self.log(format_args!("pid {pid} left"));
                     if let Some(w) = self.world.as_mut()
                         && pid as u16 != self.me
@@ -467,6 +576,9 @@ impl Bot {
                 } => {
                     let who = name.clone().unwrap_or_else(|| self.name_of(pid));
                     self.log(format_args!("chat({kind}) {who}> {text}"));
+                    if kind == chat_type::PRIVATE && self.handle_order(pid, &text, now) {
+                        continue;
+                    }
                     let asked = kind == chat_type::PUBLIC || kind == chat_type::PRIVATE;
                     if asked
                         && pid >= 0
@@ -533,6 +645,14 @@ impl Bot {
     fn greet(&mut self, name: &str, now: u64) {
         if name.is_empty() || self.is_peer(name) {
             return;
+        }
+        if self.controller.is_some() && !self.advertised_orders {
+            self.session.send_chat(
+                chat_type::PUBLIC,
+                0,
+                "I take flight orders from the arena owner. PM me 'help' for the list.",
+            );
+            self.advertised_orders = true;
         }
         if let Some(t) = self.talk.as_mut() {
             t.arrived(name, now);
@@ -629,7 +749,18 @@ impl Bot {
                 Some(i) if world.ships[i].is_alive() => {
                     if let (Some(brain), Some(nav)) = (self.brain.as_mut(), self.nav.as_mut()) {
                         let v = view(world, i, &peers, &mut enemies, &mut shots);
-                        brain.think(&v, nav)
+                        match self.flight_order {
+                            Some(FlightOrder::Position(at)) => brain.obey(&v, nav, at, false),
+                            Some(FlightOrder::Follow(id)) => {
+                                let at = world
+                                    .ship_index(id)
+                                    .map(|j| &world.ships[j])
+                                    .filter(|target| target.is_alive())
+                                    .map_or(v.pos, |target| px(target.pos));
+                                brain.obey(&v, nav, at, true)
+                            }
+                            None => brain.think(&v, nav),
+                        }
                     } else if self.fly {
                         random_walk(world.tick, self.rng.next_u32())
                     } else {
@@ -879,6 +1010,10 @@ fn main() {
             brain,
             talk,
             peer_suffix: script.as_ref().and_then(|s| s.peers.clone()),
+            controller: script.as_ref().and_then(|s| s.controller.clone()),
+            flight_order: None,
+            last_order_reply: None,
+            advertised_orders: false,
             rng: Rng::new(seed | 1),
             chatted: false,
             last_step_ms: 0,
@@ -975,6 +1110,18 @@ mod tests {
 
     fn parse(s: &str) -> Result<Option<Options>, String> {
         parse_args(s.split_whitespace().map(String::from))
+    }
+
+    #[test]
+    fn parses_only_supported_flight_orders() {
+        assert_eq!(parse_order(" Cme here! "), Some(OrderRequest::Come));
+        assert_eq!(parse_order("follow me"), Some(OrderRequest::Follow));
+        assert_eq!(
+            parse_order("stay here until I say go"),
+            Some(OrderRequest::Hold)
+        );
+        assert_eq!(parse_order("go"), Some(OrderRequest::Resume));
+        assert_eq!(parse_order("go away"), None);
     }
 
     #[test]

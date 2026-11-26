@@ -67,10 +67,12 @@ pub struct Script {
     pub greeting: Option<String>,
     /// (every so many seconds, text).
     pub announcements: Vec<(u32, String)>,
+    pub banter: Option<(u32, Vec<String>)>,
     /// (keyword, lower case; reply).
     pub replies: Vec<(String, String)>,
     /// Names ending in this are other bots: not greeted, answered or fought.
     pub peers: Option<String>,
+    pub controller: Option<String>,
 }
 
 /// Most of each list a script may hold; anything past it is an error.
@@ -157,7 +159,22 @@ pub fn parse(text: &str) -> Result<Script, String> {
                 s.peers = Some(raw.trim_start()["peers".len()..].trim_start().to_string())
                     .filter(|v| !v.is_empty())
             }
+            "controller" => s.controller = Some(rest.to_string()).filter(|v| !v.is_empty()),
             "greet" => s.greeting = speakable(rest),
+            "banter" => {
+                let (every, text) = rest.split_once(' ').unwrap_or((rest, ""));
+                let every = num(every, "banter interval")?;
+                if !(60..=86_400).contains(&every) {
+                    return Err(at("banter is every 60-86400 seconds"));
+                }
+                let (_, phrases) = s.banter.get_or_insert((every as u32, Vec::new()));
+                if phrases.len() == 8 {
+                    return Err(at("too many banter lines"));
+                }
+                if let Some(text) = speakable(text) {
+                    phrases.push(text);
+                }
+            }
             "announce" => {
                 let (every, text) = rest.split_once(' ').unwrap_or((rest, ""));
                 let every = num(every, "announce interval")?;

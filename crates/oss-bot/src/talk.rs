@@ -20,7 +20,15 @@ const REPLY_COOLDOWN_MS: u64 = 5000;
 /// A line to send: (chat type, target pid for a private line, text).
 pub type Line = (u8, i16, String);
 
+struct Banter {
+    every: u64,
+    due: u64,
+    phrases: Vec<String>,
+    next: usize,
+}
+
 pub struct Talk {
+    banter: Option<Banter>,
     greeting: Option<String>,
     /// (every ms, text, next due ms).
     announcements: Vec<(u64, String, u64)>,
@@ -34,6 +42,19 @@ pub struct Talk {
 impl Talk {
     pub fn new(script: &Script, now: u64) -> Self {
         Talk {
+            banter: script
+                .banter
+                .as_ref()
+                .filter(|(_, lines)| !lines.is_empty())
+                .map(|(seconds, lines)| {
+                    let every = u64::from(*seconds) * 1000;
+                    Banter {
+                        every,
+                        due: now + every,
+                        phrases: lines.clone(),
+                        next: 0,
+                    }
+                }),
             greeting: script.greeting.clone(),
             announcements: script
                 .announcements
@@ -50,7 +71,10 @@ impl Talk {
 
     /// Whether the bot has anything to say at all.
     pub fn is_quiet(&self) -> bool {
-        self.greeting.is_none() && self.announcements.is_empty() && self.replies.is_empty()
+        self.greeting.is_none()
+            && self.announcements.is_empty()
+            && self.replies.is_empty()
+            && self.banter.is_none()
     }
 
     fn push(&mut self, line: Line) {
@@ -108,6 +132,12 @@ impl Talk {
 
     /// The next line to send now, if one is due.
     pub fn next(&mut self, now: u64) -> Option<Line> {
+        if let Some(banter) = self.banter.as_mut().filter(|banter| now >= banter.due) {
+            let line = banter.phrases[banter.next].clone();
+            banter.next = (banter.next + 1) % banter.phrases.len();
+            banter.due = now + banter.every;
+            self.push((chat_type::PUBLIC, 0, line));
+        }
         for i in 0..self.announcements.len() {
             let (every, ref text, due) = self.announcements[i];
             if now >= due {
@@ -136,6 +166,19 @@ mod tests {
     fn talk() -> Talk {
         let s = parse("greet Hi {name}\nannounce 60 news\nreply !rules be nice").unwrap();
         Talk::new(&s, 0)
+    }
+
+    #[test]
+    fn generated_banter_rotates_at_the_configured_interval() {
+        let script = crate::script::parse(
+            "banter 90 Manoeuvres look promising.\nbanter 90 Anyone up for a round?",
+        )
+        .unwrap();
+        let mut talk = Talk::new(&script, 0);
+        assert!(talk.next(89_999).is_none());
+        assert_eq!(talk.next(90_000).unwrap().2, "Manoeuvres look promising.");
+        assert_eq!(talk.next(180_000).unwrap().2, "Anyone up for a round?");
+        assert_eq!(talk.next(270_000).unwrap().2, "Manoeuvres look promising.");
     }
 
     #[test]
