@@ -459,8 +459,17 @@ impl Brain {
     /// Flies to tile `goal`, round walls where needed, at `pace` of top speed;
     /// a pace of 0 stops on the tile and stays there.
     fn travel(&mut self, v: &View, nav: &mut Nav, goal: (i32, i32), pace: f32) -> ShipInput {
+        let target = self.waypoint(v, nav, goal);
+        let last_leg = target == centre(goal);
+        let pace = if last_leg { pace } else { pace.max(0.6) };
+        seek(v, target, pace)
+    }
+
+    /// The point (pixels) to head for on the way to tile `goal`: the goal itself
+    /// in a clear line, else the furthest tile of the planned path in sight.
+    fn waypoint(&mut self, v: &View, nav: &mut Nav, goal: (i32, i32)) -> (f32, f32) {
         let goal_px = centre(goal);
-        let target = if nav.clear_path(v.pos, goal_px) {
+        if nav.clear_path(v.pos, goal_px) {
             self.path.clear();
             goal_px
         } else {
@@ -499,8 +508,10 @@ impl Brain {
                 self.path_goal = Some(goal);
                 self.planned_tick = v.tick;
             }
-            // Drop the tiles already passed, then head for the furthest one still
+            // Drop the tiles already passed (all before the one nearest the bot,
+            // then that one too once close), then head for the furthest one still
             // in a straight, open line.
+            anchor(&mut self.path, v.pos, nav);
             while self.path.len() > 1 && len(sub(centre(self.path[0]), v.pos)) < 24.0 {
                 self.path.remove(0);
             }
@@ -513,10 +524,33 @@ impl Brain {
                 Some(i) => centre(self.path[i]),
                 None => self.path.first().map(|&t| centre(t)).unwrap_or(goal_px),
             }
-        };
-        let last_leg = target == goal_px;
-        let pace = if last_leg { pace } else { pace.max(0.6) };
-        seek(v, target, pace)
+        }
+    }
+}
+
+/// How far into a new path (tiles) to look for the bot's own place on it.
+const ANCHOR_TILES: usize = 2 * crate::nav::RESUME_TILES as usize + 8;
+
+/// Keeps `path` starting where the bot is. A resumed search traces back to where
+/// it first started, up to `RESUME_TILES` behind the bot, and a bot that cuts
+/// a corner never passes within reach of some tiles; a head left behind like
+/// that would never be dropped, and the bot would aim back for it. So this drops
+/// the tiles before the one nearest the bot (in a clear line from it) among the
+/// first [`ANCHOR_TILES`], not further, so a path that doubles back past the bot
+/// on the far side of a wall is never cut short.
+fn anchor(path: &mut Vec<(i32, i32)>, pos: (f32, f32), nav: &Nav) {
+    let nearest = path
+        .iter()
+        .take(ANCHOR_TILES)
+        .enumerate()
+        .filter(|&(_, &t)| nav.clear_path(pos, centre(t)))
+        .min_by(|a, b| {
+            let d = |t: (i32, i32)| len(sub(centre(t), pos));
+            d(*a.1).total_cmp(&d(*b.1))
+        })
+        .map(|(i, _)| i);
+    if let Some(i) = nearest {
+        path.drain(..i);
     }
 }
 
@@ -742,6 +776,50 @@ mod tests {
             "{}",
             nav.searches
         );
+    }
+
+    /// A bot that moves on while its search resumes gets a path starting where
+    /// it is, not where the search began, and keeps heading for the goal: never
+    /// back for the tiles behind it.
+    #[test]
+    fn a_resumed_path_starts_where_the_bot_now_is() {
+        let mut cells = vec![0u8; 1024 * 1024];
+        for y in 0..=700 {
+            cells[y * 1024 + 520] = 1;
+        }
+        let mut nav = Nav::new(&TileMap::from_cells(&cells), 14);
+        let goal = (540, 500);
+        let mut patrol = Brain::new(Behaviour::Patrol, vec![goal], 30);
+        let mut v = view(&[], &[]);
+        // Each tick the bot gets to where it was heading, but no more than a
+        // tile down and one across (it moves on while the search resumes).
+        for tick in 0..2_000 {
+            v.tick = tick;
+            let target = patrol.waypoint(&v, &mut nav, goal);
+            // The path starts at (or just past) its tile nearest the bot, of those
+            // the bot can fly to straight.
+            let d = |t: &(i32, i32)| len(sub(centre(*t), v.pos));
+            if let Some(head) = patrol.path.first() {
+                let nearest = patrol
+                    .path
+                    .iter()
+                    .filter(|t| nav.clear_path(v.pos, centre(**t)))
+                    .map(d)
+                    .fold(f32::MAX, f32::min);
+                assert!(
+                    d(head) <= nearest + 24.0,
+                    "tick {tick}: path starts at {head:?}, bot at {:?}",
+                    tile_of(v.pos)
+                );
+            }
+            if tile_of(v.pos) == goal {
+                return;
+            }
+            let (dx, dy) = sub(target, v.pos);
+            v.pos.0 += dx.clamp(-16.0, 16.0);
+            v.pos.1 += dy.clamp(-16.0, 16.0);
+        }
+        panic!("never got there: stuck at {:?}", tile_of(v.pos));
     }
 
     /// A detour too long for one 20 000-tile search is still found: the bot gets
