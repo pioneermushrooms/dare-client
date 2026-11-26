@@ -95,8 +95,7 @@ pub fn is_pilot_graphic(name: &str) -> bool {
 /// arena's or game's own with `None`. `bombs@3` is the bombs sheet for shots from
 /// ship 3 only, on top of `bombs` (the pilot's own for every ship, else the arena's).
 /// A sheet with no transparency at all has its black keyed out, as LVZ sheets do.
-// Set by the page in browser play.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+// Set by the page in browser play, and by --graphic.
 pub fn set_graphic(name: &str, img: Option<Image>) -> Result<(), String> {
     let name = name.to_ascii_lowercase();
     if !is_pilot_graphic(&name) {

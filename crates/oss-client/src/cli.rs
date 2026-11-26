@@ -48,6 +48,9 @@ Options:
   --continuum-dir <dir>     Take graphics/sounds from a Continuum install
                             (also OSS_CONTINUUM_DIR)
   --lvz <file.lvz>          Show an LVZ file, offline or in a zone (repeatable)
+  --graphic <name>=<file>   Use this PNG/BMP as the pilot's own graphic <name>
+                            (bombs, prizes...; bombs@3 for ship 3's shots only), as
+                            browser play's Graphics overlay does (repeatable; testing)
   --scale <n>               Integer pixel scale (default: from display DPI)
   --vsync                   Cap frame rate to the display refresh
   --fullscreen              Borderless fullscreen
@@ -236,6 +239,17 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
             "--mute" => mute = true,
             "--config" => config = Some(PathBuf::from(value("--config")?)),
             "--lvz" => lvz.push(PathBuf::from(value("--lvz")?)),
+            "--graphic" => {
+                let spec = value("--graphic")?;
+                let (name, file) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("--graphic: {spec:?} isn't <name>=<file>"))?;
+                let bytes = std::fs::read(file).map_err(|e| format!("--graphic: {file}: {e}"))?;
+                let img = oss_assets::decode_image(&bytes)
+                    .map_err(|e| format!("--graphic: {file}: {e}"))?;
+                game::custom_ships::set_graphic(name, Some(img))
+                    .map_err(|e| format!("--graphic: {e}"))?;
+            }
             "--follow" => follow = Some(value("--follow")?),
             "--attach" => attach = Some(value("--attach")?),
             "--record" => record = Some(PathBuf::from(value("--record")?)),
