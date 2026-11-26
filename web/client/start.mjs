@@ -307,6 +307,7 @@ const SIGNIN_WORDS = {
   account: ["Sign in", "Sign in"],
 };
 let flyAsGuest = false; // the sign-in box's "Fly as a guest" was chosen
+let signedInOrNot = () => {}; // ends the wait for the sign-in box
 function askToSignIn(why = "fly") {
   const [title, button] = SIGNIN_WORDS[why] ?? SIGNIN_WORDS.fly;
   $("signin-title").textContent = title;
@@ -319,6 +320,9 @@ function askToSignIn(why = "fly") {
   dialog.showModal();
   $("signin-name").focus();
   return new Promise((resolve) => {
+    // Resolved by the box's own buttons as well as its close event, which a browser may hold
+    // back until it next draws the page.
+    signedInOrNot = resolve;
     dialog.addEventListener("close", () => resolve(), { once: true });
   });
 }
@@ -341,6 +345,7 @@ form.addEventListener("submit", async (event) => {
       $("signin-password").value = "";
       showPilot();
       dialog.close();
+      signedInOrNot();
     } else {
       signinMsg.textContent = body.message || "Couldn't sign in.";
       forgot.hidden = false; // only after a failed try
@@ -356,6 +361,7 @@ $("signin-cancel").addEventListener("click", () => dialog.close());
 $("signin-guest")?.addEventListener("click", () => {
   flyAsGuest = true;
   dialog.close();
+  signedInOrNot();
 });
 
 // ---- the download ------------------------------------------------------------------------
@@ -420,13 +426,19 @@ async function download() {
 const CACHE_DB = "dare-zone-files";
 function cacheDb() {
   return new Promise((resolve, reject) => {
-    const open = indexedDB.open(CACHE_DB, 1);
-    open.onupgradeneeded = () => open.result.createObjectStore("files");
+    const open = indexedDB.open(CACHE_DB, 2);
+    open.onupgradeneeded = () => {
+      if (!open.result.objectStoreNames.contains("files")) open.result.createObjectStore("files");
+    };
     open.onsuccess = () => resolve(open.result);
     open.onerror = () => reject(open.error);
   });
 }
-async function cachedFiles() {
+// (never holding up the start: storage that is slow, blocked or broken just means downloading)
+function cachedFiles() {
+  return Promise.race([readCachedFiles(), new Promise((resolve) => setTimeout(() => resolve([]), 2000))]);
+}
+async function readCachedFiles() {
   try {
     const db = await cacheDb();
     const files = await new Promise((resolve, reject) => {
