@@ -9,7 +9,7 @@ use std::f32::consts::TAU;
 
 use oss_sim::ShipInput;
 
-use crate::nav::{Nav, centre, tile_of};
+use crate::nav::{Nav, Route, centre, tile_of};
 use crate::script::Behaviour;
 
 /// Another ship as the bot sees it.
@@ -59,10 +59,12 @@ const ROAM_GIVE_UP: u32 = 2_000;
 const ROAM_RETRY: u32 = 100;
 /// How far along a path to look for a corner to cut to.
 const LOOKAHEAD: usize = 14;
-/// Tiles one path search may look at: a few milliseconds at most in a release
-/// build (one that runs its whole budget took 2.3 ms here, 14.7 ms at the old
-/// 120 000), so no brain step holds up the bot's thread for long. Further than
-/// that, the bot heads straight for the goal and searches again as it nears.
+/// Tiles one path search may look at per call: a few milliseconds at most in a
+/// release build (one that runs its whole budget took 2.3 ms here, 14.7 ms at
+/// the old 120 000), so no brain step holds up the bot's thread for long. A
+/// search that needs more is not lost: it gives the path to the tile nearest the
+/// goal it has seen, which the bot follows, and carries on from where it stopped
+/// on the next ticks (see `Nav::path`) until it finds the whole route.
 const SEARCH: usize = 20_000;
 /// Fire only with at least this much energy left, so a bot doesn't shoot itself
 /// to death.
@@ -155,8 +157,11 @@ pub struct Brain {
     path: Vec<(i32, i32)>,
     path_goal: Option<(i32, i32)>,
     planned_tick: u32,
-    /// The last search for `path_goal` found no route: wait for the plan to go
-    /// stale before searching again rather than searching every tick.
+    /// `path` ends short of `path_goal` (the search ran out of budget, or the
+    /// goal is walled off): re-plan from its end once there.
+    partial: bool,
+    /// Searching again would get no nearer `path_goal` than now: wait for the
+    /// plan to go stale rather than searching every tick.
     no_route: bool,
     /// Where a sentry with no point of its own stands: where it first came in.
     home: Option<(f32, f32)>,
@@ -181,6 +186,7 @@ impl Brain {
             path: Vec::new(),
             path_goal: None,
             planned_tick: 0,
+            partial: false,
             no_route: false,
             home: None,
             dodge: None,
@@ -194,6 +200,7 @@ impl Brain {
     pub fn respawned(&mut self) {
         self.path.clear();
         self.path_goal = None;
+        self.partial = false;
         self.no_route = false;
         self.roam_failed = None;
         self.dodge = None;
@@ -417,12 +424,16 @@ impl Brain {
                 if (dx.abs().max(dy.abs())) < ROAM_REACH / 3 {
                     continue;
                 }
-                if let Some(path) = nav.path(here, want, ROAM_SEARCH)
+                // A partial path still ends somewhere reachable: go there.
+                if let Some(path) = nav.path(here, want, ROAM_SEARCH).tiles()
                     && let Some(&end) = path.last()
+                    && end != here
                 {
                     self.roam = Some((end, v.tick));
                     self.path = path;
                     self.path_goal = Some(end);
+                    self.partial = false;
+                    self.no_route = false;
                     self.planned_tick = v.tick;
                     break;
                 }
@@ -454,12 +465,39 @@ impl Brain {
             goal_px
         } else {
             let stale = v.tick.wrapping_sub(self.planned_tick) > 150;
-            if (self.path.is_empty() && !self.no_route) || self.path_goal != Some(goal) || stale {
-                self.path = nav.path(tile_of(v.pos), goal, SEARCH).unwrap_or_default();
+            let new_goal = self.path_goal != Some(goal);
+            // A partial path followed to its end: carry on from there.
+            let at_partial_end = self.partial && self.path.len() <= 1;
+            let wanted = new_goal
+                || stale
+                || nav.searching(goal)
+                || ((self.path.is_empty() || at_partial_end) && !self.no_route);
+            if wanted {
+                let was_end = self.path.last().copied().filter(|_| !new_goal);
+                match nav.path(tile_of(v.pos), goal, SEARCH) {
+                    Route::Found(p) => {
+                        self.path = p;
+                        self.partial = false;
+                        self.no_route = false;
+                    }
+                    Route::Partial(p) => {
+                        // Still searching, or got nearer than last time: progress.
+                        // Otherwise this is as near as it gets for now.
+                        let end = p.last().copied();
+                        self.no_route = !nav.searching(goal)
+                            && (p.len() <= 1 || (self.partial && end == was_end));
+                        self.path = p;
+                        self.partial = true;
+                    }
+                    Route::Unreachable => {
+                        // Head straight for it meanwhile.
+                        self.path.clear();
+                        self.partial = false;
+                        self.no_route = true;
+                    }
+                }
                 self.path_goal = Some(goal);
                 self.planned_tick = v.tick;
-                // No route within the budget: head straight for it meanwhile.
-                self.no_route = self.path.is_empty();
             }
             // Drop the tiles already passed, then head for the furthest one still
             // in a straight, open line.
@@ -676,8 +714,8 @@ mod tests {
         assert_eq!(idle.think(&view(&[], &[]), &mut nav), ShipInput::default());
     }
 
-    /// A goal no route reaches is searched for once per plan, not every tick: each
-    /// failed search runs its whole budget.
+    /// A goal no route reaches is searched for once per plan (a few budgets, over a
+    /// few ticks), not every tick: each failed search runs its whole budget.
     #[test]
     fn a_route_that_cannot_be_found_is_not_searched_for_every_tick() {
         // The patrol point (500, 470) sits inside a closed ring of wall.
@@ -699,7 +737,39 @@ mod tests {
             v.tick = tick;
             patrol.think(&v, &mut nav);
         }
-        assert_eq!(nav.searches, 1);
+        assert!(
+            nav.searches <= crate::nav::MAX_RESUMES as usize,
+            "{}",
+            nav.searches
+        );
+    }
+
+    /// A detour too long for one 20 000-tile search is still found: the bot gets
+    /// a partial path toward the goal at once and the whole route a few ticks on.
+    #[test]
+    fn a_long_detour_is_found_over_a_few_ticks() {
+        // A wall across x = 500 from the top down to y = 700; the bot at
+        // (500, 500)'s left, the patrol point at its right.
+        let mut cells = vec![0u8; 1024 * 1024];
+        for y in 0..=700 {
+            cells[y * 1024 + 520] = 1;
+        }
+        let mut nav = Nav::new(&TileMap::from_cells(&cells), 14);
+        let goal = (540, 500);
+        let mut patrol = Brain::new(Behaviour::Patrol, vec![goal], 30);
+        let mut v = view(&[], &[]);
+        patrol.think(&v, &mut nav);
+        assert!(
+            patrol.partial && patrol.path.len() > 1,
+            "a partial path at once"
+        );
+        for tick in 1..20 {
+            v.tick = tick;
+            patrol.think(&v, &mut nav);
+        }
+        assert!(!patrol.partial);
+        assert_eq!(patrol.path.last(), Some(&goal));
+        assert!(patrol.path.iter().any(|&(x, y)| x == 520 && y > 700));
     }
 
     #[test]

@@ -23,8 +23,46 @@ pub struct Nav {
     cost: Vec<u32>,
     from: Vec<u32>,
     touched: Vec<u32>,
-    /// Path searches run so far.
+    /// Path searches run so far (calls to [`Nav::path`]).
     pub searches: usize,
+    /// A search that ran out of budget, to carry on with.
+    pending: Option<Pending>,
+}
+
+/// A search resumes only from within this many tiles of where it started.
+pub const RESUME_TILES: i32 = 8;
+/// Budgets one search may use, over as many calls, before it stops for good.
+pub const MAX_RESUMES: u32 = 8;
+
+/// What [`Nav::path`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// A path from start to goal.
+    Found(Vec<(i32, i32)>),
+    /// A path to the tile nearest the goal seen so far: the search ran out of
+    /// budget (and may carry on, see [`Nav::searching`]) or the goal is walled off.
+    Partial(Vec<(i32, i32)>),
+    /// No way to move toward the goal at all.
+    Unreachable,
+}
+
+impl Route {
+    /// The tiles to fly along, if any.
+    pub fn tiles(self) -> Option<Vec<(i32, i32)>> {
+        match self {
+            Route::Found(t) | Route::Partial(t) => Some(t),
+            Route::Unreachable => None,
+        }
+    }
+}
+
+/// A search stopped at its budget: its open list and the tile nearest the goal.
+struct Pending {
+    start: (i32, i32),
+    goal: (i32, i32),
+    open: BinaryHeap<Reverse<(u32, u32, u32)>>,
+    best: (u32, usize),
+    budgets: u32,
 }
 
 fn index(x: i32, y: i32) -> usize {
@@ -68,6 +106,7 @@ impl Nav {
             from: vec![u32::MAX; CELLS],
             touched: Vec::new(),
             searches: 0,
+            pending: None,
         }
     }
 
@@ -122,46 +161,75 @@ impl Nav {
         None
     }
 
-    /// A path of open tiles from `start` to `goal` (both included), looking at no
-    /// more than `budget` tiles. Blocked ends move to the nearest open tile.
-    pub fn path(
-        &mut self,
-        start: (i32, i32),
-        goal: (i32, i32),
-        budget: usize,
-    ) -> Option<Vec<(i32, i32)>> {
+    /// A path of open tiles from `start` toward `goal`, looking at no more than
+    /// `budget` tiles this call. Blocked ends move to the nearest open tile.
+    ///
+    /// A search that runs out of budget is not thrown away: it gives the path to
+    /// the tile it has seen nearest the goal ([`Route::Partial`]) and keeps its
+    /// state, and the next call for the same goal from about the same place
+    /// (within [`RESUME_TILES`]) carries on where it stopped. So a long detour is
+    /// found a budget at a time, over a few calls, instead of never; after
+    /// [`MAX_RESUMES`] budgets it stops and keeps the partial path.
+    pub fn path(&mut self, start: (i32, i32), goal: (i32, i32), budget: usize) -> Route {
         self.searches += 1;
-        let start = self.nearest_open(start, 4)?;
-        let goal = self.nearest_open(goal, 8)?;
-        for &i in &self.touched {
-            self.cost[i as usize] = u32::MAX;
-            self.from[i as usize] = u32::MAX;
-        }
-        self.touched.clear();
-
+        let pending = self.pending.take();
+        let (Some(start), Some(goal)) = (self.nearest_open(start, 4), self.nearest_open(goal, 8))
+        else {
+            return Route::Unreachable;
+        };
         let h = |x: i32, y: i32| {
             let (dx, dy) = ((x - goal.0).unsigned_abs(), (y - goal.1).unsigned_abs());
             STEP * dx.max(dy) + (DIAGONAL - STEP) * dx.min(dy)
         };
-        let s = index(start.0, start.1);
-        self.cost[s] = 0;
-        self.touched.push(s as u32);
-        let mut open = BinaryHeap::new();
-        open.push(Reverse((h(start.0, start.1), 0u32, s as u32)));
+        let near =
+            |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs().max((a.1 - b.1).abs()) <= RESUME_TILES;
+        let mut p = match pending.filter(|p| p.goal == goal && near(p.start, start)) {
+            Some(p) => p,
+            None => {
+                for &i in &self.touched {
+                    self.cost[i as usize] = u32::MAX;
+                    self.from[i as usize] = u32::MAX;
+                }
+                self.touched.clear();
+                let s = index(start.0, start.1);
+                self.cost[s] = 0;
+                self.touched.push(s as u32);
+                let mut open = BinaryHeap::new();
+                open.push(Reverse((h(start.0, start.1), 0u32, s as u32)));
+                Pending {
+                    start,
+                    goal,
+                    open,
+                    best: (h(start.0, start.1), s),
+                    budgets: 0,
+                }
+            }
+        };
+        p.budgets += 1;
         let mut looked = 0;
-        while let Some(Reverse((_, g, i))) = open.pop() {
+        loop {
+            if looked >= budget {
+                let partial = self.trace(p.best.1);
+                if p.budgets < MAX_RESUMES {
+                    self.pending = Some(p);
+                }
+                return Route::Partial(partial);
+            }
+            let Some(Reverse((_, g, i))) = p.open.pop() else {
+                break;
+            };
             let i = i as usize;
             if g > self.cost[i] {
                 continue;
             }
             let (x, y) = ((i as i32) % TILES, (i as i32) / TILES);
             if (x, y) == goal {
-                return Some(self.trace(i));
+                return Route::Found(self.trace(i));
+            }
+            if h(x, y) < p.best.0 {
+                p.best = (h(x, y), i);
             }
             looked += 1;
-            if looked > budget {
-                return None;
-            }
             for (dx, dy) in [
                 (1, 0),
                 (-1, 0),
@@ -189,11 +257,23 @@ impl Nav {
                     }
                     self.cost[n] = ng;
                     self.from[n] = i as u32;
-                    open.push(Reverse((ng + h(nx, ny), ng, n as u32)));
+                    p.open.push(Reverse((ng + h(nx, ny), ng, n as u32)));
                 }
             }
         }
-        None
+        // Everything reachable seen and the goal not among it: as near as it gets.
+        let partial = self.trace(p.best.1);
+        if partial.len() > 1 {
+            Route::Partial(partial)
+        } else {
+            Route::Unreachable
+        }
+    }
+
+    /// Whether a search toward `goal` stopped at its budget and will carry on.
+    pub fn searching(&self, goal: (i32, i32)) -> bool {
+        self.nearest_open(goal, 8)
+            .is_some_and(|g| self.pending.as_ref().is_some_and(|p| p.goal == g))
     }
 
     fn trace(&self, mut i: usize) -> Vec<(i32, i32)> {
@@ -230,14 +310,62 @@ mod tests {
         let mut nav = Nav::new(&walled(), 2);
         assert!(!nav.open(500, 100));
         assert!(nav.open(500, 602));
-        let p = nav.path((490, 500), (510, 500), 200_000).unwrap();
+        let Route::Found(p) = nav.path((490, 500), (510, 500), 200_000) else {
+            panic!("no route");
+        };
         assert_eq!(p.first(), Some(&(490, 500)));
         assert_eq!(p.last(), Some(&(510, 500)));
         // Through the gap, and never on a blocked tile.
         assert!(p.iter().any(|&(x, y)| x == 500 && (600..=605).contains(&y)));
         assert!(p.iter().all(|&(x, y)| nav.open(x, y)));
-        // A tiny budget gives up rather than searching the whole map.
-        assert!(nav.path((490, 500), (510, 500), 10).is_none());
+        // A tiny budget stops early with a partial path, never the whole map.
+        let mut nav = Nav::new(&walled(), 2);
+        assert!(matches!(
+            nav.path((490, 500), (510, 500), 10),
+            Route::Partial(_)
+        ));
+        assert!(nav.searching((510, 500)));
+    }
+
+    /// A wall across x = 500 from the top down to y = 300: going round it from
+    /// (490, 100) to (510, 100) takes a search of far more than 20 000 tiles.
+    fn long_wall() -> TileMap {
+        let mut cells = vec![0u8; CELLS];
+        for y in 0..=300 {
+            cells[index(500, y)] = 1;
+        }
+        TileMap::from_cells(&cells)
+    }
+
+    #[test]
+    fn a_long_detour_is_found_a_budget_at_a_time() {
+        let mut nav = Nav::new(&long_wall(), 14);
+        let (start, goal) = ((490, 100), (510, 100));
+        let dist = |t: (i32, i32)| (t.0 - goal.0).abs().max((t.1 - goal.1).abs());
+        // One budget is not enough: a partial path, starting here and ending
+        // nearer the goal, with the search kept to carry on.
+        let Route::Partial(first) = nav.path(start, goal, 20_000) else {
+            panic!("a 20 000-tile search should not reach round the wall");
+        };
+        assert_eq!(first.first(), Some(&start));
+        assert!(dist(*first.last().unwrap()) < dist(start));
+        assert!(nav.searching(goal));
+        // Carried on from (about) the same place, it gets there.
+        let mut calls = 1;
+        let route = loop {
+            calls += 1;
+            match nav.path((491, 101), goal, 20_000) {
+                Route::Found(p) => break p,
+                Route::Partial(_) if calls < MAX_RESUMES => {}
+                r => panic!("gave up after {calls} calls: {r:?}"),
+            }
+        };
+        assert_eq!(route.last(), Some(&goal));
+        assert!(
+            route.iter().any(|&(x, y)| x == 500 && y > 300),
+            "round the wall's end"
+        );
+        assert!(route.iter().all(|&(x, y)| nav.open(x, y)));
     }
 
     #[test]
