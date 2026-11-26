@@ -197,11 +197,63 @@ fn bundled_asset(
     const FILES: &[(&str, &[u8])] = include!(concat!(env!("OUT_DIR"), "/classic_assets.rs"));
     extensions.iter().find_map(|extension| {
         let path = format!("{folder}/{name}.{extension}").to_ascii_lowercase();
+        if let Some(data) = provided::get(&path) {
+            return Some((PathBuf::from(path), data.into()));
+        }
         FILES
             .iter()
             .find(|(key, _)| *key == path)
             .map(|(_, data)| (PathBuf::from(path), (*data).into()))
     })
+}
+
+/// Assets the page hands over after the game has started (the browser build fetches its
+/// sounds separately so the game itself downloads sooner).
+#[cfg(target_arch = "wasm32")]
+mod provided {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn files() -> &'static Mutex<HashMap<String, &'static [u8]>> {
+        static FILES: OnceLock<Mutex<HashMap<String, &'static [u8]>>> = OnceLock::new();
+        FILES.get_or_init(Default::default)
+    }
+
+    pub(super) fn get(key: &str) -> Option<&'static [u8]> {
+        files().lock().ok()?.get(key).copied()
+    }
+
+    pub(super) fn insert(key: String, data: Vec<u8>) {
+        // Kept for the life of the page, like the built-in files.
+        let data: &'static [u8] = Box::leak(data.into_boxed_slice());
+        if let Ok(mut files) = files().lock() {
+            files.insert(key, data);
+        }
+    }
+}
+
+/// Adds `<folder>/<file name>` (e.g. `sound/alarm.wa2`) to the built-in assets.
+#[cfg(target_arch = "wasm32")]
+pub fn provide_asset(key: &str, data: Vec<u8>) {
+    provided::insert(key.to_ascii_lowercase(), data);
+}
+
+#[cfg(target_arch = "wasm32")]
+static PROVIDED_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The page has handed over everything it is going to (or given up), so a missing asset
+/// is missing for good. Until then a caller should not remember a miss.
+#[cfg(target_arch = "wasm32")]
+pub fn provided_all() {
+    PROVIDED_ALL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether more assets may still arrive from the page (always false off the web).
+pub fn assets_pending() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    return !PROVIDED_ALL.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_arch = "wasm32"))]
+    false
 }
 
 fn find_in(root: &Path, subdir: &str, stem: &str, exts: &[&str]) -> Option<PathBuf> {

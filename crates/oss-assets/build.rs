@@ -10,8 +10,15 @@ fn main() -> std::io::Result<()> {
         .join("../../assets/classic");
     println!("cargo:rerun-if-changed={}", root.display());
 
+    // Graphics are needed to draw the first frame, so they are built in. Sounds (5.7 MB of
+    // PCM that barely compresses) are not: the page fetches them as a pack after the game
+    // starts and hands them over with `provide_asset` (see web/build-client.sh). Set
+    // OSS_BUNDLE_SOUNDS=1 to build them in as before.
+    println!("cargo:rerun-if-env-changed=OSS_BUNDLE_SOUNDS");
+    let bundle_sounds = env::var("OSS_BUNDLE_SOUNDS").is_ok_and(|v| v == "1");
+    let folders: &[&str] = if bundle_sounds { &["graphics", "sound"] } else { &["graphics"] };
     let mut assets = String::from("&[\n");
-    for folder in ["graphics", "sound"] {
+    for &folder in folders {
         let mut entries = fs::read_dir(root.join(folder))?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {

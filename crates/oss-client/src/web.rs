@@ -52,6 +52,9 @@ extern "C" {
     #[wasm_bindgen(js_namespace = globalThis, js_name = foundationOpenGraphics, catch)]
     fn js_open_graphics() -> Result<JsValue, JsValue>;
 
+    #[wasm_bindgen(js_namespace = globalThis, js_name = dareCacheSave, catch)]
+    fn js_cache_save(name: &str, data: &[u8]) -> Result<(), JsValue>;
+
     #[wasm_bindgen(js_namespace = globalThis, js_name = dareLoadingStage, catch)]
     fn js_loading_stage(stage: &str, detail: &str, percent: i32) -> Result<(), JsValue>;
 }
@@ -126,6 +129,37 @@ pub fn clear_custom_graphic(name: &str) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn use_own_graphics(on: bool) {
     crate::game::custom_ships::set_use_own(on);
+}
+
+// ---- what the page keeps between visits, and what it fetches after the game ------------------
+
+/// A map, LVZ or the news the page saved on an earlier visit (call before starting), so the
+/// zone needn't send it again. From here on, newly downloaded ones go to
+/// `globalThis.dareCacheSave(name, bytes)` for the page to keep.
+#[wasm_bindgen]
+pub fn preload_cached_file(name: &str, data: Vec<u8>) {
+    use_page_cache();
+    oss_session::map::web_cache::preload(name, data);
+}
+
+/// Sends newly downloaded maps, LVZ and news to the page to keep.
+#[wasm_bindgen]
+pub fn use_page_cache() {
+    oss_session::map::web_cache::set_saver(|name, data| {
+        let _ = js_cache_save(name, data);
+    });
+}
+
+/// An asset fetched after the game started, e.g. `sound/alarm.wa2`.
+#[wasm_bindgen]
+pub fn provide_asset(key: &str, data: Vec<u8>) {
+    oss_assets::provide_asset(key, data);
+}
+
+/// Every asset the page is going to provide has been (or the fetch failed).
+#[wasm_bindgen]
+pub fn assets_provided() {
+    oss_assets::provided_all();
 }
 
 fn slot(ship: u8) -> Result<usize, JsValue> {
