@@ -36,6 +36,7 @@ takes every option below, and the list it prints is the one to trust. The main o
 | `--ship <1-8\|spec>` | the ship to fly, or spectator mode (the default) |
 | `--fly` | fly around and fire at random (needs a ship) |
 | `--count <n>` | run *n* bots in one process; their names are numbered |
+| `--host` | run the bots that lineup messages on standard input list, each its own connection, until standard input closes |
 | `--chat <text>` | say this once in the arena |
 | `--duration <secs>` | leave after this long, instead of running until Ctrl+C |
 | `--security <mode>` | which encryption to use: `vie`, `opensec`, `auto` or `none` |

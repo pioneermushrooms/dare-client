@@ -24,9 +24,9 @@
 //! `range` tiles) or `fighter` (chases the nearest pilot and fires). Points are
 //! tiles, 0-1023. `greet` is said when a pilot arrives (`{name}` is their name),
 //! `announce` every so many seconds (60 or more), and `reply` answers a chat line
-//! that starts with the keyword, publicly or privately as it was asked. `peers`
-//! names a suffix other bots' names end in (`[bot]`, say):
-//! those players are not greeted, answered or fought.
+//! that starts with the keyword, publicly or privately as it was asked. A bot
+//! fights anyone on another freq, bot or pilot; an old `peers` line is still
+//! accepted and does nothing.
 
 /// How a bot flies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,8 +70,6 @@ pub struct Script {
     pub banter: Option<(u32, Vec<String>)>,
     /// (keyword, lower case; reply).
     pub replies: Vec<(String, String)>,
-    /// Names ending in this are other bots: not greeted, answered or fought.
-    pub peers: Option<String>,
     pub controller: Option<String>,
 }
 
@@ -155,10 +153,8 @@ pub fn parse(text: &str) -> Result<Script, String> {
                 }
                 s.range = Some(v as i32);
             }
-            "peers" => {
-                s.peers = Some(raw.trim_start()["peers".len()..].trim_start().to_string())
-                    .filter(|v| !v.is_empty())
-            }
+            // Bots once spared names ending in this; they now go by freq.
+            "peers" => {}
             "controller" => s.controller = Some(rest.to_string()).filter(|v| !v.is_empty()),
             "greet" => s.greeting = speakable(rest),
             "banter" => {
@@ -224,7 +220,6 @@ mod tests {
         assert_eq!(s.behaviour, Behaviour::Fighter);
         assert_eq!(s.points, vec![(1, 2), (1023, 0)]);
         assert_eq!(s.greeting.as_deref(), Some("Hi {name}"));
-        assert_eq!(s.peers.as_deref(), Some("[bot]"));
         // A line that would be a command loses the command character.
         assert_eq!(s.announcements, vec![(60, "go elsewhere".to_string())]);
         assert_eq!(

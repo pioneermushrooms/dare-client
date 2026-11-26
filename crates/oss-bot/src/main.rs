@@ -5,10 +5,11 @@
 //! ship. A flying bot keeps every other ship and every shot in the arena in its
 //! simulation, as the game does, so it is hit, dies and comes back like a player.
 //! Many bots can run in one process; a scripted bot (see `script`) flies one of
-//! the behaviours in `brain` and talks (`talk`).
+//! the behaviours in `brain` and talks (`talk`). With `--host` the process runs
+//! an arena's bots as its standard input lists them (see `lineup`), each on its
+//! own thread with its own connection.
 
 mod brain;
-#[allow(dead_code)] // used by the host (next task)
 mod lineup;
 mod nav;
 mod script;
@@ -17,8 +18,9 @@ mod talk;
 use oss_session::security::{Identities, SecurityMode, client_handshake, fingerprint};
 use std::io::BufRead;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use oss_proto::ClientSettings;
@@ -30,6 +32,7 @@ use oss_sim::fixed::Rng;
 use oss_sim::{Event, Pos, ShipInput, ShipState, VEL_SCALE, World, toggle};
 
 use brain::{Brain, Contact, View};
+use lineup::{Change, Entry, Lineup, Seat};
 use nav::Nav;
 use script::Script;
 use talk::Talk;
@@ -50,6 +53,10 @@ Options:
                          standard input with -. With -, the bot leaves the zone
                          when its standard input closes. Its settings override
                          the options above; the README has the format
+  --host                 Run an arena's bots as lineup messages on standard
+                         input list them, each its own connection; the zone
+                         sets their freqs. When standard input closes, every
+                         bot leaves and the program ends
   --chat <text>          Say this in public chat once in the arena; :name:text
                          sends it privately to that player once they're here
   --new-user             Create the name when the zone offers to (it does not
@@ -85,6 +92,8 @@ struct Options {
     new_user: bool,
     /// `-` for standard input.
     script: Option<String>,
+    /// Run the bots lineup messages on standard input name.
+    host: bool,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
@@ -104,6 +113,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
         identity: None,
         new_user: false,
         script: None,
+        host: false,
     };
     while let Some(a) = args.next() {
         let mut value = |n: &str| args.next().ok_or_else(|| format!("{n} needs a value"));
@@ -135,6 +145,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
             }
             "--fly" => o.fly = true,
             "--script" => o.script = Some(value("--script")?),
+            "--host" => o.host = true,
             "--security" => {
                 o.security = SecurityMode::from_name(&value("--security")?)
                     .ok_or("--security must be vie, opensec, auto or none")?
@@ -157,6 +168,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
     }
     if o.script.is_some() && o.count != 1 {
         return Err("--script runs one bot; leave out --count".into());
+    }
+    if o.host && (o.script.is_some() || o.count != 1) {
+        return Err(
+            "--host runs the bots its standard input lists; leave out --script and --count".into(),
+        );
     }
     Ok(Some(o))
 }
@@ -225,14 +241,6 @@ fn per_second(v: oss_sim::Vel) -> (f32, f32) {
     (v.x as f32 / k, v.y as f32 / k)
 }
 
-/// Whether `name` ends in `suffix`, ignoring case.
-fn ends_with(name: &str, suffix: &str) -> bool {
-    name.len() >= suffix.len()
-        && name.is_char_boundary(name.len() - suffix.len())
-        && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-}
-
-/// One bot: a session, its socket, and (when flying) a simulation of the arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OrderRequest {
     Come,
@@ -263,6 +271,11 @@ enum FlightOrder {
     Follow(u16),
 }
 
+/// The names of the bots a host runs, shared by them all: they don't greet or
+/// answer one another (they do fight, by freq).
+type Siblings = Arc<Mutex<Vec<String>>>;
+
+/// One bot: a session, its socket, and (when flying) a simulation of the arena.
 struct Bot {
     label: String,
     session: Session,
@@ -272,7 +285,10 @@ struct Bot {
     green_seed: u32,
     doors: Option<(u32, u32)>,
     /// The ship and freq it wants, and whether it already asked for the freq.
+    /// A hosted bot asks for no freq: the zone sets it.
     ship: u8,
+    /// The ship it flies when seated (`ship` is spectator while it isn't).
+    seat_ship: u8,
     freq: Option<i16>,
     freq_asked: bool,
     /// Fly at random (`--fly`) when there is no brain.
@@ -282,8 +298,7 @@ struct Bot {
     me: u16,
     brain: Option<Brain>,
     talk: Option<Talk>,
-    /// Names ending in this belong to other bots: not greeted, answered or fought.
-    peer_suffix: Option<String>,
+    siblings: Siblings,
     controller: Option<String>,
     flight_order: Option<FlightOrder>,
     last_order_reply: Option<u64>,
@@ -307,10 +322,91 @@ impl Bot {
             .unwrap_or_default()
     }
 
-    fn is_peer(&self, name: &str) -> bool {
-        self.peer_suffix
-            .as_deref()
-            .is_some_and(|s| ends_with(name, s))
+    /// Whether `name` is another bot of the same host.
+    fn is_sibling(&self, name: &str) -> bool {
+        self.siblings
+            .lock()
+            .is_ok_and(|s| s.iter().any(|n| n.eq_ignore_ascii_case(name)))
+    }
+
+    /// Takes the seat the host gives: the bot's ship, or spectator mode.
+    fn take_seat(&mut self, seat: Seat) {
+        let want = match seat {
+            Seat::In => self.seat_ship,
+            Seat::Spectating => SPECTATOR,
+        };
+        if want == self.ship {
+            return;
+        }
+        // Going to spectator: the one place a bot will break off a fight first.
+        self.ship = want;
+        self.flight_order = None;
+        self.log(match seat {
+            Seat::In => "taking my seat",
+            Seat::Spectating => "going to spectator",
+        });
+        if self.session.state() == State::Playing
+            && self.session.me().is_some_and(|p| p.ship != want)
+        {
+            self.session.set_ship(want);
+        }
+    }
+
+    /// Leaves the zone.
+    fn leave(&mut self) {
+        self.session.disconnect();
+        let _ = self.driver.send_pending(&mut self.session);
+    }
+
+    /// One pass of the bot's work: take in what the zone sent, step the arena,
+    /// fly and talk, and send. `false` once its session has closed.
+    fn step(&mut self, cache: &MapCache, chat: Option<&str>) -> bool {
+        if self.session.state() == State::Closed {
+            return false;
+        }
+        if let Err(e) = self.driver.pump(&mut self.session) {
+            log::warn!("[{}] socket error: {e}", self.label);
+            self.session.disconnect();
+        }
+        self.handle_events(cache);
+        let now = self.driver.now_ms();
+        if self.world.is_none() {
+            self.last_step_ms = now;
+        }
+        if self.session.state() == State::Playing {
+            if let Some(text) = chat.filter(|_| !self.chatted) {
+                match private_chat(text) {
+                    // :name:text waits until that player is in the arena.
+                    Some((to, msg)) => {
+                        let pid = self
+                            .session
+                            .players()
+                            .find(|p| p.name.eq_ignore_ascii_case(to))
+                            .map(|p| p.pid);
+                        if let Some(pid) = pid {
+                            self.session.send_chat(chat_type::PRIVATE, pid, msg);
+                            self.chatted = true;
+                        }
+                    }
+                    None => {
+                        self.session.send_chat(chat_type::PUBLIC, 0, text);
+                        self.chatted = true;
+                    }
+                }
+            }
+            if let Some((kind, to, text)) = self.talk.as_mut().and_then(|t| t.next(now)) {
+                self.session.send_chat(kind, to, &text);
+            }
+            // Other ships and shots keep moving while spectating, too.
+            let flying = self.own_ship_flying();
+            self.fly(now);
+            if !flying && self.session.position_due(now) {
+                // Spectators still report in so the server knows they're alive.
+                self.session.send_position(now, &Default::default());
+            }
+        }
+        let _ = self.driver.send_pending(&mut self.session);
+        true
     }
 
     fn handle_order(&mut self, pid: i16, text: &str, now: u64) -> bool {
@@ -585,7 +681,7 @@ impl Bot {
                     if asked
                         && pid >= 0
                         && pid as u16 != self.me
-                        && !self.is_peer(&who)
+                        && !self.is_sibling(&who)
                         && let Some(t) = self.talk.as_mut()
                     {
                         t.heard(pid, kind == chat_type::PRIVATE, &text, now);
@@ -645,7 +741,7 @@ impl Bot {
     }
 
     fn greet(&mut self, name: &str, now: u64) {
-        if name.is_empty() || self.is_peer(name) {
+        if name.is_empty() || self.is_sibling(name) {
             return;
         }
         if self.controller.is_some() && !self.advertised_orders {
@@ -727,15 +823,6 @@ impl Bot {
         let Some(world) = self.world.as_mut() else {
             return;
         };
-        let peers: Vec<u16> = match self.peer_suffix.as_deref() {
-            Some(sfx) => self
-                .session
-                .players()
-                .filter(|p| ends_with(&p.name, sfx))
-                .map(|p| p.pid as u16)
-                .collect(),
-            None => Vec::new(),
-        };
         let (mut enemies, mut shots) = (Vec::new(), Vec::new());
         let mut fired = false;
         // Far behind (the machine was asleep, say): skip ahead rather than racing.
@@ -750,7 +837,7 @@ impl Bot {
             let input = match me {
                 Some(i) if world.ships[i].is_alive() => {
                     if let (Some(brain), Some(nav)) = (self.brain.as_mut(), self.nav.as_mut()) {
-                        let v = view(world, i, &peers, &mut enemies, &mut shots);
+                        let v = view(world, i, &mut enemies, &mut shots);
                         match self.flight_order {
                             Some(FlightOrder::Position(at)) => brain.obey(&v, nav, at, false),
                             Some(FlightOrder::Follow(id)) => {
@@ -847,12 +934,11 @@ fn random_walk(t: u32, r: u32) -> ShipInput {
 }
 
 /// What the brain sees this tick: the bot's ship `me`, the ships it may fight
-/// (alive, on another freq, out of safe zones, not one of `peers`) and the shots
-/// coming from other freqs.
+/// (alive, on another freq, out of safe zones: bot or pilot alike, never a
+/// teammate) and the shots coming from other freqs.
 fn view<'a>(
     world: &World,
     me: usize,
-    peers: &[u16],
     enemies: &'a mut Vec<Contact>,
     shots: &'a mut Vec<Contact>,
 ) -> View<'a> {
@@ -868,7 +954,6 @@ fn view<'a>(
                     && o.is_alive()
                     && o.freq != ship.freq
                     && o.toggles & toggle::SAFETY == 0
-                    && !peers.contains(&o.id)
             })
             .map(|o| Contact {
                 pos: px(o.pos),
@@ -902,6 +987,338 @@ fn view<'a>(
     }
 }
 
+/// Where a lineup's bots go: its arena (empty for any public one) and the
+/// arena owner they take flight orders from.
+#[derive(Clone)]
+struct Place {
+    arena: String,
+    controller: Option<String>,
+}
+
+impl Place {
+    fn of(lineup: &Lineup) -> Self {
+        Place {
+            arena: lineup.arena.clone(),
+            controller: lineup.controller.clone(),
+        }
+    }
+}
+
+/// The bots the options (and a `--script`) describe, as a lineup: one bot, or
+/// `--count` of them numbered.
+fn lineup_from_options(opts: &Options, script: Option<&Script>) -> Lineup {
+    let script = script.cloned().unwrap_or_default();
+    let ship = script.ship.unwrap_or(opts.ship);
+    let bots = (0..opts.count)
+        .map(|i| Entry {
+            name: script.name.clone().unwrap_or_else(|| {
+                if opts.count > 1 {
+                    format!("{}{}", opts.name, i + 1)
+                } else {
+                    opts.name.clone()
+                }
+            }),
+            password: script.password.clone().unwrap_or(opts.password.clone()),
+            seat: if ship == SPECTATOR {
+                Seat::Spectating
+            } else {
+                Seat::In
+            },
+            team: script.freq.unwrap_or(0),
+            script: Script {
+                ship: (ship != SPECTATOR).then_some(ship),
+                ..script.clone()
+            },
+        })
+        .collect();
+    Lineup {
+        arena: script
+            .arena
+            .clone()
+            .or(opts.arena.clone())
+            .unwrap_or_default(),
+        controller: script.controller.clone(),
+        bots,
+    }
+}
+
+/// Connects bot number `n` of a lineup: its own socket and session, and, when
+/// scripted (`--script` or `--host`), its brain and chat.
+fn start_bot(
+    entry: &Entry,
+    place: &Place,
+    opts: &Options,
+    n: usize,
+    siblings: Siblings,
+) -> Result<Bot, String> {
+    let driver = UdpDriver::connect(&opts.server).map_err(|e| format!("{}: {e}", opts.server))?;
+    let s = &entry.script;
+    let seat_ship = s.ship.unwrap_or(0);
+    let ship = match entry.seat {
+        Seat::In => seat_ship,
+        Seat::Spectating => SPECTATOR,
+    };
+    let cfg = SessionConfig {
+        name: entry.name.clone(),
+        password: entry.password.clone(),
+        arena: Some(place.arena.clone()).filter(|a| !a.is_empty()),
+        ship,
+        machine_id: 0x0B07_0000 + n as u32,
+        new_user: opts.new_user,
+        ..Default::default()
+    };
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(1)
+        .wrapping_add(n as u32 * 7919);
+    let loud = n == 0 || opts.verbose || opts.host;
+    // One identity per bot and zone, kept across runs: by number (so a renamed
+    // bot keeps its key), or by name for a hosted bot.
+    let identity = match opts.identity.as_deref() {
+        Some(path) => {
+            let who = if opts.host {
+                entry.name.to_ascii_lowercase()
+            } else {
+                format!("bot{}", n + 1)
+            };
+            let id = Identities::load(path)
+                .for_server(&format!("{who}@{}", opts.server))
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            if loud {
+                println!("[{}] identity {}", entry.name, fingerprint(&id.public()));
+            }
+            Some(id)
+        }
+        None => None,
+    };
+    let handshake = client_handshake(opts.security, None, identity, seed);
+    let now = driver.now_ms();
+    let session = Session::with_handshake(cfg, now, handshake);
+    let scripted = opts.host || opts.script.is_some();
+    let brain = scripted.then(|| Brain::new(s.behaviour, s.points.clone(), s.range.unwrap_or(30)));
+    let talk = scripted
+        .then(|| Talk::new(s, now))
+        .filter(|t| !t.is_quiet());
+    Ok(Bot {
+        label: entry.name.clone(),
+        session,
+        driver,
+        loud,
+        map: None,
+        green_seed: 0,
+        doors: None,
+        ship,
+        seat_ship,
+        // A hosted bot's freq is the zone's to set.
+        freq: if opts.host { None } else { s.freq },
+        freq_asked: false,
+        fly: opts.fly,
+        world: None,
+        nav: None,
+        me: u16::MAX,
+        brain,
+        talk,
+        siblings,
+        controller: place.controller.clone().or(s.controller.clone()),
+        flight_order: None,
+        last_order_reply: None,
+        advertised_orders: false,
+        rng: Rng::new(seed | 1),
+        chatted: false,
+        last_step_ms: 0,
+    })
+}
+
+/// What the host tells a running bot.
+enum Order {
+    Seat(Seat),
+    Team(i16),
+    Controller(Option<String>),
+    Leave,
+}
+
+/// A bot the host runs: the way to tell it things, and its thread.
+struct Hosted {
+    name: String,
+    orders: Sender<Order>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// A hosted bot's thread: connects, then works until told to leave (or the
+/// host goes away).
+fn run_hosted(
+    entry: Entry,
+    place: Place,
+    opts: Arc<Options>,
+    cache: Arc<MapCache>,
+    n: usize,
+    siblings: Siblings,
+    orders: Receiver<Order>,
+) {
+    let mut bot = match start_bot(&entry, &place, &opts, n, siblings) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("[{}] {e}", entry.name);
+            return;
+        }
+    };
+    loop {
+        loop {
+            match orders.try_recv() {
+                Ok(Order::Seat(seat)) => bot.take_seat(seat),
+                Ok(Order::Team(team)) => bot.log(format_args!("the zone puts me on freq {team}")),
+                Ok(Order::Controller(c)) => {
+                    bot.controller = c;
+                    bot.flight_order = None;
+                }
+                Ok(Order::Leave) | Err(TryRecvError::Disconnected) => {
+                    bot.leave();
+                    bot.log("left");
+                    return;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+        // A closed bot waits for the host to restart or remove it.
+        let open = bot.step(&cache, opts.chat.as_deref());
+        std::thread::sleep(Duration::from_millis(if open { 5 } else { 50 }));
+    }
+}
+
+/// The bots `--host` runs, and the lineup they follow.
+struct Host {
+    opts: Arc<Options>,
+    cache: Arc<MapCache>,
+    siblings: Siblings,
+    current: Lineup,
+    bots: Vec<Hosted>,
+    started: usize,
+}
+
+impl Host {
+    fn new(opts: Arc<Options>, cache: Arc<MapCache>) -> Self {
+        Host {
+            opts,
+            cache,
+            siblings: Siblings::default(),
+            current: Lineup {
+                arena: String::new(),
+                controller: None,
+                bots: Vec::new(),
+            },
+            bots: Vec::new(),
+            started: 0,
+        }
+    }
+
+    /// Reads lineup messages from standard input, acting on each at its `done`,
+    /// until it closes; then every bot leaves.
+    fn run(&mut self, input: impl BufRead) {
+        let mut text = String::new();
+        for line in input.lines() {
+            let Ok(line) = line else { break };
+            text.push_str(&line);
+            text.push('\n');
+            if line.trim() != "done" {
+                continue;
+            }
+            match lineup::read(&std::mem::take(&mut text)) {
+                Ok(new) => self.follow(new),
+                // The last good lineup stays in force.
+                Err(e) => log::warn!("lineup ignored: {e}"),
+            }
+        }
+        log::info!("standard input closed; {} bot(s) leaving", self.bots.len());
+        for b in &self.bots {
+            let _ = b.orders.send(Order::Leave);
+        }
+        for b in self.bots.drain(..) {
+            let _ = b.thread.join();
+        }
+    }
+
+    /// Changes the running bots to match `new`.
+    fn follow(&mut self, new: Lineup) {
+        let changes = if new.arena.eq_ignore_ascii_case(&self.current.arena) {
+            if new.controller != self.current.controller {
+                for b in &self.bots {
+                    let _ = b.orders.send(Order::Controller(new.controller.clone()));
+                }
+            }
+            lineup::diff(&self.current, &new)
+        } else {
+            // Another arena: every bot goes again.
+            let names: Vec<String> = self.bots.iter().map(|b| b.name.clone()).collect();
+            for name in names {
+                self.stop(&name);
+            }
+            let empty = Lineup {
+                bots: Vec::new(),
+                ..new.clone()
+            };
+            lineup::diff(&empty, &new)
+        };
+        *self.siblings.lock().unwrap_or_else(|e| e.into_inner()) =
+            new.bots.iter().map(|e| e.name.clone()).collect();
+        let place = Place::of(&new);
+        for change in changes {
+            match change {
+                Change::Add(entry) => self.start(entry, &place),
+                Change::Remove(name) => self.stop(&name),
+                Change::Restart(entry) => {
+                    self.stop(&entry.name);
+                    self.start(entry, &place);
+                }
+                Change::Seat(name, seat) => self.tell(&name, Order::Seat(seat)),
+                Change::Team(name, team) => self.tell(&name, Order::Team(team)),
+            }
+        }
+        self.current = new;
+    }
+
+    fn start(&mut self, entry: Entry, place: &Place) {
+        let (orders, inbox) = mpsc::channel();
+        let name = entry.name.clone();
+        let (opts, cache, siblings) =
+            (self.opts.clone(), self.cache.clone(), self.siblings.clone());
+        let (place, n) = (place.clone(), self.started);
+        self.started += 1;
+        log::info!("[{name}] starting");
+        let spawned = std::thread::Builder::new()
+            .name(name.clone())
+            .spawn(move || run_hosted(entry, place, opts, cache, n, siblings, inbox));
+        match spawned {
+            Ok(thread) => self.bots.push(Hosted {
+                name,
+                orders,
+                thread,
+            }),
+            Err(e) => log::warn!("[{name}] couldn't start: {e}"),
+        }
+    }
+
+    /// Tells the bot to leave, and waits until it has.
+    fn stop(&mut self, name: &str) {
+        let Some(i) = self
+            .bots
+            .iter()
+            .position(|b| b.name.eq_ignore_ascii_case(name))
+        else {
+            return;
+        };
+        let b = self.bots.remove(i);
+        let _ = b.orders.send(Order::Leave);
+        let _ = b.thread.join();
+    }
+
+    fn tell(&self, name: &str, order: Order) {
+        if let Some(b) = self.bots.iter().find(|b| b.name.eq_ignore_ascii_case(name)) {
+            let _ = b.orders.send(order);
+        }
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let opts = match parse_args(std::env::args().skip(1)) {
@@ -915,6 +1332,16 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let cache = MapCache::new(
+        opts.map_cache
+            .clone()
+            .unwrap_or_else(|| default_cache_dir(&opts.server)),
+    );
+    if opts.host {
+        log::info!("hosting bots on {}", opts.server);
+        Host::new(Arc::new(opts), Arc::new(cache)).run(std::io::stdin().lock());
+        return;
+    }
     let script = match opts.script.as_deref().map(read_script) {
         Some(Ok(s)) => Some(s),
         Some(Err(e)) => {
@@ -927,99 +1354,18 @@ fn main() {
     if opts.script.as_deref() == Some("-") {
         watch_stdin(stop.clone());
     }
-    let cache = MapCache::new(
-        opts.map_cache
-            .clone()
-            .unwrap_or_else(|| default_cache_dir(&opts.server)),
-    );
 
+    let lineup = lineup_from_options(&opts, script.as_ref());
+    let place = Place::of(&lineup);
     let mut bots = Vec::new();
-    for i in 0..opts.count {
-        let mut name = if opts.count > 1 {
-            format!("{}{}", opts.name, i + 1)
-        } else {
-            opts.name.clone()
-        };
-        let (mut password, mut arena, mut ship) =
-            (opts.password.clone(), opts.arena.clone(), opts.ship);
-        let mut freq = None;
-        if let Some(s) = script.as_ref() {
-            name = s.name.clone().unwrap_or(name);
-            password = s.password.clone().unwrap_or(password);
-            arena = s.arena.clone().or(arena);
-            ship = s.ship.unwrap_or(ship);
-            freq = s.freq;
-        }
-        let driver = match UdpDriver::connect(&opts.server) {
-            Ok(d) => d,
+    for (i, entry) in lineup.bots.iter().enumerate() {
+        match start_bot(entry, &place, &opts, i, Siblings::default()) {
+            Ok(b) => bots.push(b),
             Err(e) => {
-                eprintln!("error: {}: {e}", opts.server);
+                eprintln!("error: {e}");
                 std::process::exit(1);
             }
-        };
-        let cfg = SessionConfig {
-            name: name.clone(),
-            password,
-            arena,
-            ship,
-            machine_id: 0x0B07_0000 + i as u32,
-            new_user: opts.new_user,
-            ..Default::default()
-        };
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(1)
-            .wrapping_add(i as u32 * 7919);
-        // One identity per bot number and zone, kept across runs and renames.
-        let identity = opts.identity.as_deref().map(|path| {
-            let id = Identities::load(path)
-                .for_server(&format!("bot{}@{}", i + 1, opts.server))
-                .unwrap_or_else(|e| {
-                    eprintln!("error: {}: {e}", path.display());
-                    std::process::exit(1);
-                });
-            if i == 0 || opts.verbose {
-                println!("[{name}] identity {}", fingerprint(&id.public()));
-            }
-            id
-        });
-        let handshake = client_handshake(opts.security, None, identity, seed);
-        let now = driver.now_ms();
-        let session = Session::with_handshake(cfg, now, handshake);
-        let brain = script
-            .as_ref()
-            .map(|s| Brain::new(s.behaviour, s.points.clone(), s.range.unwrap_or(30)));
-        let talk = script
-            .as_ref()
-            .map(|s| Talk::new(s, now))
-            .filter(|t| !t.is_quiet());
-        bots.push(Bot {
-            label: name,
-            session,
-            driver,
-            loud: i == 0 || opts.verbose,
-            map: None,
-            green_seed: 0,
-            doors: None,
-            ship,
-            freq,
-            freq_asked: false,
-            fly: opts.fly,
-            world: None,
-            nav: None,
-            me: u16::MAX,
-            brain,
-            talk,
-            peer_suffix: script.as_ref().and_then(|s| s.peers.clone()),
-            controller: script.as_ref().and_then(|s| s.controller.clone()),
-            flight_order: None,
-            last_order_reply: None,
-            advertised_orders: false,
-            rng: Rng::new(seed | 1),
-            chatted: false,
-            last_step_ms: 0,
-        });
+        }
     }
     log::info!("{} bot(s) connecting to {}", bots.len(), opts.server);
 
@@ -1028,52 +1374,9 @@ fn main() {
     loop {
         let mut open = 0;
         for bot in &mut bots {
-            if bot.session.state() == State::Closed {
-                continue;
+            if bot.step(&cache, opts.chat.as_deref()) {
+                open += 1;
             }
-            open += 1;
-            if let Err(e) = bot.driver.pump(&mut bot.session) {
-                log::warn!("[{}] socket error: {e}", bot.label);
-                bot.session.disconnect();
-            }
-            bot.handle_events(&cache);
-            let now = bot.driver.now_ms();
-            if bot.world.is_none() {
-                bot.last_step_ms = now;
-            }
-            if bot.session.state() == State::Playing {
-                if let Some(text) = opts.chat.as_ref().filter(|_| !bot.chatted) {
-                    match private_chat(text) {
-                        // :name:text waits until that player is in the arena.
-                        Some((to, msg)) => {
-                            let pid = bot
-                                .session
-                                .players()
-                                .find(|p| p.name.eq_ignore_ascii_case(to))
-                                .map(|p| p.pid);
-                            if let Some(pid) = pid {
-                                bot.session.send_chat(chat_type::PRIVATE, pid, msg);
-                                bot.chatted = true;
-                            }
-                        }
-                        None => {
-                            bot.session.send_chat(chat_type::PUBLIC, 0, text);
-                            bot.chatted = true;
-                        }
-                    }
-                }
-                if let Some((kind, to, text)) = bot.talk.as_mut().and_then(|t| t.next(now)) {
-                    bot.session.send_chat(kind, to, &text);
-                }
-                // Other ships and shots keep moving while spectating, too.
-                let flying = bot.own_ship_flying();
-                bot.fly(now);
-                if !flying && bot.session.position_due(now) {
-                    // Spectators still report in so the server knows they're alive.
-                    bot.session.send_position(now, &Default::default());
-                }
-            }
-            let _ = bot.driver.send_pending(&mut bot.session);
         }
         if open == 0 {
             log::info!("all bots disconnected");
@@ -1083,8 +1386,7 @@ fn main() {
         let quit = stop.load(Ordering::Relaxed);
         if quit || opts.duration.is_some_and(|d| start.elapsed() >= d) {
             for bot in &mut bots {
-                bot.session.disconnect();
-                let _ = bot.driver.send_pending(&mut bot.session);
+                bot.leave();
             }
             log::info!(
                 "{}; disconnected",
@@ -1152,7 +1454,37 @@ mod tests {
         assert_eq!(private_chat("::x"), None);
         let o = parse("--server x:1 --identity ids.txt").unwrap().unwrap();
         assert_eq!(o.identity, Some(PathBuf::from("ids.txt")));
-        assert!(ends_with("Rex [Bot]", " [bot]"));
-        assert!(!ends_with("bot", " [bot]"));
+    }
+
+    #[test]
+    fn host_args_parse() {
+        let o = parse("--host --server a:1").unwrap().unwrap();
+        assert!(o.host);
+        assert_eq!(o.server, "a:1");
+        assert!(o.script.is_none());
+        assert!(!parse("--server a:1").unwrap().unwrap().host);
+        assert!(parse("--host").is_err(), "--host still needs --server");
+        assert!(parse("--host --server a:1 --script -").is_err());
+        assert!(parse("--host --server a:1 --count 2").is_err());
+    }
+
+    #[test]
+    fn view_targets_bots_on_other_freqs_and_never_teammates() {
+        let mut w = World::new(
+            oss_sim::TileMap::empty(),
+            oss_sim::ArenaSettings::sandbox(),
+            1,
+        );
+        // The bot, on freq 1.
+        let me = w.add_ship(1, 0, 1);
+        // Another bot (once named "Rex [bot]", a peer) on freq 2: an enemy.
+        let other_bot = w.add_ship(2, 0, 2);
+        // A pilot on the bot's own freq: a teammate, never a target.
+        w.add_ship(3, 0, 1);
+        let (mut enemies, mut shots) = (Vec::new(), Vec::new());
+        let v = view(&w, me, &mut enemies, &mut shots);
+        let want = px(w.ships[other_bot].pos);
+        assert_eq!(v.enemies.len(), 1);
+        assert_eq!(v.enemies[0].pos, want);
     }
 }
