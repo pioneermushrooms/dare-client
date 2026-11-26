@@ -267,12 +267,16 @@ const SIGNIN_WORDS = {
   chat: ["Sign in to chat", "Sign in"],
   account: ["Sign in", "Sign in"],
 };
+let flyAsGuest = false; // the sign-in box's "Fly as a guest" was chosen
 function askToSignIn(why = "fly") {
   const [title, button] = SIGNIN_WORDS[why] ?? SIGNIN_WORDS.fly;
   $("signin-title").textContent = title;
   $("signin-go").textContent = button;
   signinMsg.textContent = "";
   forgot.hidden = true;
+  flyAsGuest = false;
+  const guestBox = $("signin-guestbox");
+  if (guestBox) guestBox.hidden = why !== "fly"; // guests fly; they don't chat on the site
   dialog.showModal();
   $("signin-name").focus();
   return new Promise((resolve) => {
@@ -309,6 +313,11 @@ form.addEventListener("submit", async (event) => {
   }
 });
 $("signin-cancel").addEventListener("click", () => dialog.close());
+// A guest: the zone gives the name "guest" a fresh random GuestNNNN name, no password needed.
+$("signin-guest")?.addEventListener("click", () => {
+  flyAsGuest = true;
+  dialog.close();
+});
 
 // ---- the download ------------------------------------------------------------------------
 function say(text, isError = false) {
@@ -401,6 +410,11 @@ async function play() {
   say("");
   try {
     if (!me) await askToSignIn();
+    if (!me && flyAsGuest) {
+      await loadGame();
+      enter("guest", "guest", picker.value, "");
+      return;
+    }
     if (!me) return; // cancelled
     await loadGame();
     await globalThis.foundationChatLeave?.(); // the same name can't be in the zone twice
