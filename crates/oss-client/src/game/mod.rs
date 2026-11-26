@@ -5,6 +5,7 @@ pub mod arenas;
 pub mod art;
 pub mod balls;
 pub mod chat;
+pub mod custom_ships;
 pub mod default_map;
 pub mod flags;
 pub mod hud;

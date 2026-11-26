@@ -380,6 +380,19 @@ async function download() {
   return bytes;
 }
 
+// ---- the pilot's own ship graphics ----------------------------------------------------------
+// The page's Graphics overlay (Esc then G, or F8, in the game) uses these to show and replace
+// ships 1-8 for this player. A sheet is 40 square frames in 10 columns and 4 rows (360x144 for
+// stock ships): frame 0 at the top left is nose-up, then clockwise in 9 degree steps.
+function shareShips() {
+  globalThis.dareShips = {
+    set: (ship, sheetBytes) => game.set_custom_ship(ship, sheetBytes), // PNG or BMP bytes
+    clear: (ship) => game.clear_custom_ship(ship),
+    sheet: (ship) => game.ship_sheet(ship), // { width, height, rgba } or null before the game draws
+  };
+  globalThis.dispatchEvent(new Event("dare-ships-ready"));
+}
+
 // ---- Enter --------------------------------------------------------------------------------
 let loading = null; // the game's download and start-up, begun by the first Enter
 
@@ -391,6 +404,7 @@ function loadGame() {
     const bytes = await download();
     await glue.default({ module_or_path: bytes });
     game = glue;
+    shareShips();
     progress(100);
   })();
   loading.catch(() => { loading = null; button.classList.remove("downloading"); label.textContent = "Enter"; });
@@ -440,7 +454,7 @@ function enter(name, pass, arena, settings) {
     entry.hidden = true;
     document.body.classList.add("playing");
     const observer = new MutationObserver(() => {
-      const canvas = document.querySelector("canvas");
+      const canvas = document.querySelector("body > canvas"); // the game's (the page has others)
       if (canvas) {
         canvas.tabIndex = 0;
         canvas.focus();

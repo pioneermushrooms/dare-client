@@ -48,6 +48,56 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = globalThis, js_name = foundationLeaveZone, catch)]
     fn js_leave_zone(reason: Option<String>) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = foundationOpenGraphics, catch)]
+    fn js_open_graphics() -> Result<JsValue, JsValue>;
+}
+
+/// Asks the page to open its custom graphics overlay. False when the page has none.
+pub(crate) fn open_graphics() -> bool {
+    js_open_graphics().is_ok_and(|v| v.as_bool() != Some(false))
+}
+
+/// Uses `sheet` (a PNG or BMP of 40 square frames in 10 columns and 4 rows; frame
+/// 0 nose-up, then clockwise in 9 degree steps) for ship `ship` (1..8) for this
+/// player. The game picks it up on its next frame; before a visit, it is used
+/// from the start.
+#[wasm_bindgen]
+pub fn set_custom_ship(ship: u8, sheet: &[u8]) -> Result<(), JsValue> {
+    let img = oss_assets::decode_image(sheet).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    crate::game::custom_ships::set(slot(ship)?, Some(img)).map_err(|e| JsValue::from_str(&e))
+}
+
+/// Gives ship `ship` (1..8) back to the arena's or the game's own graphics.
+#[wasm_bindgen]
+pub fn clear_custom_ship(ship: u8) -> Result<(), JsValue> {
+    crate::game::custom_ships::set(slot(ship)?, None).map_err(|e| JsValue::from_str(&e))
+}
+
+/// The sheet ship `ship` (1..8) is drawn with now, as `{ width, height, rgba }`
+/// (laid out like [`set_custom_ship`]'s), or `null` before the game has built
+/// its graphics.
+#[wasm_bindgen]
+pub fn ship_sheet(ship: u8) -> Result<JsValue, JsValue> {
+    let Some(img) = crate::game::custom_ships::shown(slot(ship)?) else {
+        return Ok(JsValue::NULL);
+    };
+    let out = js_sys::Object::new();
+    js_sys::Reflect::set(&out, &"width".into(), &img.width.into())?;
+    js_sys::Reflect::set(&out, &"height".into(), &img.height.into())?;
+    js_sys::Reflect::set(
+        &out,
+        &"rgba".into(),
+        &js_sys::Uint8ClampedArray::from(&img.rgba[..]),
+    )?;
+    Ok(out.into())
+}
+
+fn slot(ship: u8) -> Result<usize, JsValue> {
+    match ship {
+        1..=8 => Ok(ship as usize - 1),
+        _ => Err(JsValue::from_str("ships are numbered 1 to 8")),
+    }
 }
 
 /// Set by [`start_dare_in`]: the page started this run, so leaving the zone goes

@@ -28,6 +28,10 @@ impl Sandbox {
                     self.toggle_spectator();
                     self.menu = false;
                 }
+                Action::Graphics => {
+                    self.open_graphics();
+                    self.menu = false;
+                }
                 _ => {}
             }
         }
@@ -59,6 +63,20 @@ impl Sandbox {
         if !self.menu {
             self.chat.scroll_to_bottom();
         }
+    }
+
+    /// G on the menu, or F8: the custom graphics overlay. The page that hosts
+    /// browser play draws it (it has the file picker and the pilot's shipyard)
+    /// and hands the chosen ship sheets back through `set_custom_ship`.
+    pub(super) fn open_graphics(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        if crate::web::open_graphics() {
+            return;
+        }
+        self.message(
+            "Custom graphics are in browser play at subspacefoundation.com.",
+            color::YELLOW,
+        );
     }
 
     /// Q on the menu, or `?quit`: leave the game and go back to the front end.
@@ -117,6 +135,7 @@ impl Sandbox {
         match choice {
             MenuChoice::Quit => self.request_leave(),
             MenuChoice::Options => self.open_settings = true,
+            MenuChoice::Graphics => self.open_graphics(),
             MenuChoice::Spectate => self.request_ship(SPECTATOR),
             MenuChoice::News => {
                 self.news_open = true;
@@ -249,6 +268,7 @@ impl Sandbox {
             keys.push((" N = Zone news", Stroke::press(KeyCode::KeyN).typing('n')));
         }
         keys.push((" O = Options", Stroke::press(KeyCode::KeyO).typing('o')));
+        keys.push((" G = Graphics", Stroke::press(KeyCode::KeyG).typing('g')));
         keys.push(("F12= Frame rate", Stroke::press(KeyCode::F12)));
         self.menu_spots.clear();
         // Spectator is a row under the eight ships, and it is there whether or
@@ -334,6 +354,8 @@ fn may_leave(in_a_fight: bool, energy: i32, max_energy: i32) -> bool {
 enum MenuChoice {
     Quit,
     Options,
+    /// Esc then G: the custom graphics overlay.
+    Graphics,
     Spectate,
     News,
     Ship(u8),
@@ -356,6 +378,7 @@ fn menu_choice(ch: char, has_news: bool, online: bool) -> Option<MenuChoice> {
     match ch.to_ascii_lowercase() {
         'q' => Some(MenuChoice::Quit),
         'o' => Some(MenuChoice::Options),
+        'g' => Some(MenuChoice::Graphics),
         's' => Some(MenuChoice::Spectate),
         'n' if has_news => Some(MenuChoice::News),
         'f' => Some(MenuChoice::FrameRate),
@@ -431,6 +454,8 @@ mod tests {
         // The rest of the menu, so that pulling this out changed nothing else.
         assert_eq!(menu_choice('q', false, false), Some(MenuChoice::Quit));
         assert_eq!(menu_choice('o', false, false), Some(MenuChoice::Options));
+        assert_eq!(menu_choice('g', false, false), Some(MenuChoice::Graphics));
+        assert_eq!(menu_choice('G', true, true), Some(MenuChoice::Graphics));
         assert_eq!(menu_choice('1', false, false), Some(MenuChoice::Ship(0)));
         assert_eq!(menu_choice('8', false, false), Some(MenuChoice::Ship(7)));
         assert_eq!(menu_choice('f', false, false), Some(MenuChoice::FrameRate));
