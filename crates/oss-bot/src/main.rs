@@ -10,6 +10,7 @@
 //! own thread with its own connection.
 
 mod brain;
+mod host;
 mod lineup;
 mod nav;
 mod script;
@@ -19,7 +20,6 @@ use oss_session::security::{Identities, SecurityMode, client_handshake, fingerpr
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,8 @@ use oss_sim::fixed::Rng;
 use oss_sim::{Event, Pos, ShipInput, ShipState, VEL_SCALE, World, toggle};
 
 use brain::{Brain, Contact, View};
-use lineup::{Change, Entry, Lineup, Seat};
+use host::{Host, Place, lineup_from_options};
+use lineup::{Entry, Seat};
 use nav::Nav;
 use script::Script;
 use talk::Talk;
@@ -564,9 +565,11 @@ impl Bot {
                     for name in present {
                         self.greet(&name, now);
                     }
-                    // Servers start you as a spectator; ask for the ship.
+                    // Servers start you as a spectator, or in the ship you logged
+                    // in with; ask for the one wanted now (spectator included: a
+                    // host may have unseated the bot while it was logging in).
                     let current = self.session.me().map(|p| p.ship).unwrap_or(SPECTATOR);
-                    if self.ship != SPECTATOR && current != self.ship {
+                    if current != self.ship {
                         self.session.set_ship(self.ship);
                     }
                     self.ask_freq();
@@ -987,61 +990,6 @@ fn view<'a>(
     }
 }
 
-/// Where a lineup's bots go: its arena (empty for any public one) and the
-/// arena owner they take flight orders from.
-#[derive(Clone)]
-struct Place {
-    arena: String,
-    controller: Option<String>,
-}
-
-impl Place {
-    fn of(lineup: &Lineup) -> Self {
-        Place {
-            arena: lineup.arena.clone(),
-            controller: lineup.controller.clone(),
-        }
-    }
-}
-
-/// The bots the options (and a `--script`) describe, as a lineup: one bot, or
-/// `--count` of them numbered.
-fn lineup_from_options(opts: &Options, script: Option<&Script>) -> Lineup {
-    let script = script.cloned().unwrap_or_default();
-    let ship = script.ship.unwrap_or(opts.ship);
-    let bots = (0..opts.count)
-        .map(|i| Entry {
-            name: script.name.clone().unwrap_or_else(|| {
-                if opts.count > 1 {
-                    format!("{}{}", opts.name, i + 1)
-                } else {
-                    opts.name.clone()
-                }
-            }),
-            password: script.password.clone().unwrap_or(opts.password.clone()),
-            seat: if ship == SPECTATOR {
-                Seat::Spectating
-            } else {
-                Seat::In
-            },
-            team: script.freq.unwrap_or(0),
-            script: Script {
-                ship: (ship != SPECTATOR).then_some(ship),
-                ..script.clone()
-            },
-        })
-        .collect();
-    Lineup {
-        arena: script
-            .arena
-            .clone()
-            .or(opts.arena.clone())
-            .unwrap_or_default(),
-        controller: script.controller.clone(),
-        bots,
-    }
-}
-
 /// Connects bot number `n` of a lineup: its own socket and session, and, when
 /// scripted (`--script` or `--host`), its brain and chat.
 fn start_bot(
@@ -1128,195 +1076,6 @@ fn start_bot(
         chatted: false,
         last_step_ms: 0,
     })
-}
-
-/// What the host tells a running bot.
-enum Order {
-    Seat(Seat),
-    Team(i16),
-    Controller(Option<String>),
-    Leave,
-}
-
-/// A bot the host runs: the way to tell it things, and its thread.
-struct Hosted {
-    name: String,
-    orders: Sender<Order>,
-    thread: std::thread::JoinHandle<()>,
-}
-
-/// A hosted bot's thread: connects, then works until told to leave (or the
-/// host goes away).
-fn run_hosted(
-    entry: Entry,
-    place: Place,
-    opts: Arc<Options>,
-    cache: Arc<MapCache>,
-    n: usize,
-    siblings: Siblings,
-    orders: Receiver<Order>,
-) {
-    let mut bot = match start_bot(&entry, &place, &opts, n, siblings) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!("[{}] {e}", entry.name);
-            return;
-        }
-    };
-    loop {
-        loop {
-            match orders.try_recv() {
-                Ok(Order::Seat(seat)) => bot.take_seat(seat),
-                Ok(Order::Team(team)) => bot.log(format_args!("the zone puts me on freq {team}")),
-                Ok(Order::Controller(c)) => {
-                    bot.controller = c;
-                    bot.flight_order = None;
-                }
-                Ok(Order::Leave) | Err(TryRecvError::Disconnected) => {
-                    bot.leave();
-                    bot.log("left");
-                    return;
-                }
-                Err(TryRecvError::Empty) => break,
-            }
-        }
-        // A closed bot waits for the host to restart or remove it.
-        let open = bot.step(&cache, opts.chat.as_deref());
-        std::thread::sleep(Duration::from_millis(if open { 5 } else { 50 }));
-    }
-}
-
-/// The bots `--host` runs, and the lineup they follow.
-struct Host {
-    opts: Arc<Options>,
-    cache: Arc<MapCache>,
-    siblings: Siblings,
-    current: Lineup,
-    bots: Vec<Hosted>,
-    started: usize,
-}
-
-impl Host {
-    fn new(opts: Arc<Options>, cache: Arc<MapCache>) -> Self {
-        Host {
-            opts,
-            cache,
-            siblings: Siblings::default(),
-            current: Lineup {
-                arena: String::new(),
-                controller: None,
-                bots: Vec::new(),
-            },
-            bots: Vec::new(),
-            started: 0,
-        }
-    }
-
-    /// Reads lineup messages from standard input, acting on each at its `done`,
-    /// until it closes; then every bot leaves.
-    fn run(&mut self, input: impl BufRead) {
-        let mut text = String::new();
-        for line in input.lines() {
-            let Ok(line) = line else { break };
-            text.push_str(&line);
-            text.push('\n');
-            if line.trim() != "done" {
-                continue;
-            }
-            match lineup::read(&std::mem::take(&mut text)) {
-                Ok(new) => self.follow(new),
-                // The last good lineup stays in force.
-                Err(e) => log::warn!("lineup ignored: {e}"),
-            }
-        }
-        log::info!("standard input closed; {} bot(s) leaving", self.bots.len());
-        for b in &self.bots {
-            let _ = b.orders.send(Order::Leave);
-        }
-        for b in self.bots.drain(..) {
-            let _ = b.thread.join();
-        }
-    }
-
-    /// Changes the running bots to match `new`.
-    fn follow(&mut self, new: Lineup) {
-        let changes = if new.arena.eq_ignore_ascii_case(&self.current.arena) {
-            if new.controller != self.current.controller {
-                for b in &self.bots {
-                    let _ = b.orders.send(Order::Controller(new.controller.clone()));
-                }
-            }
-            lineup::diff(&self.current, &new)
-        } else {
-            // Another arena: every bot goes again.
-            let names: Vec<String> = self.bots.iter().map(|b| b.name.clone()).collect();
-            for name in names {
-                self.stop(&name);
-            }
-            let empty = Lineup {
-                bots: Vec::new(),
-                ..new.clone()
-            };
-            lineup::diff(&empty, &new)
-        };
-        *self.siblings.lock().unwrap_or_else(|e| e.into_inner()) =
-            new.bots.iter().map(|e| e.name.clone()).collect();
-        let place = Place::of(&new);
-        for change in changes {
-            match change {
-                Change::Add(entry) => self.start(entry, &place),
-                Change::Remove(name) => self.stop(&name),
-                Change::Restart(entry) => {
-                    self.stop(&entry.name);
-                    self.start(entry, &place);
-                }
-                Change::Seat(name, seat) => self.tell(&name, Order::Seat(seat)),
-                Change::Team(name, team) => self.tell(&name, Order::Team(team)),
-            }
-        }
-        self.current = new;
-    }
-
-    fn start(&mut self, entry: Entry, place: &Place) {
-        let (orders, inbox) = mpsc::channel();
-        let name = entry.name.clone();
-        let (opts, cache, siblings) =
-            (self.opts.clone(), self.cache.clone(), self.siblings.clone());
-        let (place, n) = (place.clone(), self.started);
-        self.started += 1;
-        log::info!("[{name}] starting");
-        let spawned = std::thread::Builder::new()
-            .name(name.clone())
-            .spawn(move || run_hosted(entry, place, opts, cache, n, siblings, inbox));
-        match spawned {
-            Ok(thread) => self.bots.push(Hosted {
-                name,
-                orders,
-                thread,
-            }),
-            Err(e) => log::warn!("[{name}] couldn't start: {e}"),
-        }
-    }
-
-    /// Tells the bot to leave, and waits until it has.
-    fn stop(&mut self, name: &str) {
-        let Some(i) = self
-            .bots
-            .iter()
-            .position(|b| b.name.eq_ignore_ascii_case(name))
-        else {
-            return;
-        };
-        let b = self.bots.remove(i);
-        let _ = b.orders.send(Order::Leave);
-        let _ = b.thread.join();
-    }
-
-    fn tell(&self, name: &str, order: Order) {
-        if let Some(b) = self.bots.iter().find(|b| b.name.eq_ignore_ascii_case(name)) {
-            let _ = b.orders.send(order);
-        }
-    }
 }
 
 fn main() {
