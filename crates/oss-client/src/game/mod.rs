@@ -25,6 +25,7 @@ pub mod skin_view;
 pub mod start_spots;
 pub mod statbox;
 mod tracking;
+pub mod tutorial;
 pub mod view;
 pub mod voice;
 mod voice_table;

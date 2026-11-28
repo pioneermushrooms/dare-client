@@ -31,6 +31,7 @@ use super::lvz::{Lvz, ScreenRefs};
 use super::online::Online;
 use super::start_spots::Rect;
 use super::statbox::{self, StatBox};
+use super::tutorial::{self, Hint, HudPart};
 use super::view::{self, Canvas, color};
 use super::voice;
 use crate::audio::Audio;
@@ -237,6 +238,9 @@ pub struct Sandbox {
     /// so they pop off the end. They go through [`Sandbox::send_chat_line`], the same
     /// path a typed line takes, so a scripted `?go` is a real `?go`.
     pub scripted: Vec<(f32, String)>,
+    /// Parts of the HUD the zone's tutorial has just uncovered, and when (game
+    /// clock): each glows for [`hud::REVEAL_GLOW_SECS`].
+    pub(super) reveals: Vec<(HudPart, f32)>,
 }
 
 /// Sounds the game uses, loaded up front.
@@ -376,6 +380,7 @@ impl Sandbox {
             .find(|&k| k != SPECTATOR)
             .unwrap_or(0);
         s.spec_cam = (8192.0, 8192.0);
+        s.announce_tutorial_client();
         if s.is_replay() {
             s.message(
                 "Playing a replay. Arrows move the camera, Ctrl follows the stat box selection.",
@@ -383,7 +388,10 @@ impl Sandbox {
             );
             s.chat_help_due = false;
         } else {
-            s.message(format!("Entered arena {arena}."), color::GREEN);
+            s.message(
+                format!("Entered arena {}.", arenas::shown_name(&arena)),
+                color::GREEN,
+            );
             // Said here as well as in `?status`, because a session that quietly
             // fell back to VIE is exactly the thing a player should not have to
             // think to ask about.
@@ -500,6 +508,7 @@ impl Sandbox {
             spec_xradar: false,
             aim_bot: false,
             scripted: Vec::new(),
+            reveals: Vec::new(),
         };
         if s.me().is_alive() {
             s.spawn_warp_effect();
@@ -698,10 +707,43 @@ impl Sandbox {
     }
 
     /// Adds a chat line that arrived (or was echoed) as chat type `kind`.
+    /// A tutorial hint line from the zone goes to the page instead (see
+    /// [`tutorial`]).
     fn chat_message(&mut self, kind: u8, sender: Option<String>, text: impl Into<String>) {
-        let text = text.into();
-        log::debug!("message: {text}");
-        self.chat.push(Message::received(kind, sender, text));
+        if let Some(hint) = tutorial::log_or_hint(&mut self.chat, kind, sender, text.into()) {
+            self.tutorial_hint(&hint);
+        }
+    }
+
+    /// A tutorial hint line: the page shows it, and a `reveal` glows round the
+    /// part of the HUD it uncovered.
+    fn tutorial_hint(&mut self, line: &str) {
+        match tutorial::parse_hint(line) {
+            Some(Hint::Reveal(part)) => {
+                self.reveals.retain(|(p, _)| *p != part);
+                self.reveals.push((part, self.clock));
+            }
+            Some(Hint::Say { step, of, text }) => {
+                log::debug!("tutorial step {step} of {of}: {text}");
+            }
+            Some(Hint::Prompt(prompt)) => log::debug!("tutorial prompt: {prompt:?}"),
+            Some(Hint::End { list }) => {
+                log::debug!("tutorial over (arena list: {list})");
+                self.reveals.clear();
+            }
+            None => log::debug!("tutorial hint this client doesn't read: {line}"),
+        }
+        #[cfg(target_arch = "wasm32")]
+        crate::web::tutorial_hint(line);
+    }
+
+    /// Browser play shows the zone's tutorial on the page, so the zone is told so
+    /// on every arena entry; the desktop build doesn't say it, and gets the zone's
+    /// LVZ version instead.
+    fn announce_tutorial_client(&mut self) {
+        if cfg!(target_arch = "wasm32") && self.online() && !self.is_replay() {
+            self.send_chat_line(tutorial::CLIENT_COMMAND);
+        }
     }
 
     fn spawn_warp_effect(&mut self) {
@@ -751,6 +793,14 @@ impl Sandbox {
                 self.send_chat_line(&line);
             }
         }
+        // The page's tutorial buttons, sent the way a typed line is.
+        for line in tutorial::take_commands() {
+            if self.online() {
+                self.send_chat_line(&line);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        tutorial::note_keys(&input.bindings);
 
         let mut edges = input.take_edges();
         let mods = (input.shift(), input.ctrl());
@@ -2257,6 +2307,11 @@ impl Sandbox {
             self.attachments.len(),
         );
         self.arena_change = true;
+        // Whatever the tutorial was showing belongs to the arena being left: a
+        // `?go` out of it gets no `end` line from the zone.
+        self.reveals.clear();
+        #[cfg(target_arch = "wasm32")]
+        crate::web::tutorial_left_arena();
         // Who may edit settings is a question for each arena.
         self.arena_settings = None;
         self.arena_settings_open = false;
@@ -2383,7 +2438,11 @@ impl Sandbox {
             self.world.ships.len(),
             self.map_revision,
         );
-        self.message(format!("Entered arena {arena}."), color::GREEN);
+        self.message(
+            format!("Entered arena {}.", arenas::shown_name(&arena)),
+            color::GREEN,
+        );
+        self.announce_tutorial_client();
     }
 
     /// Adds an LVZ file's objects (logged and skipped if it doesn't parse).
@@ -2788,6 +2847,8 @@ impl Sandbox {
         self.draw_log(&ui, r);
         self.lvz.draw(layer::AFTER_CHAT, &c, &ui, r, clock, &refs);
         self.lvz.draw(layer::TOP_MOST, &c, &ui, r, clock, &refs);
+        // Over the covers the tutorial has just taken off.
+        hud::draw_reveals(self, &ui, r);
         self.draw_arena_list(&ui, r);
         if self.menu {
             self.draw_menu(&ui, r);

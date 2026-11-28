@@ -507,6 +507,21 @@ function shareShips() {
     useOwn: (on) => game.use_own_graphics(!!on),
   };
   globalThis.dispatchEvent(new Event("dare-ships-ready"));
+  // The zone's tutorial: the page's mentor box sends its buttons' commands (?skip, ?leave,
+  // ?tutorial, ?go <arena>; nothing else is taken) and asks how the player's keys read
+  // ("gun" -> "Ctrl"). The game hands it the hint lines through globalThis.foundationTutorial.
+  globalThis.dareTutorial = {
+    command: (line) => game.tutorial_command(line),
+    keyFor: (action) => game.key_for(action),
+  };
+}
+
+// A guest who has been through the tutorial says so when logging in, so the zone doesn't start
+// it again (the page sets the key when a tutorial ends).
+const TUTORIAL_DONE_KEY = "dare.tutorial.done";
+function guestPassword() {
+  try { if (localStorage.getItem(TUTORIAL_DONE_KEY)) return "guest:done"; } catch {}
+  return "guest";
 }
 
 // ---- Enter --------------------------------------------------------------------------------
@@ -559,7 +574,7 @@ async function play() {
     if (!me) await askToSignIn();
     if (!me && flyAsGuest) {
       await loaded;
-      enter("guest", "guest", picker.value, "");
+      enter("guest", guestPassword(), picker.value, "");
       return;
     }
     if (!me) { // cancelled: the download carries on unseen

@@ -52,6 +52,9 @@ extern "C" {
     #[wasm_bindgen(js_namespace = globalThis, js_name = foundationOpenGraphics, catch)]
     fn js_open_graphics() -> Result<JsValue, JsValue>;
 
+    #[wasm_bindgen(js_namespace = globalThis, js_name = foundationTutorial, catch)]
+    fn js_tutorial(line: &str) -> Result<(), JsValue>;
+
     #[wasm_bindgen(js_namespace = globalThis, js_name = dareCacheSave, catch)]
     fn js_cache_save(name: &str, data: &[u8]) -> Result<(), JsValue>;
 
@@ -68,6 +71,33 @@ extern "C" {
 /// is fine: nothing happens.
 pub(crate) fn loading_stage(stage: &str, detail: &str, percent: i32) {
     let _ = js_loading_stage(stage, detail, percent);
+}
+
+/// Hands the page a hint line from the zone's tutorial, prefix and all (see
+/// [`crate::game::tutorial`]), for its mentor box. A page without the hook is fine.
+pub(crate) fn tutorial_hint(line: &str) {
+    let _ = js_tutorial(line);
+}
+
+/// Tells the page the player is leaving the arena (an empty line), which ends
+/// whatever its tutorial box was showing there.
+pub(crate) fn tutorial_left_arena() {
+    let _ = js_tutorial("");
+}
+
+/// Sends one of the tutorial box's commands to the zone, as if the player typed
+/// it: `?skip`, `?leave`, `?tutorial` or `?go <arena>`, and nothing else.
+#[wasm_bindgen]
+pub fn tutorial_command(cmd: &str) -> Result<(), JsValue> {
+    crate::game::tutorial::queue_command(cmd).map_err(|e| JsValue::from_str(&e))
+}
+
+/// How the player's keys for `action` read (an action name from the settings
+/// file's `[keys]`, e.g. `gun` or `afterburner`), for the tutorial box to put in
+/// its `{action}` placeholders. Empty for a name that is no action.
+#[wasm_bindgen]
+pub fn key_for(action: &str) -> String {
+    crate::game::tutorial::key_for(action)
 }
 
 /// Asks the page to open its custom graphics overlay. False when the page has none.

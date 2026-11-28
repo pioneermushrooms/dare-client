@@ -19,7 +19,7 @@ impl Sandbox {
             if arena.is_empty() {
                 "Entering a public arena...".to_string()
             } else {
-                format!("Entering arena {arena}...")
+                format!("Entering arena {}...", super::arenas::shown_name(arena))
             },
             color::GREEN,
         );

@@ -8,6 +8,7 @@ use oss_sim::{Ship, TileMap, cap, ship::active, tile, toggle};
 use super::art::{Art, anim_frame};
 use super::lvz::ScreenRefs;
 use super::sandbox::Sandbox;
+use super::tutorial::HudPart;
 use super::view::{Canvas, color};
 use crate::gfx::{Region, Renderer, TextureId};
 
@@ -201,6 +202,111 @@ pub fn screen_refs(
         (w - 26.0, top),
         (w - 26.0, top + 6.0 * 25.0),
     ]
+}
+
+/// How long a part of the HUD the tutorial uncovers glows for.
+pub const REVEAL_GLOW_SECS: f32 = 3.0;
+
+/// Where a part of the HUD is, as rectangles `(x, y, w, h)` in interface pixels,
+/// read off this frame's anchors (`refs`, see [`screen_refs`]) so the outline
+/// sits wherever the part is drawn. `radar` is the small radar's side and
+/// `bar_half` half the energy bar as drawn. Empty for the player list while it
+/// is closed.
+pub(super) fn reveal_rects(
+    part: HudPart,
+    refs: &ScreenRefs,
+    radar: f32,
+    bar_half: f32,
+) -> Vec<(f32, f32, f32, f32)> {
+    let at = |i: u8| refs[usize::from(i)];
+    match part {
+        HudPart::Radar => {
+            let (x, y) = at(reference::RADAR_TOP_LEFT);
+            vec![(x, y, radar, radar)]
+        }
+        HudPart::Energy => {
+            let (cx, below) = at(reference::BELOW_ENERGY);
+            vec![(cx - bar_half, 0.0, 2.0 * bar_half, below)]
+        }
+        HudPart::Statbox => {
+            let (w, h) = at(reference::STATS_BOX);
+            if w > 0.0 && h > 0.0 {
+                vec![(0.0, 0.0, w, h)]
+            } else {
+                Vec::new()
+            }
+        }
+        HudPart::Items => {
+            let (sw, top) = at(reference::SPECIALS_TOP_RIGHT);
+            let bottom = at(reference::SPECIALS_BOTTOM_RIGHT).1;
+            let (wx, wtop) = at(reference::WEAPONS_TOP_LEFT);
+            let wbottom = at(reference::WEAPONS_BOTTOM_LEFT).1;
+            let (view_w, _) = at(reference::BOTTOM_RIGHT);
+            vec![
+                (0.0, top, sw, bottom - top),
+                (wx, wtop, view_w - wx, wbottom - wtop),
+            ]
+        }
+        HudPart::Chat => {
+            let (x, top) = at(reference::CHAT_TOP_LEFT);
+            let (_, view_h) = at(reference::BOTTOM_RIGHT);
+            // Up to the radar, which has its own outline.
+            let right = at(reference::RADAR_TOP_LEFT).0 - RADAR_MARGIN;
+            vec![(x, top, right - x, view_h - top)]
+        }
+    }
+}
+
+/// Outlines the parts of the HUD the tutorial has just uncovered, pulsing and
+/// fading out over [`REVEAL_GLOW_SECS`].
+pub fn draw_reveals(s: &mut Sandbox, c: &Canvas, r: &mut Renderer) {
+    let clock = s.clock;
+    s.reveals
+        .retain(|(_, at)| clock - at < REVEAL_GLOW_SECS && clock >= *at);
+    let bar_half = gauge(c.view_w, statbox_right(s))
+        .bar_half
+        .unwrap_or(FRAME_HALF);
+    for &(part, at) in &s.reveals {
+        let t = clock - at;
+        let pulse = 0.6 + 0.4 * (t * std::f32::consts::TAU * 1.5).cos();
+        let fade = (1.0 - t / REVEAL_GLOW_SECS).clamp(0.0, 1.0).sqrt();
+        let a = pulse * fade;
+        for (x, y, w, h) in reveal_rects(part, &s.screen_refs, radar_dim(c), bar_half) {
+            // A bright line round the part, and a softer one outside it.
+            outline(
+                c,
+                r,
+                x - 1.0,
+                y - 1.0,
+                w + 2.0,
+                h + 2.0,
+                2.0,
+                [1.0, 0.9, 0.3, a],
+            );
+            outline(
+                c,
+                r,
+                x - 3.0,
+                y - 3.0,
+                w + 6.0,
+                h + 6.0,
+                1.0,
+                [1.0, 0.8, 0.2, a * 0.4],
+            );
+        }
+    }
+}
+
+/// A rectangle's border, `t` thick, inside `(x, y, w, h)`.
+#[allow(clippy::too_many_arguments)]
+fn outline(c: &Canvas, r: &mut Renderer, x: f32, y: f32, w: f32, h: f32, t: f32, rgba: [f32; 4]) {
+    if w <= 2.0 * t || h <= 2.0 * t {
+        return;
+    }
+    c.rect(r, x, y, w, t, rgba);
+    c.rect(r, x, y + h - t, w, t, rgba);
+    c.rect(r, x, y + t, t, h - 2.0 * t, rgba);
+    c.rect(r, x + w - t, y + t, t, h - 2.0 * t, rgba);
 }
 
 /// Half the energy bar, at the client area it was measured on.
@@ -849,6 +955,43 @@ pub fn radar_image(map: &TileMap, dim: u32) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::game::statbox;
+
+    /// Each part's outline is read off the anchors, so it follows the HUD.
+    #[test]
+    fn reveal_outlines_sit_on_their_anchors() {
+        let mut refs: ScreenRefs = [(0.0, 0.0); 12];
+        refs[2] = (800.0, 600.0);
+        refs[3] = (200.0, 90.0);
+        refs[4] = (26.0, 240.0);
+        refs[5] = (26.0, 415.0);
+        refs[6] = (400.0, 28.0);
+        refs[7] = (0.0, 470.0);
+        refs[8] = (660.0, 460.0);
+        refs[10] = (774.0, 240.0);
+        refs[11] = (774.0, 390.0);
+        assert_eq!(
+            reveal_rects(HudPart::Radar, &refs, 134.0, 240.0),
+            [(660.0, 460.0, 134.0, 134.0)]
+        );
+        assert_eq!(
+            reveal_rects(HudPart::Energy, &refs, 134.0, 240.0),
+            [(160.0, 0.0, 480.0, 28.0)]
+        );
+        assert_eq!(
+            reveal_rects(HudPart::Statbox, &refs, 134.0, 240.0),
+            [(0.0, 0.0, 200.0, 90.0)]
+        );
+        assert_eq!(
+            reveal_rects(HudPart::Items, &refs, 134.0, 240.0),
+            [(0.0, 240.0, 26.0, 175.0), (774.0, 240.0, 26.0, 150.0)]
+        );
+        assert_eq!(
+            reveal_rects(HudPart::Chat, &refs, 134.0, 240.0),
+            [(0.0, 470.0, 654.0, 130.0)]
+        );
+        refs[3] = (0.0, 0.0);
+        assert!(reveal_rects(HudPart::Statbox, &refs, 134.0, 240.0).is_empty());
+    }
 
     /// Every view the player list can be in, laid out the way the game lays it out,
     /// each with the right edge the game would publish for it (`statbox_right`).

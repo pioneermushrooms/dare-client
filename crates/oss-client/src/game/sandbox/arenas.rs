@@ -89,13 +89,25 @@ fn row_text(a: &ArenaListed) -> (String, String) {
 
 /// A public arena's name is its number (`0`, `1`, ...), which Continuum's list
 /// shows as `(Public 0)`. Going there still uses the number, which is what the
-/// zone knows it by.
-fn shown_name(name: &str) -> String {
+/// zone knows it by. The zone's tutorial runs in numbered copies of one private
+/// arena (`#training1`, `#training2`, ...), each of them just `Training` to the
+/// player in it.
+pub(super) fn shown_name(name: &str) -> String {
     if !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()) {
         format!("(Public {name})")
+    } else if is_training(name) {
+        "Training".to_string()
     } else {
         name.to_string()
     }
+}
+
+/// `#training` followed by a number, in any case.
+fn is_training(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower
+        .strip_prefix("#training")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Which rows are drawn, as a range of indices: all of them when they fit, and
@@ -324,6 +336,16 @@ mod tests {
         assert_eq!(shown_name("12"), "(Public 12)");
         assert_eq!(shown_name("duel2"), "duel2");
         assert_eq!(shown_name(""), "");
+    }
+
+    /// Every copy of the tutorial's arena is shown as `Training`.
+    #[test]
+    fn a_tutorial_arena_is_shown_as_training() {
+        assert_eq!(shown_name("#training1"), "Training");
+        assert_eq!(shown_name("#Training12"), "Training");
+        assert_eq!(shown_name("#training"), "#training");
+        assert_eq!(shown_name("#trainingx"), "#trainingx");
+        assert_eq!(shown_name("training1"), "training1");
     }
 
     /// A zone with more arenas than the box holds scrolls, keeping the chosen
