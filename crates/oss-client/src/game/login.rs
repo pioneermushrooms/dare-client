@@ -25,7 +25,7 @@ use winit::keyboard::KeyCode;
 
 use super::input::Stroke;
 use super::online::ServerOptions;
-use oss_session::SPECTATOR;
+use oss_session::{MAX_NAME, SPECTATOR, name_refusal};
 
 pub const FILE_NAME: &str = "login.ini";
 const MAX_FIELD: usize = 64;
@@ -277,6 +277,28 @@ impl Login {
         l
     }
 
+    /// The form exactly as a straight-in `--server` start would have connected:
+    /// its zone, name, arena and ship, and nothing kept in `login.ini` from the
+    /// last time the form was used.
+    ///
+    /// [`Login::load`] lays the command line over `login.ini`, which is right for
+    /// a form the player fills in but not for one that plays by itself: an arena
+    /// typed last time for another zone would be entered here without anyone
+    /// asking for it.
+    pub fn as_command_line(&mut self, z: &ServerOptions) {
+        self.server = z.server.chars().take(MAX_FIELD).collect();
+        self.name = z.name.chars().take(MAX_FIELD).collect();
+        self.arena = z
+            .arena
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(MAX_FIELD)
+            .collect();
+        self.ship = z.ship;
+        self.focus = usize::from(!self.name.is_empty());
+    }
+
     /// Remembers everything but the password.
     pub fn save(&self, path: &Path) {
         let text = format!(
@@ -498,10 +520,16 @@ impl Login {
             // zones instead of moving on to the next field. Read per stroke:
             // the stroke before this one may have moved the focus.
             let on_list = self.focused() == Field::Zones;
+            // The name box stops where SubSpace 1.34's does.
+            let max = if self.focused() == Field::Name {
+                MAX_NAME
+            } else {
+                MAX_FIELD
+            };
             if let Some(c) = stroke.text
                 && let Some(t) = self.text_mut()
                 && !c.is_control()
-                && t.chars().count() < MAX_FIELD
+                && t.chars().count() < max
             {
                 t.push(c);
             }
@@ -607,6 +635,20 @@ impl Login {
         }
         if self.name.trim().is_empty() {
             self.error = Some("Enter a name".into());
+            self.focus_on(Field::Name);
+            return None;
+        }
+        // Typing stops at the limit, but a name can arrive longer from
+        // `login.ini` or the settings file. It is shown whole and refused
+        // here, not cut short, because a shorter name is someone else's.
+        if self.name.trim().chars().count() > MAX_NAME {
+            self.error = Some(format!("A name is at most {MAX_NAME} characters"));
+            self.focus_on(Field::Name);
+            return None;
+        }
+        // What SubSpace 1.34's own form refuses, in its words.
+        if let Some(why) = name_refusal(self.name.trim()) {
+            self.error = Some(why.into());
             self.focus_on(Field::Name);
             return None;
         }
@@ -725,6 +767,32 @@ mod tests {
         ];
         l.input(&held, false);
         assert_eq!(l.name, "", "a held Backspace clears the field");
+    }
+
+    /// An Enter still down from answering something in another window --
+    /// whatever was answered to bring this one up -- is reported by the window,
+    /// as it gains the focus, as a press it made up. Taken as a keystroke it
+    /// pressed Play the moment the form appeared, before a saved password could
+    /// be filled in. Held, it presses nothing; pressed again here, it plays.
+    #[test]
+    fn an_enter_held_from_another_window_does_not_press_play() {
+        use super::super::input::InputState;
+        let mut l = Login::load(None, Some("Pilot"), Box::new(Login::default().into_base()));
+        let mut input = InputState::default();
+
+        input.window_key(Some(KeyCode::Enter), "\r", true, false, true);
+        assert_eq!(l.input(&input.take_strokes(), false), None, "no Play");
+        assert!(input.held(KeyCode::Enter), "but it is down");
+
+        input.window_key(Some(KeyCode::Enter), "", false, false, false);
+        input.window_key(Some(KeyCode::Enter), "\r", true, false, false);
+        assert!(
+            matches!(
+                l.input(&input.take_strokes(), false),
+                Some(Choice::Connect(_))
+            ),
+            "pressed in this window, Enter plays"
+        );
     }
 
     /// The other half of one keystroke being one thing: a Backspace lands where
@@ -852,7 +920,11 @@ mod tests {
             follow: Some("Someone".into()),
             attach: Some("Teammate".into()),
             record: Some(PathBuf::from("visit.ossr")),
-            security: oss_session::security::SecurityMode::OpenSec,
+            security: oss_session::security::SecurityMode::parse(
+                "opensec",
+                &oss_session::security::MechanismRegistry::builtin(),
+            )
+            .unwrap(),
             known_servers: Some(PathBuf::from("known.txt")),
             identities: Some(PathBuf::from("ids.txt")),
             new_user: true,
@@ -1045,6 +1117,39 @@ mod tests {
         );
     }
 
+    /// A `--server` start with no password opens the form and lets it play by
+    /// itself. That form must send what straight in would have sent: not the
+    /// arena, name or ship left in `login.ini` from the last time the form was
+    /// used for some other zone.
+    #[test]
+    fn the_command_lines_form_carries_nothing_left_over_in_login_ini() {
+        let dir = std::env::temp_dir().join(format!("oss-login-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ini = dir.join("login.ini");
+        std::fs::write(
+            &ini,
+            "server = 127.0.0.1:7000\nname = Other\narena = leftover\nship = 3\n",
+        )
+        .expect("login.ini");
+        let z = ServerOptions {
+            server: "127.0.0.1:5000".into(),
+            name: "Pilot".into(),
+            ..Login::default().into_base()
+        };
+        let mut l = Login::load(Some(&ini), None, Box::new(z.clone()));
+        assert_eq!(l.arena, "leftover", "the form a player fills in keeps it");
+        l.as_command_line(&z);
+        let Some(Choice::Connect(o)) = l.play() else {
+            panic!("expected connect");
+        };
+        assert_eq!(
+            (o.server.as_str(), o.name.as_str(), o.arena, o.ship),
+            ("127.0.0.1:5000", "Pilot", None, SPECTATOR),
+            "what --server --name sent straight in"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Both ship fallbacks are spectator.
     ///
     /// The form used to default to 0 while the `ServerOptions` it carries
@@ -1101,6 +1206,54 @@ mod tests {
         assert_eq!(Login::load(Some(&ini), None, base()).ship, SPECTATOR);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SubSpace 1.34's name box stops at 23 characters, and so does this one.
+    /// The password box does not, because it is not a name. A longer name that
+    /// arrives from the settings is shown whole and refused at Enter, not cut
+    /// short into somebody else's.
+    #[test]
+    fn the_name_box_stops_at_23_characters() {
+        let mut l = Login::load(None, None, Box::new(Login::default().into_base()));
+        assert_eq!(l.focused(), Field::Name);
+        l.input(&strokes(&[], "Abcdefghijklmnopqrs1234567890"), false);
+        assert_eq!(l.name, "Abcdefghijklmnopqrs1234");
+        l.input(&strokes(&[KeyCode::Tab], ""), false);
+        assert_eq!(l.focused(), Field::Password);
+        l.input(&strokes(&[], "a password of thirty letters.."), false);
+        assert_eq!(l.password.chars().count(), 30);
+
+        let mut l = Login::load(
+            None,
+            Some("Abcdefghijklmnopqrs12345"),
+            Box::new(Login::default().into_base()),
+        );
+        assert_eq!(l.name.chars().count(), 24, "shown whole");
+        assert_eq!(l.input(&strokes(&[KeyCode::Enter], ""), false), None);
+        assert_eq!(l.error.as_deref(), Some("A name is at most 23 characters"));
+        assert_eq!(l.focused(), Field::Name);
+        l.input(&strokes(&[KeyCode::Backspace], ""), false);
+        assert!(matches!(
+            l.input(&strokes(&[KeyCode::Enter], ""), false),
+            Some(Choice::Connect(_))
+        ));
+    }
+
+    /// SubSpace 1.34's own form refuses a name with a colon in it, and one
+    /// that starts with a symbol, in these words; so does this one. Anything
+    /// else that box takes goes through, `%` and `,` included.
+    #[test]
+    fn a_colon_or_a_leading_symbol_is_refused_as_subspace_134_does() {
+        for (name, why) in [
+            ("Ab:cd", Some("Player name cannot contain a colon.")),
+            ("_Abcd", Some("Player name cannot start with a symbol.")),
+            ("Mr,Ed%", None),
+        ] {
+            let mut l = Login::load(None, Some(name), Box::new(Login::default().into_base()));
+            let played = l.input(&strokes(&[KeyCode::Enter], ""), false);
+            assert_eq!(l.error.as_deref(), why, "{name:?}");
+            assert_eq!(played.is_some(), why.is_none(), "{name:?}");
+        }
     }
 
     #[test]

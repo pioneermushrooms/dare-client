@@ -4,15 +4,30 @@
 //! [`options`] is the whole of it -- parse the arguments, read the settings file,
 //! and hand back an [`crate::Options`] ready for [`crate::run`]. The binary in
 //! this crate is a dozen lines on top of it, and a build outside this repository
-//! can be the same (see the crate documentation).
+//! can be the same, with [`options_with`] (see the crate documentation).
 
 use std::path::PathBuf;
 
-use crate::game::online::ServerOptions;
+use oss_session::security::{MechanismRegistry, SecurityMode};
+
+use crate::game::online::{ServerOptions, Supplied};
 use crate::{app, config, game};
 
-/// The `--help` text.
-pub const USAGE: &str = "\
+/// The `--help` text for the mechanisms in `mechanisms`: the words
+/// `--security` accepts, and the order `auto` tries, are read from them.
+pub fn usage(mechanisms: &MechanismRegistry) -> String {
+    let security = oss_session::security::usage(mechanisms, SECURITY_NOTES, 28, 80);
+    USAGE.replace("{security}", &security)
+}
+
+/// What the client says about `--security` that the bot does not.
+const SECURITY_NOTES: &str = "With a server's key on record (known_servers.txt), \
+     auto uses that key's mechanism alone and never steps down from it; a mechanism \
+     named here wins over the key. The settings file's [network] security takes the \
+     same words.";
+
+/// The `--help` text, with `{security}` for the part read from the mechanisms.
+const USAGE: &str = "\
 Usage: oss-client [options]                (login screen)
        oss-client --server <host:port> --name <name> [options]
        oss-client --sandbox [map.lvl] [options]
@@ -20,7 +35,10 @@ Usage: oss-client [options]                (login screen)
 Play online:
   --server <host:port>      Zone to join
   --name <name>             Player name (default: from the settings file)
-  --password <pw>           Password (default empty)
+  --password <pw>           Password. Without it, the password saved for this
+                            name and zone is used; with none saved, the start-up
+                            screen opens filled in for you to type it. An empty
+                            --password \"\" goes straight in with no password
   --arena <name>            Arena to enter (default: any public arena)
   --new-user                When the zone offers to create a name it does not
                             know, say yes without asking: for scripted runs.
@@ -79,11 +97,7 @@ Options:
   --directory <host:port>   A directory server for the start-up screen's zone list
                             (repeatable; adds to the settings file's)
   --zones                   Start with the zone list selected
-  --security <mode>         auto (OpenSec, falling back to VIE), opensec, vie,
-                            or none. The none mode sends your password in the
-                            clear and only works against a server set to allow
-                            it: it is for development, and nothing selects it
-                            for you
+  --security <mode>         {security}
   --config <file>           Settings file, which must already exist; only the
                             default is written for you (oss-client.ini in the
                             user's settings folder)
@@ -114,20 +128,39 @@ pub fn init_logging() {
 /// the settings file filled in behind them, or `None` for `--help`.
 ///
 /// This is what the binary in this crate does before [`crate::run`], and the first
-/// half of what any other binary on this library has to do.
+/// half of what any other binary on this library has to do. It is
+/// [`options_with`] and this repository's own mechanisms and client.
 pub fn options(args: impl Iterator<Item = String>) -> Result<Option<app::Options>, String> {
-    let Some(mut opts) = parse_args(args)? else {
+    options_with(args, Supplied::default())
+}
+
+/// [`options`], for a build that supplies mechanisms or a client of its own.
+///
+/// The mechanisms are registered in `supplied` **before** the arguments are read,
+/// because they decide what `--security` and the settings file accept: a
+/// registered mechanism is a word both take, it is in the automatic order at its
+/// place by strength, and [`usage`] lists it. `supplied` ends up in
+/// [`crate::Options::supplied`].
+pub fn options_with(
+    args: impl Iterator<Item = String>,
+    supplied: Supplied,
+) -> Result<Option<app::Options>, String> {
+    let Some(mut opts) = parse_args(args, &supplied.mechanisms)? else {
         return Ok(None);
     };
+    opts.supplied = supplied;
     apply_config(&mut opts)?;
     Ok(Some(opts))
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>, String> {
+fn parse_args(
+    args: impl Iterator<Item = String>,
+    mechanisms: &MechanismRegistry,
+) -> Result<Option<app::Options>, String> {
     let mut map = None;
     let mut server = None;
     let mut name = None;
-    let mut password = String::new();
+    let mut password: Option<String> = None;
     let mut arena = None;
     let mut new_user = false;
     let mut ship: Option<u8> = None;
@@ -170,8 +203,8 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
             }
             "--assets-dir" => assets_dir = Some(PathBuf::from(value("--assets-dir")?)),
             "--server" => server = Some(value("--server")?),
-            "--name" => name = Some(value("--name")?),
-            "--password" => password = value("--password")?,
+            "--name" => name = Some(name_fits(value("--name")?, "--name")?),
+            "--password" => password = Some(value("--password")?),
             "--arena" => arena = Some(value("--arena")?),
             "--new-user" => new_user = true,
             "--freq" => {
@@ -370,10 +403,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
             "--directory" => directories.push(value("--directory")?),
             "--zones" => open_zones = true,
             "--security" => {
-                security = Some(
-                    oss_session::security::SecurityMode::from_name(&value("--security")?)
-                        .ok_or("--security must be auto, opensec, vie or none")?,
-                )
+                let word = value("--security")?;
+                security = Some(SecurityMode::parse(&word, mechanisms).map_err(|_| {
+                    format!(
+                        "--security must be {}, not `{word}`",
+                        oss_session::security::words(mechanisms)
+                    )
+                })?)
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -414,11 +450,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
             palette: Default::default(),
             ui_scale: 0,
             directories: directories.clone(),
-            security: security.unwrap_or_default(),
+            security: security.clone().unwrap_or_default(),
             security_from_cli: security.is_some(),
-            // The command line cannot name a handshake or a client that is not
-            // in this repository; a build that has them sets this after
-            // `options` returns.
+            // Replaced by `options_with` with what was supplied.
             supplied: Default::default(),
             identity: true,
             open_zones,
@@ -427,8 +461,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
             player_name: None,
             login_file: None,
             saved: Default::default(),
+            form_plays_itself: false,
         }));
     }
+    let mut form_plays_itself = false;
     let mode = match (sandbox, server) {
         (true, Some(_)) => return Err("use either --sandbox or --server, not both".into()),
         (true, None) => {
@@ -447,19 +483,29 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
                 server: server.unwrap_or_default(),
                 // Filled from the settings file if not given; checked in `apply_config`.
                 name: name.unwrap_or_default(),
-                password,
+                password: password.clone().unwrap_or_default(),
                 arena,
                 ship: ship.unwrap_or(oss_session::SPECTATOR),
                 freq,
                 follow,
                 attach,
                 record,
-                security: security.unwrap_or_default(),
+                security: security.clone().unwrap_or_default(),
                 known_servers: None,
                 identities: None,
                 new_user,
             });
+            // A zone named with no password goes by way of the start-up screen,
+            // filled in, which plays by itself once the password store has
+            // looked up the one saved for that name and zone -- and stays put
+            // for it to be typed when there is none. Straight in, it sent an
+            // empty password unasked: a refusal at best, and a wrong try towards
+            // the zone's lock-out at worst. `--password ""` still goes straight
+            // in, for a zone that wants none.
             if opts.server.is_empty() {
+                app::Mode::Login(opts)
+            } else if password.is_none() {
+                form_plays_itself = true;
                 app::Mode::Login(opts)
             } else {
                 app::Mode::Zone(opts)
@@ -492,11 +538,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
         palette: Default::default(),
         ui_scale: 0,
         directories,
-        security: security.unwrap_or_default(),
         security_from_cli: security.is_some(),
-        // The command line cannot name a handshake or a client that is not in
-        // this repository; a build that has them sets this after `options`
-        // returns.
+        security: security.unwrap_or_default(),
+        // Replaced by `options_with` with what was supplied.
         supplied: Default::default(),
         identity: true,
         open_zones,
@@ -505,6 +549,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<app::Options>
         player_name: None,
         login_file: None,
         saved: Default::default(),
+        form_plays_itself,
     }))
 }
 
@@ -536,12 +581,29 @@ fn apply_config(opts: &mut app::Options) -> Result<(), String> {
     };
     opts.login_file = path.parent().map(|dir| dir.join(game::login::FILE_NAME));
     opts.settings_path = Some(path.clone());
-    let (cfg, warnings) = config::Config::load(&path, opts.config.is_some())?;
+    let (cfg, warnings) =
+        config::Config::load(&path, opts.config.is_some(), &opts.supplied.mechanisms)?;
     for w in warnings {
         log::warn!("{}: {w}", path.display());
     }
     log::info!("settings: {}", path.display());
     finish_options(opts, cfg)
+}
+
+/// `name`, if it is one a zone can be sent: no longer than SubSpace 1.34's
+/// name box allows, and nothing that box refuses. A longer one is refused
+/// rather than cut, because the cut name would log in as a different account.
+fn name_fits(name: String, what: &str) -> Result<String, String> {
+    if name.chars().count() > oss_session::MAX_NAME {
+        return Err(format!(
+            "{what} is longer than {} characters",
+            oss_session::MAX_NAME
+        ));
+    }
+    if let Some(why) = oss_session::name_refusal(&name) {
+        return Err(format!("{what}: {why}"));
+    }
+    Ok(name)
 }
 
 fn finish_options(opts: &mut app::Options, cfg: config::Config) -> Result<(), String> {
@@ -560,9 +622,21 @@ fn finish_options(opts: &mut app::Options, cfg: config::Config) -> Result<(), St
     opts.ui_scale = cfg.ui_scale;
     opts.pad = cfg.pad;
     opts.directories.extend(cfg.directories);
-    // The command line wins over the settings file.
+    // The command line wins over the settings file. The file's word is read
+    // against this build's mechanisms here, not when the file is parsed, so a
+    // word this build does not know is reported and left in the file as it is:
+    // `opts.saved` keeps it, and a Save writes it back untouched.
     if !opts.security_from_cli {
-        opts.security = cfg.security;
+        opts.security = match SecurityMode::parse(&cfg.security, &opts.supplied.mechanisms) {
+            Ok(mode) => mode,
+            Err(e) => {
+                log::warn!(
+                    "settings: [network] security: {e}; using auto for this run, and \
+                     leaving the setting as it is"
+                );
+                SecurityMode::Auto
+            }
+        };
     }
     opts.identity = cfg.identity;
     opts.player_name = cfg.name.clone();
@@ -570,11 +644,23 @@ fn finish_options(opts: &mut app::Options, cfg: config::Config) -> Result<(), St
         && z.name.is_empty()
     {
         match cfg.name {
-            Some(name) => z.name = name,
+            Some(name) => z.name = name_fits(name, "the settings file's name")?,
             // No name anywhere: ask on the start-up screen, carrying everything
             // else the command line asked for rather than starting again from
             // nothing.
             None => opts.mode = app::Mode::Login(z.clone()),
+        }
+    }
+    // The same for a zone named with no password, which goes by way of the
+    // form: the settings file's name, as straight in, and with no name
+    // anywhere the form asks for one rather than playing by itself.
+    if opts.form_plays_itself
+        && let app::Mode::Login(z) = &mut opts.mode
+        && z.name.is_empty()
+    {
+        match opts.player_name.clone() {
+            Some(name) => z.name = name,
+            None => opts.form_plays_itself = false,
         }
     }
     Ok(())
@@ -585,7 +671,112 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Result<Option<app::Options>, String> {
-        parse_args(s.split_whitespace().map(String::from))
+        parse_args(
+            s.split_whitespace().map(String::from),
+            &MechanismRegistry::builtin(),
+        )
+    }
+
+    /// `--name` takes what SubSpace 1.34's name box takes, 23 characters, and
+    /// refuses a longer name rather than cutting it into someone else's.
+    #[test]
+    fn a_name_longer_than_23_characters_is_refused() {
+        let o = parse("--server x:1 --name Abcdefghijklmnopqrs1234 --password pw")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&o.mode, app::Mode::Zone(z) if z.name == "Abcdefghijklmnopqrs1234"),
+            "straight in, with the whole name"
+        );
+        let e = parse("--server x:1 --name Abcdefghijklmnopqrs12345 --password pw").err();
+        assert_eq!(e.as_deref(), Some("--name is longer than 23 characters"));
+        let e = parse("--server x:1 --name _ab --password pw").err();
+        assert_eq!(
+            e.as_deref(),
+            Some("--name: Player name cannot start with a symbol.")
+        );
+    }
+
+    /// A mechanism registered in one line is a word `--security` takes, and the
+    /// help lists it with the built-ins; one this build does not have is refused
+    /// with the words it does take.
+    #[test]
+    fn a_registered_mechanism_is_selectable_and_in_the_help() {
+        use oss_session::security::{Era, SecurityMode};
+        use oss_session::test_zone::dummy_mechanism;
+
+        let mut supplied = Supplied::default();
+        supplied
+            .mechanisms
+            .register(dummy_mechanism(
+                "dummy@example.org",
+                "Dummy",
+                Era::Modern,
+                2000,
+            ))
+            .unwrap();
+
+        let o = parse_args(
+            ["--security", "dummy@example.org", "--sandbox"]
+                .into_iter()
+                .map(String::from),
+            &supplied.mechanisms,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(o.security.name(), "dummy@example.org");
+        assert!(o.security_from_cli);
+
+        let help = usage(&supplied.mechanisms);
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "--security <mode> auto (the default) tries the automatic order, \
+                 OpenSecurity, then Dummy, then Subspace,"
+            ),
+            "{help}"
+        );
+        assert!(
+            flat.contains("Or name one mechanism: none, vie, dummy@example.org or opensec."),
+            "{help}"
+        );
+        assert!(!help.contains("{security}"));
+        // The lines written for `--security` fit, each after the first indented
+        // under the option's description.
+        let security: Vec<&str> = help
+            .lines()
+            .skip_while(|l| !l.starts_with("  --security"))
+            .take_while(|l| !l.starts_with("  --config"))
+            .collect();
+        assert!(security.len() > 1, "{help}");
+        for line in &security {
+            assert!(line.len() <= 80, "{line:?}");
+        }
+        for line in &security[1..] {
+            assert!(line.starts_with(&" ".repeat(28)), "{line:?}");
+        }
+
+        // The built-in help says the built-ins, and nothing about the dummy.
+        let plain = usage(&MechanismRegistry::builtin());
+        assert!(!plain.contains("dummy"), "{plain}");
+        assert!(plain.contains("auto (the default)"), "{plain}");
+
+        // Without the registration the word is refused, with the list.
+        let Err(err) = parse("--security dummy@example.org --sandbox") else {
+            panic!("an unregistered mechanism is refused")
+        };
+        assert_eq!(
+            err,
+            "--security must be auto, none, vie or opensec, not `dummy@example.org`"
+        );
+        assert_eq!(
+            parse("--security VIE --sandbox").unwrap().unwrap().security,
+            SecurityMode::parse("vie", &MechanismRegistry::builtin()).unwrap()
+        );
+        assert_eq!(
+            parse("--sandbox").unwrap().unwrap().security,
+            SecurityMode::Auto
+        );
     }
 
     /// The start-up screen is a way into a zone like any other, so what the command
@@ -733,10 +924,11 @@ mod tests {
         assert_eq!((o.scale, o.vsync), (Some(2), true));
         let o = parse("--sandbox --ship 2").unwrap().unwrap();
         assert!(matches!(&o.mode, app::Mode::Sandbox { map: None, ship: 1 }));
-        let o = parse("--server 127.0.0.1:5000 --name Bob --ship 4")
+        let o = parse("--server 127.0.0.1:5000 --name Bob --ship 4 --password pw")
             .unwrap()
             .unwrap();
         assert!(matches!(&o.mode, app::Mode::Zone(z) if z.name == "Bob" && z.ship == 3));
+        assert!(!o.form_plays_itself);
         let mut o = parse("--server x:1").unwrap().unwrap();
         finish_options(&mut o, config::Config::default()).unwrap();
         assert!(
@@ -749,7 +941,9 @@ mod tests {
             vsync: true,
             ..Default::default()
         };
-        let mut o = parse("--server x:1 --scale 2").unwrap().unwrap();
+        let mut o = parse("--server x:1 --scale 2 --password pw")
+            .unwrap()
+            .unwrap();
         finish_options(&mut o, cfg).unwrap();
         assert!(matches!(&o.mode, app::Mode::Zone(z) if z.name == "Ace"));
         assert_eq!((o.scale, o.vsync), (Some(2), true), "flags win");
@@ -760,5 +954,58 @@ mod tests {
             app::Mode::Login(z) if z.server.is_empty()
         ));
         assert!(parse("--help").unwrap().is_none());
+    }
+
+    /// A zone named with no password went straight in and sent an empty one,
+    /// unasked: a refusal, and a wrong try towards the zone's lock-out. Now it
+    /// goes by way of the start-up screen, filled in, which plays by itself
+    /// once the saved password is found. `--password ""` still goes straight
+    /// in, for a zone that wants none.
+    #[test]
+    fn a_zone_with_no_password_goes_by_way_of_the_form() {
+        let mut o = parse("--server x:1 --name Bob --ship 2").unwrap().unwrap();
+        finish_options(&mut o, config::Config::default()).unwrap();
+        assert!(
+            matches!(&o.mode, app::Mode::Login(z) if z.server == "x:1" && z.name == "Bob" && z.ship == 1),
+            "the form, filled in with what the command line named"
+        );
+        assert!(o.form_plays_itself, "and it plays by itself");
+
+        let mut o = parse("--server x:1 --name Bob --password pw")
+            .unwrap()
+            .unwrap();
+        finish_options(&mut o, config::Config::default()).unwrap();
+        assert!(matches!(&o.mode, app::Mode::Zone(z) if z.password == "pw"));
+        assert!(!o.form_plays_itself);
+
+        let o = parse_args(
+            ["--server", "x:1", "--name", "Bob", "--password", ""]
+                .into_iter()
+                .map(String::from),
+            &MechanismRegistry::builtin(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(&o.mode, app::Mode::Zone(z) if z.password.is_empty()),
+            "an empty password asked for in so many words goes straight in"
+        );
+
+        let o = parse("").unwrap().unwrap();
+        assert!(!o.form_plays_itself, "no zone named: the form, as ever");
+
+        // No --name: the settings file's, as straight in; with none there
+        // either, the form asks for one and does not play by itself.
+        let cfg = config::Config {
+            name: Some("Ace".into()),
+            ..Default::default()
+        };
+        let mut o = parse("--server x:1").unwrap().unwrap();
+        finish_options(&mut o, cfg).unwrap();
+        assert!(matches!(&o.mode, app::Mode::Login(z) if z.name == "Ace"));
+        assert!(o.form_plays_itself);
+        let mut o = parse("--server x:1").unwrap().unwrap();
+        finish_options(&mut o, config::Config::default()).unwrap();
+        assert!(!o.form_plays_itself, "no name anywhere: ask for one");
     }
 }

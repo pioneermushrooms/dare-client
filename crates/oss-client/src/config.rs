@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
+use oss_session::security::{MechanismPolicy, MechanismRegistry};
 use winit::keyboard::KeyCode;
 
 use crate::game::input::{Action, Binding, Bindings, Mods, PadBindings, PadButton};
@@ -83,8 +84,11 @@ pub struct Config {
     /// Directory servers for the zone browser ("host:port").
     /// [`DEFAULT_DIRECTORIES`] unless the settings file says otherwise.
     pub directories: Vec<String>,
-    /// Connection encryption (auto = OpenSec, falling back to VIE).
-    pub security: oss_session::security::SecurityMode,
+    /// Connection encryption, as the file says it: `auto`, or the name of one
+    /// mechanism. Kept as the word, and read against this build's mechanisms
+    /// only when it is applied, so a word this build does not know is still in
+    /// the file after a Save.
+    pub security: String,
     /// Offer zones an OpenSec identity key (one per zone) they can use for bans.
     pub identity: bool,
     /// The start screen's skin, by name.
@@ -111,7 +115,7 @@ impl Default for Config {
             ui_scale: 0,
             pad: PadBindings::default(),
             directories: DEFAULT_DIRECTORIES.iter().map(|&s| s.to_owned()).collect(),
-            security: Default::default(),
+            security: oss_session::security::AUTO.to_owned(),
             identity: true,
             skin: crate::game::skin::DEFAULT_SKIN.to_owned(),
             skin_folders: Vec::new(),
@@ -138,7 +142,13 @@ impl Config {
     /// defaults; a missing file given explicitly is an error, because a mistyped
     /// `--config` should not quietly mint a second profile somewhere else. Returns
     /// the settings and a warning per line that couldn't be used.
-    pub fn load(path: &Path, explicit: bool) -> Result<(Config, Vec<String>), String> {
+    ///
+    /// `mechanisms` are this build's, for the comment a new file is written with.
+    pub fn load(
+        path: &Path,
+        explicit: bool,
+        mechanisms: &MechanismRegistry,
+    ) -> Result<(Config, Vec<String>), String> {
         match std::fs::read(path) {
             Ok(bytes) => Ok(Config::parse(&String::from_utf8_lossy(&bytes))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => {
@@ -146,7 +156,7 @@ impl Config {
                 let written = path
                     .parent()
                     .map_or(Ok(()), std::fs::create_dir_all)
-                    .and_then(|_| std::fs::write(path, config.to_text()));
+                    .and_then(|_| std::fs::write(path, config.to_text(mechanisms)));
                 match written {
                     Ok(()) => log::info!("wrote default settings to {}", path.display()),
                     Err(e) => log::warn!("couldn't write {}: {e}", path.display()),
@@ -226,9 +236,13 @@ impl Config {
                     .ok_or_else(|| format!("unknown palette `{value}`")),
                 ("accessibility", "ui_scale") => number(value, 0, 4).map(|n| c.ui_scale = n),
                 ("network", "identity") => flag(value).map(|b| c.identity = b),
-                ("network", "security") => oss_session::security::SecurityMode::from_name(value)
-                    .map(|m| c.security = m)
-                    .ok_or_else(|| format!("expected auto, opensec or vie, got `{value}`")),
+                // Kept as written: which words are good depends on the mechanisms
+                // the build has, and a word this build does not know is not this
+                // build's to throw away.
+                ("network", "security") => {
+                    c.security = value.trim().to_owned();
+                    Ok(())
+                }
                 ("directory", "servers") => {
                     // Every settings file written before this key had defaults
                     // carries `servers =` with nothing after it, because
@@ -308,8 +322,9 @@ impl Config {
         (c, warnings)
     }
 
-    /// The whole file, with comments; parsing it gives back `self`.
-    pub fn to_text(&self) -> String {
+    /// The whole file, with comments; parsing it gives back `self`. The comment
+    /// on `security` lists the words `mechanisms` accept.
+    pub fn to_text(&self, mechanisms: &MechanismRegistry) -> String {
         let mut s = String::from(
             "; oss-client settings. Delete a line to get its default back.\n\
              ; Command-line flags override these for one run, and are never saved here.\n\n[video]\n",
@@ -341,15 +356,20 @@ impl Config {
             self.palette.name(),
             self.ui_scale
         );
+        let order = MechanismPolicy::automatic(mechanisms).automatic_line(mechanisms);
+        let names: Vec<&str> = mechanisms.ids().map(|id| id.as_str()).collect();
         s += &format!(
             "[network]\n\
-             ; auto: OpenSec, falling back to VIE for servers without it (never once a\n\
-             ; server's key is on record); opensec or vie to force one.\n\
+             ; auto tries each mechanism in turn, strongest first, stepping down for a\n\
+             ; server that does not answer (never once a server's key is on record).\n\
+             ; {order}.\n\
+             ; Or name one to use it alone: {}.\n\
              security = {}\n\
              ; Offer each zone an OpenSec identity key of its own (kept in\n\
              ; identities.txt), which zones may use for bans.\n\
              identity = {}\n\n",
-            self.security.name(),
+            names.join(", "),
+            self.security,
             self.identity
         );
         s += &format!(
@@ -626,7 +646,7 @@ mod tests {
     #[test]
     fn default_file_round_trips() {
         let c = Config::default();
-        let (back, warnings) = Config::parse(&c.to_text());
+        let (back, warnings) = Config::parse(&c.to_text(&MechanismRegistry::builtin()));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back, c);
         let custom = Config {
@@ -642,11 +662,14 @@ mod tests {
                 p
             },
             directories: vec!["127.0.0.1:4990".into(), "localhost:4991".into()],
-            security: oss_session::security::SecurityMode::OpenSec,
+            security: "opensec".into(),
             identity: false,
             ..Config::default()
         };
-        assert_eq!(Config::parse(&custom.to_text()).0, custom);
+        assert_eq!(
+            Config::parse(&custom.to_text(&MechanismRegistry::builtin())).0,
+            custom
+        );
     }
 
     #[test]
@@ -655,7 +678,10 @@ mod tests {
         let (c, warnings) = Config::parse("[chat]\nenter_to_chat = no\n");
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(!c.enter_to_chat);
-        assert_eq!(Config::parse(&c.to_text()).0, c);
+        assert_eq!(
+            Config::parse(&c.to_text(&MechanismRegistry::builtin())).0,
+            c
+        );
     }
 
     /// A player who has just installed the client must have somewhere to play
@@ -668,13 +694,16 @@ mod tests {
         assert_eq!(c.directories, DEFAULT_DIRECTORIES, "out of the box");
         for dir in DEFAULT_DIRECTORIES {
             assert!(
-                c.to_text().contains(dir),
+                c.to_text(&MechanismRegistry::builtin()).contains(dir),
                 "and the file written on the first run names {dir}"
             );
         }
         // The two that answered nothing on 2026-11-18 are not shipped.
         for gone in ["ssdir.playsubspace.com", "zones.sscentral.com"] {
-            assert!(!c.to_text().contains(gone), "{gone} is still listed");
+            assert!(
+                !c.to_text(&MechanismRegistry::builtin()).contains(gone),
+                "{gone} is still listed"
+            );
         }
     }
 
@@ -698,8 +727,16 @@ mod tests {
 
         // ... which has to survive being written back out, or the opt-out
         // would last exactly until the next save.
-        assert!(off.to_text().contains("servers = none"));
-        assert!(Config::parse(&off.to_text()).0.directories.is_empty());
+        assert!(
+            off.to_text(&MechanismRegistry::builtin())
+                .contains("servers = none")
+        );
+        assert!(
+            Config::parse(&off.to_text(&MechanismRegistry::builtin()))
+                .0
+                .directories
+                .is_empty()
+        );
 
         let (mine, _) = Config::parse("[directory]\nservers = dir.example:4990\n");
         assert_eq!(mine.directories, ["dir.example:4990"], "a choice is kept");
@@ -719,10 +756,11 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1, "and is told where the name really lives");
         assert!(
-            !c.to_text().contains("[player]"),
+            !c.to_text(&MechanismRegistry::builtin())
+                .contains("[player]"),
             "but the key is not written again"
         );
-        let (back, warnings) = Config::parse(&c.to_text());
+        let (back, warnings) = Config::parse(&c.to_text(&MechanismRegistry::builtin()));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back.name, None, "so the seed is spent, not kept in sync");
     }
@@ -807,7 +845,7 @@ spectate = F10
         assert_eq!(c.bindings.get(Action::Screenshot), &[print, f11(Mods::Any)]);
 
         // And a fresh file round-trips with spectate on F11 alone.
-        let (back, w) = Config::parse(&Config::default().to_text());
+        let (back, w) = Config::parse(&Config::default().to_text(&MechanismRegistry::builtin()));
         assert!(w.is_empty(), "{w:?}");
         assert_eq!(back.bindings.get(Action::Spectate), &[f11(Mods::Any)]);
         assert_eq!(back.bindings.get(Action::Screenshot), &[print]);
@@ -837,7 +875,12 @@ spectate = F10
                 ),
             ]
         );
-        assert_eq!(Config::parse(&c.to_text()).0.macros, c.macros);
+        assert_eq!(
+            Config::parse(&c.to_text(&MechanismRegistry::builtin()))
+                .0
+                .macros,
+            c.macros
+        );
     }
 
     #[test]
@@ -845,11 +888,16 @@ spectate = F10
         let dir = std::env::temp_dir().join(format!("oss-config-{}", std::process::id()));
         let path = dir.join(FILE_NAME);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(Config::load(&path, true).is_err());
-        let (c, _) = Config::load(&path, false).unwrap();
+        assert!(Config::load(&path, true, &MechanismRegistry::builtin()).is_err());
+        let (c, _) = Config::load(&path, false, &MechanismRegistry::builtin()).unwrap();
         assert_eq!(c, Config::default());
         std::fs::write(&path, "[audio]\nmute = yes\n").unwrap();
-        assert!(Config::load(&path, false).unwrap().0.mute);
+        assert!(
+            Config::load(&path, false, &MechanismRegistry::builtin())
+                .unwrap()
+                .0
+                .mute
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -862,7 +910,7 @@ spectate = F10
         let dir = std::env::temp_dir().join(format!("oss-config-say-{}", std::process::id()));
         let path = dir.join(FILE_NAME);
         let _ = std::fs::remove_dir_all(&dir);
-        let e = Config::load(&path, true).unwrap_err();
+        let e = Config::load(&path, true, &MechanismRegistry::builtin()).unwrap_err();
         assert!(e.contains("--config"), "{e}");
         assert!(e.contains("empty file"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -881,7 +929,7 @@ spectate = F10
                 std::path::PathBuf::from("/y")
             ]
         );
-        let (again, _) = Config::parse(&c.to_text());
+        let (again, _) = Config::parse(&c.to_text(&MechanismRegistry::builtin()));
         assert_eq!(again.skin, c.skin);
         assert_eq!(again.skin_folders, c.skin_folders);
     }

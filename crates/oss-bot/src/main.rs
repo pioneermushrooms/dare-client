@@ -1,6 +1,7 @@
 //! `oss-bot`: a headless SubSpace client for tests, load swarms and arena bots.
 //!
-//! Connects (VIE), logs in, enters an arena, takes the settings and map (cached),
+//! Connects (negotiating its encryption exactly as the graphical client does: the
+//! automatic order, read from the mechanism registry by strength), logs in, enters an arena, takes the settings and map (cached),
 //! answers security checks, and either sits in spectator mode or flies a simulated
 //! ship. A flying bot keeps every other ship and every shot in the arena in its
 //! simulation, as the game does, so it is hit, dies and comes back like a player.
@@ -17,7 +18,9 @@ mod report;
 mod script;
 mod talk;
 
-use oss_session::security::{Identities, SecurityMode, client_handshake, fingerprint};
+use oss_session::security::{
+    Identities, MechanismRegistry, SecurityMode, client_handshake, context, fingerprint,
+};
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,7 +31,9 @@ use oss_proto::ClientSettings;
 use oss_session::map::{MapCache, default_cache_dir};
 use oss_session::sim::{arena_world, remote_state, remote_weapon};
 use oss_session::udp::UdpDriver;
-use oss_session::{SPECTATOR, Session, SessionConfig, SessionEvent, State, chat_type};
+use oss_session::{
+    MAX_NAME, SPECTATOR, Session, SessionConfig, SessionEvent, State, chat_type, name_refusal,
+};
 use oss_sim::fixed::Rng;
 use oss_sim::{Event, Pos, ShipInput, ShipState, VEL_SCALE, World, toggle};
 
@@ -40,6 +45,21 @@ use report::{Reports, run_ticks};
 use script::Script;
 use talk::Talk;
 
+/// The `--help` text for the mechanisms in `mechanisms`: the words `--security`
+/// accepts, and the order `auto` tries, are read from them.
+fn usage(mechanisms: &MechanismRegistry) -> String {
+    let security =
+        oss_session::security::usage(mechanisms, "Bots do not remember server keys.", 25, 80);
+    USAGE.replace("{security}", &security)
+}
+
+/// The lines the bot logs at start about its security, read from its
+/// mechanisms: what it supports, weakest first, and the order `auto` tries.
+fn startup_lines(mechanisms: &MechanismRegistry) -> [String; 2] {
+    oss_session::security::startup_lines(mechanisms)
+}
+
+/// The `--help` text, with `{security}` for the part read from the mechanisms.
 const USAGE: &str = "\
 Usage: oss-bot --server <host:port> [options]
 
@@ -69,10 +89,7 @@ Options:
                          bot needs this against a zone that has just come up
   --duration <secs>      Disconnect after this long (default: run until Ctrl+C)
   --map-cache <dir>      Where downloaded maps are kept
-  --security <mode>      vie (default), opensec, auto (OpenSec, falling back
-                         to VIE), or none; bots don't pin server keys. The none
-                         mode sends the password in the clear and only works
-                         against a server set to allow it
+  --security <mode>      {security}
   --identity <file>      Offer an OpenSec identity key, one per bot number and
                          zone, kept in <file> (made if missing); a renamed bot
                          keeps its key
@@ -100,7 +117,10 @@ struct Options {
     host: bool,
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>, String> {
+fn parse_args(
+    mut args: impl Iterator<Item = String>,
+    mechanisms: &MechanismRegistry,
+) -> Result<Option<Options>, String> {
     let mut o = Options {
         server: String::new(),
         name: "oss-bot".into(),
@@ -113,7 +133,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
         duration: None,
         map_cache: None,
         verbose: false,
-        security: SecurityMode::Vie,
+        security: SecurityMode::Auto,
         identity: None,
         new_user: false,
         script: None,
@@ -151,8 +171,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
             "--script" => o.script = Some(value("--script")?),
             "--host" => o.host = true,
             "--security" => {
-                o.security = SecurityMode::from_name(&value("--security")?)
-                    .ok_or("--security must be vie, opensec, auto or none")?
+                let word = value("--security")?;
+                o.security = SecurityMode::parse(&word, mechanisms).map_err(|_| {
+                    format!(
+                        "--security must be {}, not `{word}`",
+                        oss_session::security::words(mechanisms)
+                    )
+                })?
             }
             "--identity" => o.identity = Some(value("--identity")?.into()),
             "--chat" => o.chat.push(value("--chat")?),
@@ -177,6 +202,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Options>,
         return Err(
             "--host runs the bots its standard input lists; leave out --script and --count".into(),
         );
+    }
+    // The client's name box stops at MAX_NAME, and a zone is never sent a
+    // longer name. The numbered names are checked too: the number goes on the
+    // end, so the last bot's is the longest.
+    let longest = if o.count > 1 {
+        format!("{}{}", o.name, o.count)
+    } else {
+        o.name.clone()
+    };
+    if longest.chars().count() > MAX_NAME {
+        return Err(format!(
+            "the name {longest:?} is longer than {MAX_NAME} characters"
+        ));
+    }
+    if let Some(why) = name_refusal(&o.name) {
+        return Err(format!("--name: {why}"));
     }
     Ok(Some(o))
 }
@@ -582,6 +623,14 @@ impl Bot {
                     if let Some(w) = self.world.as_mut() {
                         w.sync_doors(door_seed, timestamp);
                     }
+                }
+                SessionEvent::MapRejected { name, reason } => log::error!(
+                    "[{}] map {name} {reason}; left the zone rather than answer its \
+                     checks with it",
+                    self.label
+                ),
+                SessionEvent::Refused { reason } => {
+                    log::error!("[{}] {reason}; left the zone", self.label)
                 }
                 SessionEvent::Playing => {
                     let n = self.session.players().count();
@@ -1107,9 +1156,15 @@ fn start_bot(
         }
         None => None,
     };
-    let handshake = client_handshake(opts.security, None, identity, seed);
+    // Bots remember no server keys, so nothing is pinned.
+    let negotiation = client_handshake(
+        &MechanismRegistry::builtin(),
+        &opts.security,
+        &context(seed, None, identity),
+    )
+    .map_err(|e| format!("--security {}: {e}", opts.security))?;
     let now = driver.now_ms();
-    let session = Session::with_handshake(cfg, now, handshake);
+    let session = Session::with_negotiation(cfg, now, negotiation);
     let scripted = opts.host || opts.script.is_some();
     let brain = scripted.then(|| Brain::new(s.behaviour, s.points.clone(), s.range.unwrap_or(30)));
     let talk = scripted
@@ -1149,17 +1204,25 @@ fn start_bot(
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let opts = match parse_args(std::env::args().skip(1)) {
+    let mechanisms = MechanismRegistry::builtin();
+    let opts = match parse_args(std::env::args().skip(1), &mechanisms) {
         Ok(Some(o)) => o,
         Ok(None) => {
-            println!("oss-bot {}\n\n{USAGE}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "oss-bot {}\n\n{}",
+                env!("CARGO_PKG_VERSION"),
+                usage(&mechanisms)
+            );
             return;
         }
         Err(e) => {
-            eprintln!("error: {e}\n\n{USAGE}");
+            eprintln!("error: {e}\n\n{}", usage(&mechanisms));
             std::process::exit(2);
         }
     };
+    for line in startup_lines(&mechanisms) {
+        log::info!("{line}");
+    }
     let cache = MapCache::new(
         opts.map_cache
             .clone()
@@ -1240,8 +1303,158 @@ fn private_chat(text: &str) -> Option<(&str, &str)> {
 mod tests {
     use super::*;
 
+    use oss_session::security::{Era, MechanismInUse};
+    use oss_session::test_zone::dummy_mechanism;
+
     fn parse(s: &str) -> Result<Option<Options>, String> {
-        parse_args(s.split_whitespace().map(String::from))
+        parse_args(
+            s.split_whitespace().map(String::from),
+            &MechanismRegistry::builtin(),
+        )
+    }
+
+    /// A bot's name is held to the client's 23 characters, numbered names
+    /// included: the number goes on the end, so ten bots of a 22-character
+    /// name would end with a 24-character one.
+    #[test]
+    fn a_name_longer_than_23_characters_is_refused() {
+        let o = parse("--server x:1 --name Abcdefghijklmnopqrs1234")
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.name, "Abcdefghijklmnopqrs1234");
+        assert!(parse("--server x:1 --name Abcdefghijklmnopqrs12345").is_err());
+        assert!(
+            parse("--server x:1 --name Abcdefghijklmnopqrs123 --count 9")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            parse("--server x:1 --name a:b").err().as_deref(),
+            Some("--name: Player name cannot contain a colon.")
+        );
+        assert_eq!(
+            parse("--server x:1 --name Abcdefghijklmnopqrs123 --count 10")
+                .err()
+                .as_deref(),
+            Some("the name \"Abcdefghijklmnopqrs12310\" is longer than 23 characters")
+        );
+    }
+
+    /// The bot negotiates exactly as the client does: `auto` unless told
+    /// otherwise, the order read from its mechanisms by strength, so a
+    /// mechanism of middle strength lands between OpenSecurity and Subspace.
+    /// Naming one mechanism still works.
+    #[test]
+    fn the_default_is_the_automatic_order_as_in_the_client() {
+        let o = parse("--server x:1").unwrap().unwrap();
+        assert_eq!(o.security, SecurityMode::Auto);
+
+        let mut mechanisms = MechanismRegistry::builtin();
+        mechanisms
+            .register(dummy_mechanism(
+                "middle@example.org",
+                "Middle",
+                Era::Modern,
+                2000,
+            ))
+            .unwrap();
+        let o = parse_args(
+            ["--server", "x:1"].into_iter().map(String::from),
+            &mechanisms,
+        )
+        .unwrap()
+        .unwrap();
+        let negotiation =
+            client_handshake(&mechanisms, &o.security, &context(1, None, None)).unwrap();
+        let MechanismInUse::Automatic(progress) = negotiation.mechanism else {
+            panic!("the automatic order")
+        };
+        let rungs: Vec<&str> = progress.rungs().map(|id| id.as_str()).collect();
+        assert_eq!(rungs, ["opensec", "middle@example.org", "vie"]);
+        assert_eq!(
+            startup_lines(&mechanisms)[1],
+            "Automatic order: OpenSecurity, then Middle, then Subspace"
+        );
+
+        // By name, the old default among them.
+        for word in ["vie", "middle@example.org", "none", "OPENSEC"] {
+            let o = parse_args(
+                ["--server", "x:1", "--security", word]
+                    .into_iter()
+                    .map(String::from),
+                &mechanisms,
+            )
+            .unwrap()
+            .unwrap();
+            let negotiation =
+                client_handshake(&mechanisms, &o.security, &context(1, None, None)).unwrap();
+            assert_eq!(
+                negotiation.mechanism.id().map(|id| id.as_str()),
+                Some(word.to_ascii_lowercase().as_str())
+            );
+        }
+        assert_eq!(
+            parse("--server x:1 --security middle@example.org").err(),
+            Some(
+                "--security must be auto, none, vie or opensec, not `middle@example.org`"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// The start-up lines, exactly, and the help read from the same mechanisms.
+    #[test]
+    fn the_start_up_lines_and_help_come_from_the_mechanisms() {
+        let builtin = MechanismRegistry::builtin();
+        assert_eq!(
+            startup_lines(&builtin),
+            [
+                "Mechanisms supported: None, Subspace, OpenSecurity",
+                "Automatic order: OpenSecurity, then Subspace",
+            ]
+        );
+        let help = usage(&builtin);
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "--security <mode> auto (the default) tries the automatic order, \
+                 OpenSecurity, then Subspace,"
+            ),
+            "{help}"
+        );
+        assert!(
+            flat.contains("Or name one mechanism: none, vie or opensec."),
+            "{help}"
+        );
+        assert!(!help.contains("{security}"));
+        // The lines written for `--security` fit, each after the first indented
+        // under the option's description.
+        let security: Vec<&str> = help
+            .lines()
+            .skip_while(|l| !l.starts_with("  --security"))
+            .take_while(|l| !l.starts_with("  --identity"))
+            .collect();
+        assert!(security.len() > 1, "{help}");
+        for line in &security {
+            assert!(line.len() <= 80, "{line:?}");
+        }
+        for line in &security[1..] {
+            assert!(line.starts_with(&" ".repeat(25)), "{line:?}");
+        }
+
+        let mut more = MechanismRegistry::builtin();
+        more.register(dummy_mechanism(
+            "middle@example.org",
+            "Middle",
+            Era::Modern,
+            2000,
+        ))
+        .unwrap();
+        assert_eq!(
+            startup_lines(&more)[0],
+            "Mechanisms supported: None, Subspace, Middle, OpenSecurity"
+        );
+        assert!(usage(&more).contains("middle@example.org"));
     }
 
     #[test]

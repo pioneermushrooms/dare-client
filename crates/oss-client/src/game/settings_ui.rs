@@ -1304,7 +1304,11 @@ mod tests {
         assert_eq!(ui.cfg.skin, "Dare Night");
         press(&mut ui, &[KeyCode::Enter, KeyCode::Enter]);
         assert_eq!(ui.cfg.skin, "Dare", "and comes round");
-        assert!(ui.cfg.to_text().contains("skin = Dare"));
+        assert!(
+            ui.cfg
+                .to_text(&oss_session::security::MechanismRegistry::builtin())
+                .contains("skin = Dare")
+        );
     }
 
     /// A key is rebound from the keyboard alone: Enter on its line waits for a

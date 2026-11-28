@@ -357,9 +357,12 @@ mod tests {
     use super::*;
 
     fn options(args: &str) -> Options {
-        crate::parse_args(args.split_whitespace().map(String::from))
-            .unwrap()
-            .unwrap()
+        crate::parse_args(
+            args.split_whitespace().map(String::from),
+            &oss_session::security::MechanismRegistry::builtin(),
+        )
+        .unwrap()
+        .unwrap()
     }
 
     fn lineup(text: &str) -> Lineup {
