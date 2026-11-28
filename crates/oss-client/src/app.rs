@@ -19,6 +19,7 @@ use crate::game::art::{self, Art};
 use crate::game::input::{InputState, Stroke, char_for, shifted_char};
 use crate::game::login::{Choice, Login};
 use crate::game::online::{Online, ServerOptions, Supplied};
+use crate::game::remember;
 use crate::game::sandbox::Sandbox;
 use crate::game::settings_ui::{SettingsUi, UiAction};
 use crate::game::skin::{HotSpot, Skin, SkinEntry};
@@ -208,14 +209,15 @@ pub struct Options {
     pub enter_to_chat: bool,
     /// Directory servers for the zone browser.
     pub directories: Vec<String>,
-    /// Connection encryption.
+    /// Connection encryption: the automatic order, or one mechanism by name.
     pub security: oss_session::security::SecurityMode,
-    /// What a build outside this repository supplies for the connection: the
-    /// handshake, and the client the session presents itself as. The default is
-    /// neither, which is this repository's own client — the modes
-    /// [`Options::security`] names, and [`oss_session::VieClient`].
+    /// The mechanisms the client can speak, and the client the session presents
+    /// itself as. The default is this repository's own: the built-in mechanisms,
+    /// and [`oss_session::VieClient`].
     ///
-    /// Set between [`crate::options`] and [`run`]; see [`Supplied`] and the crate
+    /// A build outside this repository registers its mechanisms in a
+    /// [`Supplied`] and hands it to [`crate::options_with`], so that
+    /// `--security` and the settings file know them; see the crate
     /// documentation.
     pub supplied: Supplied,
     /// `--security` was given (it wins over the settings file).
@@ -245,6 +247,10 @@ pub struct Options {
     /// the lead's own settings, twice over, leaving the next ordinary start
     /// with a local directory and no zone list.
     pub saved: crate::config::Config,
+    /// `--server` with no `--password`: the start-up screen opens filled in and
+    /// plays by itself once the password store has looked up the password saved
+    /// for that name and zone, or waits for one to be typed when there is none.
+    pub form_plays_itself: bool,
 }
 
 /// Waiting for the zone: shows progress until the arena is ready.
@@ -317,6 +323,11 @@ struct LoginScreen {
     spots: Spots,
     /// Fills in a saved password when the name and zone have one.
     recall: crate::game::remember::Recall,
+    /// A Play waiting for the store to look up the saved password.
+    hold: Option<crate::game::remember::Hold>,
+    /// The held Play was the command line's rather than the player's: the
+    /// form is not saved as the player's last choice when it goes through.
+    held_for_command_line: bool,
     /// The skinned screen; `None` falls back to the plain drawn one.
     skin: Option<Box<SkinUi>>,
 }
@@ -653,7 +664,8 @@ fn cycle_skin(options: &mut Options, ls: &mut LoginScreen, r: &mut Renderer) {
             Ok(()) => {
                 options.saved.skin.clone_from(&e.name);
                 if let Some(p) = &options.settings_path
-                    && let Err(err) = std::fs::write(p, options.saved.to_text())
+                    && let Err(err) =
+                        std::fs::write(p, options.saved.to_text(&options.supplied.mechanisms))
                 {
                     log::warn!("couldn't save the skin choice: {err}");
                 }
@@ -851,6 +863,13 @@ struct Running {
     /// The window can't be seen (minimised/covered); Windows then stops sending
     /// redraws, so the game is driven from `about_to_wait` without drawing.
     occluded: bool,
+    /// When the GPU last refused a frame as unshowable ([`FrameError::Hidden`]).
+    /// macOS often says nothing to the window when it is covered, but the surface
+    /// then hands back no buffer: drawing straight on spun the loop tens of
+    /// thousands of times a second, and a buffer that never came held it a whole
+    /// second. Until a frame goes through again it is treated as occluded, and a
+    /// frame is only tried every [`HIDDEN_PROBE`].
+    surface_hidden: Option<web_time::Instant>,
     /// The login form to come back to when the player leaves the game, as it was
     /// when they went in. `None` when the run never passed through it.
     front_end: Option<Login>,
@@ -891,6 +910,30 @@ struct App {
     clicked: bool,
     /// This machine's password store, if it has one, for "Remember password".
     vault: crate::game::remember::Vault,
+    /// The zone list as it stood when the player last pressed Play, as
+    /// (address, name): where the window title finds a zone's name, for the
+    /// zone played and for any zone a redirect sends the connection on to.
+    zone_names: Vec<(String, String)>,
+    /// The zone address the window title names now, so the title changes only
+    /// when the connection moves to another zone.
+    titled: Option<String>,
+}
+
+/// The window's title while connected: the zone's name from the zone list when
+/// its address is listed there, then the address.
+///
+/// An address typed by hand or given with `--server` has no name unless it is
+/// one the list holds, and after a redirect the new address is looked up afresh:
+/// the name of the zone that did the redirecting is never carried over to
+/// another address.
+fn window_title(server: &str, names: &[(String, String)]) -> String {
+    match names
+        .iter()
+        .find(|(address, name)| address == server && !name.trim().is_empty())
+    {
+        Some((_, name)) => format!("Open SubSpace — {} — {server}", name.trim()),
+        None => format!("Open SubSpace — {server}"),
+    }
 }
 
 pub fn run(options: Options) -> Result<(), String> {
@@ -928,6 +971,9 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         .map(|r| r.display().to_string())
         .collect();
     log::info!("assets: {}", shown.join(", "));
+    for line in startup_lines(&options) {
+        log::info!("{line}");
+    }
     let level = match &options.mode {
         Mode::Sandbox { map: Some(map), .. } => {
             oss_assets::locate::read_file(map).map_err(|e| e.to_string())?
@@ -972,6 +1018,8 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         vault: crate::game::remember::Vault::probe(),
         #[cfg(target_arch = "wasm32")]
         vault: crate::game::remember::Vault::None,
+        zone_names: Vec::new(),
+        titled: None,
     };
     #[cfg(target_arch = "wasm32")]
     {
@@ -1063,8 +1111,11 @@ impl App {
             spots: Spots::default(),
             recall: Default::default(),
             skin,
+            hold: None,
+            held_for_command_line: false,
         }));
         set_title(&run.window, "Open SubSpace");
+        self.titled = None;
         self.settings = None;
         self.input.clear();
         run.window.request_redraw();
@@ -1091,7 +1142,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         let title = match &self.options.mode {
             Mode::Sandbox { .. } => "Open SubSpace — sandbox".to_string(),
-            Mode::Zone(z) => format!("Open SubSpace — {}", z.server),
+            Mode::Zone(z) => window_title(&z.server, &[]),
             Mode::Login(_) => "Open SubSpace".to_string(),
             Mode::Replay(p) => format!("Open SubSpace — replay {}", p.display()),
         };
@@ -1173,6 +1224,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(run) = self.running.as_mut() {
                     run.occluded = hidden;
                     if !hidden {
+                        run.surface_hidden = None;
                         run.window.request_redraw();
                     }
                 }
@@ -1181,35 +1233,22 @@ impl ApplicationHandler<AppEvent> for App {
             // included: it reads the keystrokes from there in `frame`, which is
             // what lets a scripted `--press` reach it as it reaches every other
             // screen.
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
                 let code = match event.physical_key {
                     PhysicalKey::Code(code) => Some(code),
                     _ => None,
                 };
-                if event.state != ElementState::Pressed {
-                    if let Some(code) = code {
-                        self.input.release(code);
-                    }
-                    return;
-                }
-                // The key and the character it typed are one keystroke, with the
-                // OS repeat flag on it. `event.repeat` is the flag that used to
-                // be dropped on the floor, which is why a held Backspace cleared
-                // one character and stopped.
-                let mut chars = event.text.iter().flat_map(|t| t.chars());
-                let first = chars.next();
-                if code.is_some() || first.is_some() {
-                    self.input.press(Stroke {
-                        key: code,
-                        text: first,
-                        repeat: event.repeat,
-                    });
-                }
-                // A key event can carry more than one character when a dead key
-                // finishes a composition. The key belongs to the first of them.
-                for c in chars {
-                    self.input.press(Stroke::text(c).repeated(event.repeat));
-                }
+                self.input.window_key(
+                    code,
+                    event.text.as_deref().unwrap_or(""),
+                    event.state == ElementState::Pressed,
+                    event.repeat,
+                    is_synthetic,
+                );
             }
             // The pointer, which the start-up screen is built around: Continuum's
             // own is a set of named hot spots, so a keyboard-only version of it
@@ -1297,9 +1336,17 @@ impl ApplicationHandler<AppEvent> for App {
         let Some(run) = self.running.as_ref() else {
             return;
         };
-        if run.occluded {
+        if run.occluded || run.surface_hidden.is_some() {
             // Keep the simulation and connection alive, at a modest rate.
             self.frame(event_loop, false);
+            if let Some(run) = self.running.as_ref()
+                && !run.occluded
+                && run
+                    .surface_hidden
+                    .is_some_and(|t| hidden_probe_due(t, web_time::Instant::now()))
+            {
+                run.window.request_redraw();
+            }
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 web_time::Instant::now() + std::time::Duration::from_millis(5),
             ));
@@ -1423,6 +1470,18 @@ impl App {
                 if self.options.open_zones {
                     login.focus_zones();
                 }
+                // A zone named on the command line with no password: play as
+                // soon as the saved one is found, and wait for one to be typed
+                // when there is none. The form carries what the command line
+                // sent, as straight in, and nothing left over from the last
+                // time the form was used.
+                let hold = self.options.form_plays_itself.then(|| {
+                    login.as_command_line(z);
+                    crate::game::remember::Hold::new(
+                        web_time::Instant::now(),
+                        crate::game::remember::IfNone::Stay,
+                    )
+                });
                 // Opened for one arena (the builder's "Fly in it"): start with it chosen.
                 #[cfg(target_arch = "wasm32")]
                 if let Some(arena) = crate::web::start_arena() {
@@ -1440,6 +1499,8 @@ impl App {
                     spots: Spots::default(),
                     recall: Default::default(),
                     skin,
+                    hold,
+                    held_for_command_line: hold.is_some(),
                 }))
             }
         };
@@ -1453,6 +1514,7 @@ impl App {
             started: web_time::Instant::now(),
             captured: false,
             occluded: false,
+            surface_hidden: None,
         });
     }
 
@@ -1579,8 +1641,10 @@ impl App {
             self.input.take_edges();
             let mut open_options = None;
             let mut next_skin = false;
-            let choice = if let Some(ui) = ls.skin.as_deref_mut() {
-                let clicked = std::mem::take(&mut self.clicked) && self.settings.is_none();
+            // Taken once: a waiting Play below gives way to a click as to a key.
+            let clicked = std::mem::take(&mut self.clicked);
+            let mut choice = if let Some(ui) = ls.skin.as_deref_mut() {
+                let clicked = clicked && self.settings.is_none();
                 let phys = cursor.map(|(x, y)| (x * run.scale as f32, y * run.scale as f32));
                 let out = skin_frame(
                     ui,
@@ -1598,25 +1662,15 @@ impl App {
                 out.choice
             } else {
                 // The list owns Up/Down and the rest of its keys while it has the focus.
-                // Whichever row it settles on fills in the Zone field, so the highlighted
-                // row and the address can never disagree; Enter and Esc belong to the
-                // screen, and the form below answers them.
+                // Whichever row they walk to fills in the Zone field; a key that only
+                // passes through the list, Tab above all, leaves the field alone. Enter
+                // and Esc belong to the screen, and the form below answers them.
                 if ls.login.focused() == crate::game::login::Field::Zones {
-                    let picked = ls.browser.input(&strokes);
-                    if let Some(crate::game::zones::BrowserChoice::Pick(address)) = picked {
-                        ls.login.server = address;
-                        ls.login.error = None;
-                    } else if strokes.iter().any(|s| s.key.is_some())
-                        && let Some(z) = ls.browser.zones.get(ls.browser.selected)
-                    {
-                        ls.login.server.clone_from(&z.address);
-                        ls.login.error = None;
-                    }
+                    ls.browser.form_keys(&mut ls.login, &strokes);
                 }
                 // A click, against the regions the last frame drew. The keyboard is
                 // untouched by this: clicking a field focuses it exactly as tabbing
                 // to it does, so everything that worked before still does.
-                let clicked = std::mem::take(&mut self.clicked);
                 let mut pointed = None;
                 if clicked && self.settings.is_none() {
                     let size = run.renderer.size();
@@ -1698,6 +1752,62 @@ impl App {
             if next_skin {
                 cycle_skin(&mut self.options, ls, &mut run.renderer);
             }
+            // A waiting Play gives way to the player's next key or click: the
+            // form is theirs from then on. Without this, a character typed while
+            // it waited filled the box, and the Play went off with that one
+            // character as the password. The OS repeating a key still held is
+            // not a next key, or a held Enter would cancel its own Play.
+            if ls.hold.is_some() && remember::Hold::interrupted(clicked, &strokes) {
+                ls.hold = None;
+                ls.held_for_command_line = false;
+                ls.login.error = None;
+            }
+            // A password filled in for one zone never goes to another: the zone
+            // may have changed in this very frame, after the store's last look.
+            // Play is then made again from the form as it now stands.
+            if matches!(choice, Some(Choice::Connect(_))) && ls.recall.follow(&mut ls.login) {
+                choice = ls.login.play();
+            }
+            // Play with the password box empty while the store may still be
+            // looking up a saved password for this name and zone: wait for it.
+            let now = web_time::Instant::now();
+            if matches!(choice, Some(Choice::Connect(_)))
+                && remember::Hold::needed(&ls.login, &ls.recall, &self.vault)
+            {
+                log::info!("Play waits for the password store to look up a saved password");
+                ls.hold = Some(remember::Hold::new(now, remember::IfNone::Play));
+                ls.held_for_command_line = false;
+                ls.login.error = Some("Looking for a saved password...".into());
+                choice = None;
+            }
+            let mut from_command_line = false;
+            if choice.is_none()
+                && let Some(hold) = ls.hold
+            {
+                match hold.verdict(&ls.login, &ls.recall, &self.vault, now) {
+                    remember::Verdict::Wait => {}
+                    remember::Verdict::Play => {
+                        ls.hold = None;
+                        from_command_line = std::mem::take(&mut ls.held_for_command_line);
+                        choice = ls.login.play();
+                    }
+                    remember::Verdict::Stay => {
+                        ls.hold = None;
+                        ls.held_for_command_line = false;
+                        // A missing name or a zone with no port says so, as
+                        // Play would; otherwise the password box is waiting.
+                        if ls.login.play().is_some() {
+                            log::info!(
+                                "no password saved for this name and zone: waiting for one \
+                                 to be typed"
+                            );
+                            ls.login.focus_on(crate::game::login::Field::Password);
+                            ls.login.error =
+                                Some("Type the zone's password, then press Enter".into());
+                        }
+                    }
+                }
+            }
             match choice {
                 Some(Choice::Options) => {
                     self.settings = Some(SettingsUi::new(current_config(&self.options)));
@@ -1738,7 +1848,11 @@ impl App {
                 }
                 Some(Choice::Connect(mut opts)) => {
                     apply_settings(&self.options, &mut opts);
-                    if let Some(path) = &self.options.login_file {
+                    // The command line is for this run: what it named is not
+                    // kept as the player's last zone and name.
+                    if let Some(path) = &self.options.login_file
+                        && !from_command_line
+                    {
                         ls.login.save(path);
                     }
                     let size = run.window.inner_size();
@@ -1748,7 +1862,12 @@ impl App {
                     );
                     match Online::connect(&opts, res, &self.options.supplied) {
                         Ok(net) => {
-                            set_title(&run.window, &format!("Open SubSpace — {}", opts.server));
+                            self.zone_names = ls
+                                .browser
+                                .zones
+                                .iter()
+                                .map(|z| (z.address.clone(), z.name.clone()))
+                                .collect();
                             let Screen::Login(ls) =
                                 std::mem::replace(&mut run.screen, Screen::Empty)
                             else {
@@ -1853,6 +1972,8 @@ impl App {
                             spots: Spots::default(),
                             recall: Default::default(),
                             skin,
+                            hold: None,
+                            held_for_command_line: false,
                         }));
                     }
                     (None, Some(err)) => return self.fail(event_loop, err),
@@ -1918,6 +2039,28 @@ impl App {
                     run.screen = Screen::Game(Box::new(s));
                 }
                 Err(e) => return self.fail(event_loop, e),
+            }
+        }
+
+        // The title follows the connection: set when it starts, again whenever
+        // a redirect moves it to another zone, and back to the bare name when a
+        // failed connection returns to the form.
+        let zone = match &run.screen {
+            Screen::Connecting(conn) => Some(conn.net.connection().0),
+            Screen::Game(game) => game.zone_address(),
+            _ => None,
+        };
+        if !matches!(self.options.mode, Mode::Replay(_)) {
+            match zone {
+                Some(zone) if self.titled.as_deref() != Some(zone) => {
+                    set_title(&run.window, &window_title(zone, &self.zone_names));
+                    self.titled = Some(zone.to_owned());
+                }
+                None if self.titled.is_some() && matches!(run.screen, Screen::Login(_)) => {
+                    set_title(&run.window, "Open SubSpace");
+                    self.titled = None;
+                }
+                _ => {}
             }
         }
 
@@ -2003,6 +2146,16 @@ impl App {
             Screen::Empty => None,
         };
 
+        // Checked before drawing: a covered window runs without drawing, and a
+        // timed run must still end on time.
+        if let Some(at) = self.options.quit_at
+            && run.started.elapsed().as_secs_f32() >= at
+        {
+            log::info!("--quit-at {at}: leaving");
+            leave_zone(&mut run.screen);
+            event_loop.exit();
+            return;
+        }
         if !draw {
             return;
         }
@@ -2015,31 +2168,44 @@ impl App {
         if let Some(ui) = self.settings.as_mut() {
             draw_settings(ui, &run.screen, &mut run.renderer, run.scale, cursor);
         }
-        match run.renderer.render(stars, 0.0) {
-            Ok(()) | Err(FrameError::Skip) => {}
+        let shown = match run.renderer.render(stars, 0.0) {
+            Ok(()) => {
+                run.surface_hidden = None;
+                true
+            }
+            Err(FrameError::Skip) => true,
+            Err(FrameError::Hidden) => {
+                run.surface_hidden = Some(web_time::Instant::now());
+                false
+            }
             Err(FrameError::Fatal(e)) => return self.fail(event_loop, e),
-        }
+        };
         #[cfg(target_arch = "wasm32")]
         if let Screen::Connecting(conn) = &mut run.screen {
             conn.tell_page();
         }
         run.renderer.perf().frame_done(frame_at.elapsed());
-        if let Some(at) = self.options.quit_at
-            && run.started.elapsed().as_secs_f32() >= at
-        {
-            log::info!("--quit-at {at}: leaving");
-            leave_zone(&mut run.screen);
-            event_loop.exit();
-            return;
-        }
         // A skipped frame (e.g. occluded window) keeps the capture pending.
         if run.captured && run.renderer.capture.is_none() {
             leave_zone(&mut run.screen);
             event_loop.exit();
             return;
         }
-        run.window.request_redraw();
+        // Hidden, the next frame is tried from `about_to_wait` once it is due.
+        if shown {
+            run.window.request_redraw();
+        }
     }
+}
+
+/// How often a frame is tried while the GPU says the window can't be shown, to
+/// notice it being uncovered when the window system doesn't say so.
+const HIDDEN_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether a window the GPU last refused at `hidden_since` should try a frame
+/// again at `now`.
+fn hidden_probe_due(hidden_since: web_time::Instant, now: web_time::Instant) -> bool {
+    now.saturating_duration_since(hidden_since) >= HIDDEN_PROBE
 }
 
 fn load_art(dir: &AssetDirs, renderer: &mut Renderer) -> Result<(Art, TextureId), String> {
@@ -2070,6 +2236,13 @@ fn draw_settings(
     ui.draw(&c, r, cursor);
 }
 
+/// The lines the client logs at start about its security: the mechanisms it
+/// supports, weakest first, and the order `auto` tries them in. Both are read
+/// from [`Options::supplied`]'s mechanisms.
+pub fn startup_lines(options: &Options) -> [String; 2] {
+    oss_session::security::startup_lines(&options.supplied.mechanisms)
+}
+
 /// What the settings window opens on: the settings file's own values, never the
 /// command line's (see [`Options::saved`]).
 fn current_config(o: &Options) -> crate::config::Config {
@@ -2085,7 +2258,7 @@ impl App {
         self.options.saved = cfg.clone();
         let path = self.options.settings_path.clone();
         ui.status = Some(match &path {
-            Some(p) => match std::fs::write(p, cfg.to_text()) {
+            Some(p) => match std::fs::write(p, cfg.to_text(&self.options.supplied.mechanisms)) {
                 Ok(()) => {
                     ui.mark_saved();
                     format!("Saved to {}", p.display())
@@ -2572,7 +2745,7 @@ fn ship_title(ship: u8) -> &'static str {
 /// command line or the form. Both ways into a zone go through here, so neither can
 /// be given a different set by accident.
 fn apply_settings(o: &Options, opts: &mut ServerOptions) {
-    opts.security = o.security;
+    opts.security = o.security.clone();
     opts.known_servers = known_servers_path(o);
     opts.identities = identities_path(o);
 }
@@ -2594,6 +2767,19 @@ fn known_servers_path(o: &Options) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A window the GPU called hidden is tried again only every HIDDEN_PROBE,
+    /// not on every pass of the loop.
+    #[test]
+    fn a_hidden_window_tries_a_frame_four_times_a_second() {
+        let t = web_time::Instant::now();
+        assert!(!super::hidden_probe_due(t, t));
+        assert!(!super::hidden_probe_due(
+            t,
+            t + std::time::Duration::from_millis(249)
+        ));
+        assert!(super::hidden_probe_due(t, t + super::HIDDEN_PROBE));
+    }
+
     use super::*;
 
     /// A test run's `--directory 127.0.0.1:4991` reached the lead's own
@@ -2636,11 +2822,103 @@ scale = 3
         assert_eq!(o.scale, Some(1));
         assert!(o.mute);
         // What a Save would write is the file's own, untouched.
-        let saved = current_config(&o).to_text();
+        let saved = current_config(&o).to_text(&o.supplied.mechanisms);
         assert!(!saved.contains("127.0.0.1"), "{saved}");
         assert!(saved.contains("servers = dir.example:4990"), "{saved}");
         assert!(saved.contains("scale = 3"), "{saved}");
         assert!(saved.contains("mute = false"), "{saved}");
+    }
+
+    /// A settings file naming a mechanism this build does not have keeps the
+    /// word across a Save. It used to be read against a fixed list, dropped as
+    /// unknown, and written back as `auto`, so saving any setting -- the
+    /// volume, say -- quietly undid the player's choice. A build that does have
+    /// the mechanism reads the same file and uses it.
+    #[test]
+    fn a_mechanism_named_in_the_settings_file_survives_a_save() {
+        use oss_session::security::{Era, SecurityMode};
+
+        let dir = std::env::temp_dir().join(format!("oss-client-keepword-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp folder");
+        let file = dir.join("settings.ini");
+        std::fs::write(
+            &file,
+            "[network]\nsecurity = dummy@example.org\n[audio]\nvolume = 40\n",
+        )
+        .expect("written");
+        let args = || ["--config", file.to_str().expect("a path")].map(String::from);
+
+        // A build without it: auto for this run, and the word kept.
+        let o = crate::cli::options(args().into_iter())
+            .expect("parsed")
+            .expect("not --help");
+        assert_eq!(o.security, SecurityMode::Auto);
+        let mut cfg = current_config(&o);
+        cfg.volume = 70;
+        let saved = cfg.to_text(&o.supplied.mechanisms);
+        assert!(saved.contains("security = dummy@example.org"), "{saved}");
+        assert!(saved.contains("volume = 70"), "{saved}");
+        std::fs::write(&file, &saved).expect("saved");
+
+        // A build that registers it, reading the saved file: it is used.
+        let mut supplied = Supplied::default();
+        supplied
+            .mechanisms
+            .register(oss_session::test_zone::dummy_mechanism(
+                "dummy@example.org",
+                "Dummy",
+                Era::Modern,
+                2000,
+            ))
+            .unwrap();
+        let o = crate::cli::options_with(args().into_iter(), supplied)
+            .expect("parsed")
+            .expect("not --help");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(o.security.name(), "dummy@example.org");
+        let saved = current_config(&o).to_text(&o.supplied.mechanisms);
+        assert!(saved.contains("security = dummy@example.org"), "{saved}");
+        assert!(
+            saved.contains("; Or name one to use it alone: none, vie, dummy@example.org, opensec."),
+            "{saved}"
+        );
+    }
+
+    /// The client's start-up lines, exactly, for this repository's own build,
+    /// and for one that registers a mechanism of middle strength.
+    #[test]
+    fn the_start_up_lines_are_exact() {
+        let o = crate::cli::options(["--sandbox"].map(String::from).into_iter())
+            .expect("parsed")
+            .expect("not --help");
+        assert_eq!(
+            startup_lines(&o),
+            [
+                "Mechanisms supported: None, Subspace, OpenSecurity",
+                "Automatic order: OpenSecurity, then Subspace",
+            ]
+        );
+
+        let mut supplied = Supplied::default();
+        supplied
+            .mechanisms
+            .register(oss_session::test_zone::dummy_mechanism(
+                "dummy@example.org",
+                "Dummy",
+                oss_session::security::Era::Modern,
+                2000,
+            ))
+            .unwrap();
+        let o = crate::cli::options_with(["--sandbox"].map(String::from).into_iter(), supplied)
+            .expect("parsed")
+            .expect("not --help");
+        assert_eq!(
+            startup_lines(&o),
+            [
+                "Mechanisms supported: None, Subspace, Dummy, OpenSecurity",
+                "Automatic order: OpenSecurity, then Dummy, then Subspace",
+            ]
+        );
     }
 
     /// "The scale number doesn't seem to stick or even take effect" -- the
@@ -2657,6 +2935,36 @@ scale = 3
         assert_eq!(wanted_scale(Some(3), 1.0), 3);
         assert_eq!(wanted_scale(Some(99), 1.0), 8);
         assert_eq!(wanted_scale(Some(0), 2.0), 1, "0 as a value, not as None");
+    }
+
+    /// The zone's name between "Open SubSpace" and the address when the zone
+    /// list has it; the address alone when it does not; and after a redirect,
+    /// the new address looked up afresh.
+    #[test]
+    fn the_title_names_the_zone_when_the_list_does() {
+        let names = vec![
+            ("127.0.0.1:5000".to_string(), "Home Zone".to_string()),
+            ("127.0.0.1:6000".to_string(), " ".to_string()),
+        ];
+        assert_eq!(
+            window_title("127.0.0.1:5000", &names),
+            "Open SubSpace — Home Zone — 127.0.0.1:5000"
+        );
+        assert_eq!(
+            window_title("10.0.0.9:5000", &names),
+            "Open SubSpace — 10.0.0.9:5000",
+            "typed by hand, or a redirect to an address the list does not hold"
+        );
+        assert_eq!(
+            window_title("127.0.0.1:6000", &names),
+            "Open SubSpace — 127.0.0.1:6000",
+            "a blank name is no name"
+        );
+        assert_eq!(
+            window_title("127.0.0.1:5000", &[]),
+            "Open SubSpace — 127.0.0.1:5000",
+            "straight in with --server: no list"
+        );
     }
 
     #[test]

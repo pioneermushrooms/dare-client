@@ -45,8 +45,9 @@ mod menu;
 const TICK: Duration = Duration::from_millis(10);
 /// Most sim ticks run per frame before we give up catching up (e.g. after a stall).
 const MAX_TICKS_PER_FRAME: u32 = 25;
-/// How much a frame's clock is stretched or squeezed toward the server's.
-const SLEW_PER_FRAME: Duration = Duration::from_micros(500);
+/// How much faster or slower than real time the clock runs while it works off a
+/// small difference from the server's: 5%, the same at any frame rate.
+const SLEW_RATE: f64 = 0.05;
 
 /// The session time a simulated state stands for: the world runs in fixed ticks that
 /// a frame catches up all at once, so the newest tick is `behind` real time (the
@@ -280,6 +281,12 @@ impl Sandbox {
     }
 
     /// Online: the arena `net` has finished entering.
+    /// The address of the zone this game is connected to, if it is online.
+    /// A redirect changes it.
+    pub fn zone_address(&self) -> Option<&str> {
+        self.net.as_ref().map(|n| n.connection().0)
+    }
+
     pub fn new_online(
         renderer: &mut Renderer,
         dir: &AssetDirs,
@@ -863,7 +870,7 @@ impl Sandbox {
             self.leave = true;
         }
         self.acc += dt;
-        self.sync_clock();
+        self.sync_clock(dt);
         let mut ticks = 0;
         while self.acc >= TICK {
             let mut ship_input = if self.spectating {
@@ -2422,10 +2429,11 @@ impl Sandbox {
 
     /// Online, keeps the world's tick count on the server's clock: a large jump (a
     /// stall, or a clock resync) moves the clock; small drift is worked off by
-    /// running the clock half a millisecond a frame fast or slow (a few percent,
-    /// invisible) until it is back within a tick. Adding or dropping a whole 10 ms
-    /// tick at once made your ship hop on screen.
-    fn sync_clock(&mut self) {
+    /// running the clock 5% fast or slow (invisible) until it is back within a tick.
+    /// Adding or dropping a whole 10 ms tick at once made your ship hop on screen.
+    /// `dt` is the real time this frame covered, so the correction takes as long at
+    /// 30 frames a second as at 270 or in a covered window that loops far faster.
+    fn sync_clock(&mut self, dt: Duration) {
         let Some(net) = self.net.as_ref() else { return };
         let target = net.session.server_ticks(net.now_ms());
         let pending = (self.acc.as_nanos() / TICK.as_nanos()) as i32;
@@ -2434,16 +2442,9 @@ impl Sandbox {
             log::debug!("clock: moved {drift} ticks to the server's");
             self.world.tick = target;
             self.acc = Duration::ZERO;
+            self.slewing = false;
         } else {
-            // Start past two ticks (one is just rounding), stop once within one.
-            self.slewing = drift.abs() > 2 || (self.slewing && drift.abs() > 1);
-            if self.slewing {
-                if drift > 0 {
-                    self.acc += SLEW_PER_FRAME;
-                } else {
-                    self.acc = self.acc.saturating_sub(SLEW_PER_FRAME);
-                }
-            }
+            (self.acc, self.slewing) = slew(self.acc, drift, self.slewing, dt);
         }
     }
 
@@ -3237,9 +3238,76 @@ mod perf_tests {
     }
 }
 
+/// One frame of working off a small clock difference: `drift` ticks behind the
+/// server (negative: ahead). Starts past two ticks (one is just rounding), stops
+/// once within one, and moves the accumulator by [`SLEW_RATE`] of the frame's `dt`.
+fn slew(acc: Duration, drift: i32, slewing: bool, dt: Duration) -> (Duration, bool) {
+    let slewing = drift.abs() > 2 || (slewing && drift.abs() > 1);
+    if !slewing {
+        return (acc, false);
+    }
+    let step = dt.mul_f64(SLEW_RATE);
+    let acc = if drift > 0 {
+        acc + step
+    } else {
+        acc.saturating_sub(step)
+    };
+    (acc, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::spawn_area;
+    use super::{TICK, slew};
+    use std::time::Duration;
+
+    /// Runs the frame loop's clock (add the frame's time, slew, run whole ticks) at
+    /// `fps` against a server clock `drift` ticks ahead of ours; returns how long
+    /// the drift took to work off, or None within `secs`.
+    fn time_to_settle(fps: u32, drift: i32, secs: f64) -> Option<f64> {
+        let dt = Duration::from_secs_f64(1.0 / f64::from(fps));
+        let (mut acc, mut slewing) = (Duration::ZERO, false);
+        let (mut real, mut ticks) = (Duration::ZERO, 0i64);
+        for frame in 1..=(secs * f64::from(fps)) as u64 {
+            real += dt;
+            acc += dt;
+            let target = i64::from(drift) + (real.as_nanos() / TICK.as_nanos()) as i64;
+            let pending = (acc.as_nanos() / TICK.as_nanos()) as i64;
+            let off = (target - ticks - pending) as i32;
+            (acc, slewing) = slew(acc, off, slewing, dt);
+            while acc >= TICK {
+                acc -= TICK;
+                ticks += 1;
+            }
+            if !slewing && frame > 1 {
+                return Some(frame as f64 / f64::from(fps));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn clock_slew_takes_the_same_time_at_any_frame_rate() {
+        // 5 ticks behind: 50 ms at 5% takes about a second, wherever the frames fall.
+        for fps in [30, 60, 270, 40_000] {
+            let t =
+                time_to_settle(fps, 5, 5.0).unwrap_or_else(|| panic!("{fps} fps never settled"));
+            assert!((0.5..=1.0).contains(&t), "{fps} fps settled in {t:.3} s");
+        }
+        // Ahead of the server: the clock runs slow instead, just as long.
+        let t = time_to_settle(270, -5, 5.0).expect("settles from ahead");
+        assert!((0.5..=1.0).contains(&t), "ahead: {t:.3} s");
+    }
+
+    #[test]
+    fn clock_slew_leaves_rounding_alone() {
+        let acc = Duration::from_millis(3);
+        assert_eq!(slew(acc, 1, false, Duration::from_millis(16)), (acc, false));
+        assert_eq!(slew(acc, 2, false, Duration::from_millis(16)), (acc, false));
+        // Once slewing, it carries on down to within one tick.
+        let (moved, on) = slew(acc, 2, true, Duration::from_millis(20));
+        assert!(on && moved == acc + Duration::from_millis(1));
+    }
     use super::view::lerp_direction;
     use oss_proto::settings::{ClientSettings, SpawnPosition};
 

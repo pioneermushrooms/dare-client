@@ -1,0 +1,954 @@
+//! The map a session answers security checks with is the map the zone announced.
+//!
+//! Every security answer carries a checksum of the arena's map, so a session that
+//! plays on a map whose CRC is not the zone's answers with a checksum the zone
+//! cannot accept, and a zone that checks it ends the visit. These tests run a
+//! session through the real transport against a scripted zone, as `login_flow.rs`
+//! does, with a synthetic map and a synthetic stand-in for an LVZ file, and pin
+//! the three ways that went wrong or could:
+//!
+//! 1. **An unnamed slot in the file list is never asked for.** A subgame zone
+//!    lists an optional file it is not offering as an entry with no name, no
+//!    checksum and no size, keeping the indices after it. Asking for it anyway
+//!    gets the file behind it, under a name the list never gave.
+//! 2. **A file the arena does not list never replaces the map.** Such a file used
+//!    to be taken for the map, and the next security answer carried that file's
+//!    bytes read as tiles.
+//! 3. **A damaged map is never used.** One damaged copy is asked for again; a
+//!    second ends the visit with [`SessionEvent::MapRejected`], and a security
+//!    check held for the map is never answered.
+//! 4. **A damaged LVZ is never used either.** One damaged copy is asked for again;
+//!    a second leaves the file out ([`SessionEvent::FileRejected`]) and the visit
+//!    goes on, since no answer to the zone depends on it.
+//!
+//! Playback of a recording that holds a damaged map or file neither refuses nor
+//! hangs up: there is no zone to ask again.
+
+use std::io::Write;
+
+use oss_net::{Config, Event, Server, TransferId, VieAcceptor};
+use oss_proto::common::PlayerData;
+use oss_proto::s2c::{
+    EnteringArena, LoginResponse, MapData, MapFile, MapFilename, PlayerEntering, PlayerId, Security,
+};
+use oss_proto::{C2SPacket, ClientSettings, FixedStr, Packet, checksum};
+use oss_session::replay::{Player as ReplayPlayer, Recorder};
+use oss_session::{Session, SessionConfig, SessionEvent, State};
+
+const ADDR: u32 = 1;
+const KEY: u32 = 0x0F00_2345;
+const MAP_NAME: &str = "tiny.lvl";
+const LVZ_NAME: &str = "art.lvz";
+/// The file behind the unnamed slot: listed by nobody, sent all the same.
+const HIDDEN_NAME: &str = "hidden.lvz";
+
+/// Where [`checksum::map_checksum`] starts sampling for [`KEY`].
+fn sample_origin() -> (u32, u32) {
+    (KEY % 31, KEY % 32)
+}
+
+fn tile(x: u32, y: u32, t: u32) -> [u8; 4] {
+    (x | (y << 12) | (t << 24)).to_le_bytes()
+}
+
+/// The arena's map: a tile list with walls on squares the checksum samples.
+fn map_bytes() -> Vec<u8> {
+    let (x, y) = sample_origin();
+    [tile(x, y, 1), tile(x + 31, y + 32, 5), tile(400, 400, 7)].concat()
+}
+
+/// A map the zone did not announce: the same with one more wall.
+fn other_map_bytes() -> Vec<u8> {
+    let (x, y) = sample_origin();
+    [map_bytes(), tile(x + 62, y, 9).to_vec()].concat()
+}
+
+/// Stand-in for an LVZ. Only its first four bytes are like one; the rest is a
+/// tile list, so that read as a map it puts walls where the checksum looks.
+fn hidden_bytes() -> Vec<u8> {
+    let (x, y) = sample_origin();
+    [
+        b"CONT".to_vec(),
+        tile(x, y + 64, 3).to_vec(),
+        tile(x + 93, y + 96, 2).to_vec(),
+    ]
+    .concat()
+}
+
+const LVZ: &[u8] = b"CONT listed lvz bytes";
+/// The listed LVZ with one byte changed, so its CRC is not the listed one.
+const DAMAGED_LVZ: &[u8] = b"CONT listed lvz bytez";
+
+/// The security map checksum of a level's bytes, as the session computes it.
+fn map_checksum_of(level: &[u8]) -> u32 {
+    let grid = oss_formats::Level::parse(level)
+        .unwrap()
+        .server_tile_grid()
+        .0;
+    checksum::map_checksum(KEY, |x, y| grid.get(x as u32, y as u32))
+}
+
+/// A map with large objects that cover walls listed before them, on squares
+/// the checksum samples for [`KEY`]: a large asteroid (2x2) over one wall and
+/// a wormhole (5x5) over another, plus a wall nothing covers. Away from the
+/// edges, where the servers disagree about wrapping.
+fn big_object_map_bytes() -> Vec<u8> {
+    let (x, y) = sample_origin();
+    let (x1, y1) = (x + 31 * 10, y + 32 * 10);
+    let (x2, y2) = (x + 31 * 12, y + 32 * 12);
+    [
+        tile(x1, y1, 1),
+        tile(x2, y2, 4),
+        tile(x + 31 * 14, y + 32 * 14, 7),
+        tile(x1 - 1, y1 - 1, 217),
+        tile(x2 - 2, y2 - 3, 220),
+    ]
+    .concat()
+}
+
+/// ASSS 1.4.4's map checksum, transcribed here from `core/mapdata.c` rather
+/// than taken from `oss-formats`, so that this test can disagree with it.
+/// `read_plain_tile_data` puts each tile into a sparse array in file order,
+/// and a tile type of 217 or above fills its whole area (217: 2x2, 219: 6x6,
+/// 220: 5x5) with its own type, over whatever was there. `GetChecksum` then
+/// adds `key ^ tile` for tiles 1..=160 and 171 on every 31st column and 32nd
+/// row from the key's remainders (signed; equal to unsigned for this key).
+fn asss_map_checksum(level: &[u8], key: u32) -> u32 {
+    let mut tiles = std::collections::HashMap::new();
+    for w in level.as_chunks::<4>().0 {
+        let v = u32::from_le_bytes(*w);
+        let (x, y, t) = (v & 0xFFF, (v >> 12) & 0xFFF, (v >> 24) as u8);
+        if x >= 1024 || y >= 1024 {
+            continue;
+        }
+        let size = match t {
+            217 => 2,
+            219 => 6,
+            220 => 5,
+            _ => 1,
+        };
+        for dx in 0..size {
+            for dy in 0..size {
+                tiles.insert((x + dx, y + dy), t);
+            }
+        }
+    }
+    let save = key as i32;
+    let mut sum = key;
+    let mut y = save % 32;
+    while y < 1024 {
+        let mut x = save % 31;
+        while x < 1024 {
+            let t = tiles.get(&(x as u32, y as u32)).copied().unwrap_or(0);
+            if (1..=160).contains(&t) || t == 171 {
+                sum = sum.wrapping_add(save as u32 ^ u32::from(t));
+            }
+            x += 31;
+        }
+        y += 32;
+    }
+    sum
+}
+
+fn zlib(data: &[u8]) -> Vec<u8> {
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+fn packet(p: &impl Packet) -> Vec<u8> {
+    let mut v = Vec::new();
+    p.encode(&mut v);
+    v
+}
+
+fn map_data(name: &str, data: Vec<u8>) -> Vec<u8> {
+    packet(&MapData {
+        name: FixedStr::new(name.as_bytes()),
+        data,
+    })
+}
+
+fn security() -> Vec<u8> {
+    packet(&Security {
+        green_seed: 7,
+        door_seed: 9,
+        timestamp: 0,
+        key: KEY,
+    })
+}
+
+/// The arena's file list: the map, an unnamed slot, then one real LVZ (index 2).
+fn file_list(map: &[u8]) -> MapFilename {
+    MapFilename::Files(vec![
+        MapFile {
+            name: FixedStr::new(MAP_NAME.as_bytes()),
+            checksum: checksum::crc32(map),
+            size: 0,
+        },
+        MapFile {
+            name: FixedStr::default(),
+            checksum: 0,
+            size: 0,
+        },
+        MapFile {
+            name: FixedStr::new(LVZ_NAME.as_bytes()),
+            checksum: checksum::crc32(LVZ),
+            size: LVZ.len() as u32 + 17,
+        },
+    ])
+}
+
+/// A map the zone announces with its true CRC, but which does not read as a
+/// map: a bitmap header whose size field runs past the end of the file.
+fn unreadable_map_bytes() -> Vec<u8> {
+    let mut b = b"BM".to_vec();
+    b.extend_from_slice(&0xFFFF_u32.to_le_bytes());
+    b.extend_from_slice(&[0; 26]);
+    b
+}
+
+#[derive(Default)]
+struct Zone {
+    /// The arena's map, when it is not [`map_bytes`].
+    map: Option<Vec<u8>>,
+    /// A copy of the map the client already holds, offered from its cache.
+    cached: Option<Vec<u8>>,
+    /// Damaged copies of the map to send before a good one.
+    damaged_maps: u32,
+    /// Damaged copies of the listed LVZ to send before a good one.
+    damaged_lvz: u32,
+    /// Map transfers to send as ones the client cannot take, before a good one.
+    cancelled_maps: u32,
+    /// The same for the listed LVZ.
+    cancelled_lvz: u32,
+    /// Map transfers to send as a map-data packet too short to decode.
+    malformed_maps: u32,
+    /// Send the map announcement one byte too long, so it does not decode.
+    malformed_list: bool,
+    /// Send the security check with the arena, before the map is asked for.
+    challenge_on_entry: bool,
+    /// Send the check first of all, before the settings and the map list.
+    challenge_first: bool,
+    /// Announce no map at all.
+    no_map: bool,
+    /// Send the settings only once the map has gone, with the listed LVZ.
+    settings_late: bool,
+    /// Send the settings cut short, so they do not decode.
+    short_settings: bool,
+    /// Push [`HIDDEN_NAME`] unasked once the map has gone, then send the check.
+    push_hidden: bool,
+    settings: Vec<u8>,
+    /// File requests received, in order (0 = the map).
+    requests: Vec<u16>,
+    /// Every security answer received.
+    answers: Vec<oss_proto::c2s::SecurityResponse>,
+    /// The transfer carrying the pushed file, while it is under way.
+    hidden_transfer: Option<TransferId>,
+    /// Steps left before the check goes out after the pushed file.
+    challenge_in: Option<u32>,
+    disconnected: bool,
+}
+
+impl Zone {
+    fn the_map(&self) -> Vec<u8> {
+        self.map.clone().unwrap_or_else(map_bytes)
+    }
+
+    fn handle(&mut self, server: &mut Server<u32>, pkt: &[u8]) {
+        let decoded = match C2SPacket::decode(pkt).expect("valid C2S") {
+            C2SPacket::ContLogin(c) => C2SPacket::Login(c.0),
+            other => other,
+        };
+        match decoded {
+            C2SPacket::Login(_) => {
+                let reply = LoginResponse {
+                    code: 0,
+                    server_version: 134,
+                    ..Default::default()
+                };
+                server.send(&ADDR, &packet(&reply), true);
+            }
+            C2SPacket::GoArena(_) => {
+                self.settings = ClientSettings::default().to_bytes();
+                server.send(
+                    &ADDR,
+                    &packet(&PlayerId {
+                        pid: 5,
+                        arena: None,
+                    }),
+                    true,
+                );
+                if self.challenge_first {
+                    server.send(&ADDR, &security(), true);
+                }
+                if self.short_settings {
+                    server.send(&ADDR, &self.settings[..700], true);
+                } else if !self.settings_late {
+                    server.send(&ADDR, &self.settings, true);
+                }
+                let me = PlayerData {
+                    pid: 5,
+                    name: FixedStr::new(b"tester"),
+                    ship: 8,
+                    ..Default::default()
+                };
+                server.send(&ADDR, &packet(&PlayerEntering { players: vec![me] }), true);
+                if self.malformed_list {
+                    let mut list = packet(&file_list(&self.the_map()));
+                    list.push(0);
+                    server.send(&ADDR, &list, true);
+                } else if !self.no_map {
+                    server.send(&ADDR, &packet(&file_list(&self.the_map())), true);
+                }
+                server.send(&ADDR, &packet(&EnteringArena {}), true);
+                if self.challenge_on_entry {
+                    server.send(&ADDR, &security(), true);
+                }
+            }
+            C2SPacket::MapRequest(r) => {
+                let index = r.index.unwrap_or(0);
+                self.requests.push(index);
+                if index == 2 && self.settings_late {
+                    server.send(&ADDR, &self.settings, true);
+                }
+                // A transfer whose first byte is 0 is no packet at all, so the
+                // client's transport cancels it on its first piece.
+                if index == 0 && self.malformed_maps > 0 {
+                    self.malformed_maps -= 1;
+                    let conn = server.connection_mut(&ADDR).unwrap();
+                    conn.send_sized(vec![0x2A, b't', b'i', b'n', b'y']);
+                    return;
+                }
+                let left = match index {
+                    0 => Some(&mut self.cancelled_maps),
+                    2 => Some(&mut self.cancelled_lvz),
+                    _ => None,
+                };
+                if let Some(n) = left.filter(|n| **n > 0) {
+                    *n -= 1;
+                    let conn = server.connection_mut(&ADDR).unwrap();
+                    conn.send_sized(vec![0; 1500]);
+                    return;
+                }
+                let p = match index {
+                    0 if self.damaged_maps > 0 => {
+                        self.damaged_maps -= 1;
+                        map_data(MAP_NAME, zlib(&other_map_bytes()))
+                    }
+                    0 => map_data(MAP_NAME, zlib(&self.the_map())),
+                    2 if self.damaged_lvz > 0 => {
+                        self.damaged_lvz -= 1;
+                        map_data(LVZ_NAME, DAMAGED_LVZ.to_vec())
+                    }
+                    2 => map_data(LVZ_NAME, LVZ.to_vec()),
+                    // The unnamed slot, answered as a subgame zone answers it.
+                    _ => map_data(HIDDEN_NAME, hidden_bytes()),
+                };
+                let good_map = index == 0 && p == map_data(MAP_NAME, zlib(&self.the_map()));
+                let conn = server.connection_mut(&ADDR).unwrap();
+                conn.send_sized(p);
+                if good_map && self.push_hidden {
+                    self.hidden_transfer =
+                        Some(conn.send_sized(map_data(HIDDEN_NAME, hidden_bytes())));
+                }
+            }
+            C2SPacket::SecurityResponse(r) => self.answers.push(r),
+            _ => {}
+        }
+    }
+}
+
+/// Runs a session against `zone` for up to `steps` 10 ms steps, answering the map
+/// and the files the way the graphical client does. Stops early once `done`.
+fn run(
+    zone: &mut Zone,
+    steps: usize,
+    recording: Option<Shared>,
+    done: impl Fn(&Zone, &Session) -> bool,
+) -> (Session, Vec<SessionEvent>) {
+    let mut now = 1_000u64;
+    let mut server = Server::new(Config::server());
+    server.add_acceptor(Box::new(VieAcceptor::default()));
+    let cfg = SessionConfig {
+        name: "tester".into(),
+        password: "pw".into(),
+        want_lvz: true,
+        ..Default::default()
+    };
+    let mut client = Session::new(cfg, now, 0xBEEF);
+    if let Some(r) = recording {
+        client.record_to(Recorder::new(Box::new(r), now, &[]).unwrap(), now);
+    }
+    let mut events = Vec::new();
+    for _ in 0..steps {
+        now += 10;
+        client.tick(now);
+        while let Some(d) = client.poll_transmit() {
+            server.handle_datagram(now, ADDR, &d);
+        }
+        server.tick(now);
+        while let Some((_, ev)) = server.poll_event() {
+            match ev {
+                Event::Packet(p) => zone.handle(&mut server, &p),
+                Event::SizedSent(id) if zone.hidden_transfer == Some(id) => {
+                    zone.hidden_transfer = None;
+                    zone.challenge_in = Some(50);
+                }
+                Event::Disconnected(_) => zone.disconnected = true,
+                _ => {}
+            }
+        }
+        if let Some(n) = zone.challenge_in.as_mut() {
+            if *n == 0 {
+                zone.challenge_in = None;
+                server.send(&ADDR, &security(), true);
+            } else {
+                *n -= 1;
+            }
+        }
+        while let Some((_, d)) = server.poll_transmit() {
+            client.handle_datagram(now, &d);
+        }
+        while let Some(ev) = client.poll_event() {
+            match &ev {
+                SessionEvent::MapNeeded { .. } => {
+                    let cached = zone.cached.as_deref();
+                    if !cached.is_some_and(|c| client.use_cached_map(c)) {
+                        client.download_map();
+                    }
+                }
+                SessionEvent::FilesListed(files) => {
+                    for f in files {
+                        client.download_file(&f.name);
+                    }
+                }
+                _ => {}
+            }
+            events.push(ev);
+        }
+        if done(zone, &client) {
+            break;
+        }
+    }
+    (client, events)
+}
+
+fn maps_ready(events: &[SessionEvent]) -> Vec<&[u8]> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::MapReady { data, .. } => Some(&data[..]),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_test_files_would_give_different_answers() {
+    // Without these, the tests below could pass for the wrong reason.
+    let real = map_checksum_of(&map_bytes());
+    assert_ne!(real, map_checksum_of(&hidden_bytes()));
+    assert_ne!(real, map_checksum_of(&other_map_bytes()));
+    assert_ne!(
+        checksum::crc32(&map_bytes()),
+        checksum::crc32(&other_map_bytes())
+    );
+}
+
+#[test]
+fn an_unnamed_slot_in_the_file_list_is_never_asked_for() {
+    let mut zone = Zone {
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 2000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending() && z.requests.len() >= 2
+    });
+
+    let listed = events.iter().find_map(|e| match e {
+        SessionEvent::FilesListed(f) => Some(f.clone()),
+        _ => None,
+    });
+    let listed = listed.expect("files listed");
+    assert_eq!(listed.len(), 1, "the unnamed slot is not offered");
+    // The listed file keeps its own index; the slot before it is not renumbered away.
+    assert_eq!((listed[0].index, listed[0].name.as_str()), (2, LVZ_NAME));
+    assert_eq!(zone.requests, vec![0, 2]);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        SessionEvent::FileReady { name, data, downloaded: true } if name == LVZ_NAME && data == LVZ
+    )));
+    assert_eq!(maps_ready(&events), vec![&map_bytes()[..]]);
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(zone.answers[0].map_checksum, map_checksum_of(&map_bytes()));
+    assert_eq!(client.state(), State::Playing);
+}
+
+#[test]
+fn a_file_the_arena_does_not_list_never_replaces_the_map() {
+    let mut zone = Zone {
+        push_hidden: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, _| !z.answers.is_empty());
+
+    assert!(
+        zone.hidden_transfer.is_none(),
+        "the unlisted file was delivered before the check"
+    );
+    assert_eq!(zone.answers.len(), 1, "the check was answered");
+    assert_eq!(
+        zone.answers[0].map_checksum,
+        map_checksum_of(&map_bytes()),
+        "answered with the announced map, not the unlisted file"
+    );
+    assert_eq!(
+        zone.answers[0].settings_checksum,
+        checksum::settings_checksum(KEY, &zone.settings)
+    );
+    assert_eq!(maps_ready(&events), vec![&map_bytes()[..]]);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::FileReady { name, .. } if name == HIDDEN_NAME)),
+        "an unlisted file is not handed on either"
+    );
+    assert!(!client.downloads_pending());
+    assert_eq!(client.state(), State::Playing);
+}
+
+#[test]
+fn a_damaged_map_is_asked_for_again_and_the_check_waits_for_it() {
+    let mut zone = Zone {
+        damaged_maps: 1,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending()
+    });
+
+    assert_eq!(zone.requests, vec![0, 0, 2], "the map was asked for twice");
+    assert_eq!(maps_ready(&events), vec![&map_bytes()[..]]);
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(zone.answers[0].map_checksum, map_checksum_of(&map_bytes()));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::MapRejected { .. }))
+    );
+    assert_eq!(client.state(), State::Playing);
+}
+
+#[test]
+fn a_map_that_stays_damaged_ends_the_visit_unanswered() {
+    let mut zone = Zone {
+        damaged_maps: u32::MAX,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let recording = Shared::default();
+    let (client, events) = run(&mut zone, 3000, Some(recording.clone()), |z, c| {
+        z.disconnected && c.state() == State::Closed
+    });
+
+    assert_eq!(zone.requests, vec![0, 0], "asked once more, then no more");
+    assert!(maps_ready(&events).is_empty(), "no damaged map is used");
+    assert!(
+        zone.answers.is_empty(),
+        "the check held for the map is never answered"
+    );
+    let rejected = events
+        .iter()
+        .position(|e| matches!(e, SessionEvent::MapRejected { name, .. } if name == MAP_NAME))
+        .expect("the refusal is reported");
+    let closed = events
+        .iter()
+        .position(|e| matches!(e, SessionEvent::Closed(_)))
+        .expect("and the session hangs up");
+    assert!(rejected < closed, "the reason comes before the hang-up");
+    assert!(zone.disconnected, "the zone saw the client leave");
+    assert_eq!(client.state(), State::Closed);
+    drop(client);
+
+    // The same visit played back: the damaged map is not used, and playback,
+    // which has no zone to ask again, neither refuses nor hangs up.
+    let (replayed, seen) = play_back(&recording);
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, SessionEvent::MapNeeded { .. }))
+    );
+    assert!(!seen.iter().any(|e| matches!(
+        e,
+        SessionEvent::MapReady { .. } | SessionEvent::MapRejected { .. } | SessionEvent::Closed(_)
+    )));
+    assert_ne!(replayed.state(), State::Closed);
+}
+
+fn files_ready<'a>(events: &'a [SessionEvent], want: &str) -> Vec<&'a [u8]> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::FileReady { name, data, .. } if name == want => Some(&data[..]),
+            _ => None,
+        })
+        .collect()
+}
+
+fn files_rejected(events: &[SessionEvent], want: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::FileRejected { name, .. } if name == want))
+        .count()
+}
+
+/// Plays a recording back through a playback session, as the client's replay
+/// viewer does, and returns the session and everything it reported.
+fn play_back(recording: &Shared) -> (Session, Vec<SessionEvent>) {
+    let bytes = recording.0.lock().unwrap().clone();
+    let mut player = ReplayPlayer::from_bytes(&bytes).unwrap();
+    let mut replayed = Session::playback(SessionConfig::default(), 0);
+    let mut seen = Vec::new();
+    let mut t = 0u32;
+    while !player.finished() {
+        t += 10;
+        let due: Vec<_> = player.due(t).to_vec();
+        for r in &due {
+            replayed.feed(t as u64, r);
+        }
+        seen.extend(std::iter::from_fn(|| replayed.poll_event()));
+    }
+    (replayed, seen)
+}
+
+#[test]
+fn a_damaged_lvz_is_asked_for_again_and_the_good_copy_used() {
+    let mut zone = Zone {
+        damaged_lvz: 1,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending() && z.requests.len() >= 3
+    });
+
+    assert_eq!(zone.requests, vec![0, 2, 2], "the LVZ was asked for twice");
+    assert_eq!(
+        files_ready(&events, LVZ_NAME),
+        vec![LVZ],
+        "only the good copy"
+    );
+    assert_eq!(files_rejected(&events, LVZ_NAME), 0);
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(client.state(), State::Playing);
+}
+
+#[test]
+fn an_lvz_that_stays_damaged_is_left_out_and_the_visit_goes_on() {
+    let mut zone = Zone {
+        damaged_lvz: u32::MAX,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let recording = Shared::default();
+    let (client, events) = run(&mut zone, 3000, Some(recording.clone()), |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending() && z.requests.len() >= 3
+    });
+
+    assert_eq!(
+        zone.requests,
+        vec![0, 2, 2],
+        "asked once more, then no more"
+    );
+    assert!(
+        files_ready(&events, LVZ_NAME).is_empty(),
+        "a damaged LVZ is never handed on"
+    );
+    assert_eq!(
+        files_rejected(&events, LVZ_NAME),
+        1,
+        "and that is said once"
+    );
+    assert_eq!(zone.answers.len(), 1, "the check is still answered");
+    assert_eq!(zone.answers[0].map_checksum, map_checksum_of(&map_bytes()));
+    assert!(!events.iter().any(|e| matches!(e, SessionEvent::Closed(_))));
+    assert!(!zone.disconnected);
+    assert_eq!(client.state(), State::Playing);
+    drop(client);
+
+    // Played back, the damaged copies are neither used nor asked for again.
+    let (replayed, seen) = play_back(&recording);
+    assert!(files_ready(&seen, LVZ_NAME).is_empty());
+    assert_eq!(files_rejected(&seen, LVZ_NAME), 0);
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, SessionEvent::MapReady { .. }))
+    );
+    assert_ne!(replayed.state(), State::Closed);
+}
+
+/// A map whose CRC is the zone's but which does not read as a map is not asked
+/// for again -- another copy would be the same bytes -- and is never played on
+/// as an empty map: the visit ends, and the check waiting for the map is never
+/// answered. The same from the cache. Played back, it is neither used nor
+/// refused.
+#[test]
+fn a_map_that_does_not_read_as_one_ends_the_visit_unanswered() {
+    assert!(oss_formats::Level::parse(&unreadable_map_bytes()).is_err());
+    for from_cache in [false, true] {
+        let mut zone = Zone {
+            map: Some(unreadable_map_bytes()),
+            cached: from_cache.then(unreadable_map_bytes),
+            challenge_on_entry: true,
+            ..Default::default()
+        };
+        let recording = Shared::default();
+        let (client, events) = run(&mut zone, 3000, Some(recording.clone()), |z, c| {
+            z.disconnected && c.state() == State::Closed
+        });
+
+        let want: Vec<u16> = if from_cache { vec![] } else { vec![0] };
+        assert_eq!(zone.requests, want, "never asked for again ({from_cache})");
+        assert!(maps_ready(&events).is_empty(), "not used ({from_cache})");
+        assert!(zone.answers.is_empty(), "the check is never answered");
+        let rejected = events.iter().find_map(|e| match e {
+            SessionEvent::MapRejected { name, reason } if name == MAP_NAME => Some(reason),
+            _ => None,
+        });
+        let rejected = rejected.expect("the refusal is reported");
+        assert!(rejected.contains("does not read as a map"), "{rejected}");
+        assert!(zone.disconnected, "the zone saw the client leave");
+        assert_eq!(client.state(), State::Closed);
+        drop(client);
+
+        let (replayed, seen) = play_back(&recording);
+        assert!(!seen.iter().any(|e| matches!(
+            e,
+            SessionEvent::MapReady { .. }
+                | SessionEvent::MapRejected { .. }
+                | SessionEvent::Closed(_)
+        )));
+        assert_ne!(replayed.state(), State::Closed);
+    }
+}
+
+/// The map in the security answer is the map as the servers hold it: a large
+/// object covers the whole of its area, walls listed before it included.
+/// ASSS, Subspace Server .NET and oss-server all compute the checksum they
+/// expect that way; the plain grid, which the session used to answer from,
+/// keeps the covered walls and gives a different sum.
+#[test]
+fn the_map_checksum_counts_large_objects_over_their_whole_area() {
+    let level = big_object_map_bytes();
+    let plain = oss_formats::Level::parse(&level).unwrap().tile_grid();
+    let plain = checksum::map_checksum(KEY, |x, y| plain.get(x as u32, y as u32));
+    let want = asss_map_checksum(&level, KEY);
+    assert_ne!(plain, want, "the map tells the two grids apart");
+    assert_eq!(
+        asss_map_checksum(&map_bytes(), KEY),
+        map_checksum_of(&map_bytes()),
+        "the transcription agrees where there is nothing to expand"
+    );
+
+    let mut zone = Zone {
+        map: Some(level),
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, _) = run(&mut zone, 3000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending()
+    });
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(zone.answers[0].map_checksum, want);
+    assert_eq!(client.state(), State::Playing);
+}
+
+/// A map transfer the client's transport cancels never arrives. It used to be
+/// waited for for ever: the check held for the map went unanswered and the
+/// client never left its download screen. Now it counts as a damaged copy:
+/// asked for once more, and a second ends the visit.
+#[test]
+fn a_cancelled_map_transfer_is_asked_for_again_then_refused() {
+    let mut zone = Zone {
+        cancelled_maps: 1,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending()
+    });
+    assert_eq!(zone.requests, vec![0, 0, 2], "asked for again, then got");
+    assert_eq!(maps_ready(&events), vec![&map_bytes()[..]]);
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(zone.answers[0].map_checksum, map_checksum_of(&map_bytes()));
+    assert_eq!(client.state(), State::Playing);
+
+    let mut zone = Zone {
+        cancelled_maps: u32::MAX,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, c| {
+        z.disconnected && c.state() == State::Closed
+    });
+    assert_eq!(zone.requests, vec![0, 0]);
+    assert!(maps_ready(&events).is_empty());
+    assert!(zone.answers.is_empty());
+    assert!(events.iter().any(|e| matches!(
+        e,
+        SessionEvent::MapRejected { reason, .. } if reason.contains("cancelled")
+    )));
+    assert_eq!(client.state(), State::Closed);
+}
+
+/// The same for an LVZ, which is left out rather than ending the visit.
+#[test]
+fn a_cancelled_lvz_transfer_is_asked_for_again_then_left_out() {
+    let mut zone = Zone {
+        cancelled_lvz: u32::MAX,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending() && z.requests.len() >= 3
+    });
+    assert_eq!(zone.requests, vec![0, 2, 2]);
+    assert!(files_ready(&events, LVZ_NAME).is_empty());
+    assert_eq!(files_rejected(&events, LVZ_NAME), 1);
+    assert!(
+        !client.downloads_pending(),
+        "nothing is waited for any more"
+    );
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(client.state(), State::Playing);
+}
+
+/// A check that arrives before the arena's settings waits for them, and for
+/// the map, rather than going out with a settings checksum of 0. Here the
+/// settings come last of all, after the map.
+#[test]
+fn a_check_before_the_settings_waits_for_them() {
+    let mut zone = Zone {
+        challenge_first: true,
+        settings_late: true,
+        ..Default::default()
+    };
+    let (client, _) = run(&mut zone, 3000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending()
+    });
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(
+        zone.answers[0].settings_checksum,
+        checksum::settings_checksum(KEY, &zone.settings)
+    );
+    assert_eq!(zone.answers[0].map_checksum, map_checksum_of(&map_bytes()));
+    assert_eq!(client.state(), State::Playing);
+}
+
+/// A zone that announces no map has none: the answer is the sum over an empty
+/// map, which is the key itself (ASSS `GetChecksum`), not 0.
+#[test]
+fn with_no_map_announced_the_map_checksum_is_that_of_an_empty_map() {
+    let mut zone = Zone {
+        no_map: true,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    run(&mut zone, 3000, None, |z, _| !z.answers.is_empty());
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(zone.answers[0].map_checksum, KEY);
+    assert_eq!(zone.requests, Vec::<u16>::new());
+}
+
+/// Settings that do not decode cannot be asked for again, and every answer is
+/// built from them: the visit ends, with the reason, and the check is never
+/// answered. Played back, the recording carries on.
+#[test]
+fn settings_that_do_not_decode_end_the_visit_unanswered() {
+    let mut zone = Zone {
+        short_settings: true,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let recording = Shared::default();
+    let (client, events) = run(&mut zone, 3000, Some(recording.clone()), |z, c| {
+        z.disconnected && c.state() == State::Closed
+    });
+    assert!(zone.answers.is_empty());
+    let refused = events.iter().position(|e| {
+        matches!(
+            e,
+            SessionEvent::Refused { reason } if reason.contains("arena settings")
+        )
+    });
+    let closed = events
+        .iter()
+        .position(|e| matches!(e, SessionEvent::Closed(_)));
+    assert!(refused.expect("refused") < closed.expect("closed"));
+    assert_eq!(client.state(), State::Closed);
+    drop(client);
+
+    let (replayed, seen) = play_back(&recording);
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Refused { .. } | SessionEvent::Closed(_)))
+    );
+    assert_ne!(replayed.state(), State::Closed);
+}
+
+/// A map-data packet too short to decode is a failed copy of the map: asked
+/// for again, not waited for for ever.
+#[test]
+fn a_map_data_packet_that_does_not_decode_is_asked_for_again() {
+    let mut zone = Zone {
+        malformed_maps: 1,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, c| {
+        !z.answers.is_empty() && !c.downloads_pending()
+    });
+    assert_eq!(zone.requests, vec![0, 0, 2]);
+    assert_eq!(maps_ready(&events), vec![&map_bytes()[..]]);
+    assert_eq!(zone.answers.len(), 1);
+    assert_eq!(zone.answers[0].map_checksum, map_checksum_of(&map_bytes()));
+    assert_eq!(client.state(), State::Playing);
+}
+
+/// A map announcement that does not decode cannot be asked for again, and
+/// without it every answer would carry no map, or the last arena's: the visit
+/// ends with the reason, and the check is never answered.
+#[test]
+fn a_map_announcement_that_does_not_decode_ends_the_visit_unanswered() {
+    let mut zone = Zone {
+        malformed_list: true,
+        challenge_on_entry: true,
+        ..Default::default()
+    };
+    let (client, events) = run(&mut zone, 3000, None, |z, c| {
+        z.disconnected && c.state() == State::Closed
+    });
+    assert!(zone.answers.is_empty());
+    assert!(zone.requests.is_empty());
+    assert!(events.iter().any(|e| matches!(
+        e,
+        SessionEvent::Refused { reason } if reason.contains("map announcement")
+    )));
+    assert_eq!(client.state(), State::Closed);
+}
+
+/// A `Write` the test can read back after the session is gone.
+#[derive(Clone, Default)]
+struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for Shared {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

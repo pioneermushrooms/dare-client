@@ -328,8 +328,13 @@ fn flag(name: &str) -> bool {
 
 #[derive(Debug)]
 pub enum FrameError {
-    /// Skip this frame (minimised, timeout); try again next frame.
+    /// Skip this frame (the GPU is behind, or the surface needs configuring
+    /// again); try again next frame.
     Skip,
+    /// The surface can't be shown: the window is covered or minimised, which the
+    /// GPU reports (occluded, or a buffer that never came) even when the window
+    /// system doesn't. Drawing again at once would only spin or stall.
+    Hidden,
     /// Unrecoverable surface/device failure.
     Fatal(String),
 }
@@ -804,7 +809,7 @@ impl Renderer {
                 self.perf.end(Stage::Acquire);
                 self.perf.skipped();
                 self.clear_queue();
-                return Err(FrameError::Skip);
+                return Err(FrameError::Hidden);
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 log::debug!("frame skipped (surface outdated/lost)");

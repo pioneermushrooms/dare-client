@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use oss_net::{
-    CipherKind, Config, Connection, DisconnectReason, Event as NetEvent, Handshake,
+    CipherKind, Config, Connection, DisconnectReason, Era, Event as NetEvent, Handshake,
     VieClientHandshake,
 };
 use oss_proto::c2s::{
@@ -43,6 +43,34 @@ pub use oss_proto::s2c::BallPosition;
 
 /// Spectator "ship".
 pub const SPECTATOR: u8 = 8;
+
+/// The longest player name, in characters.
+///
+/// SubSpace 1.34's name box stops at 23, and the biller's login reply has
+/// room for 23 and a terminator. Anything that takes a name refuses a longer
+/// one rather than cutting it: a cut name is a different account.
+pub const MAX_NAME: usize = 23;
+
+/// Why SubSpace 1.34's own name box refuses `name`, in its words, or `None`
+/// if it does not.
+///
+/// It refuses a name that starts with a symbol, and a name with a colon
+/// anywhere in it: `:name:` is how a remote private message is addressed,
+/// so a name with a colon could not be sent one. The length is
+/// [`MAX_NAME`]'s to check.
+pub fn name_refusal(name: &str) -> Option<&'static str> {
+    if name
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_ascii_alphanumeric())
+    {
+        return Some("Player name cannot start with a symbol.");
+    }
+    if name.contains(':') {
+        return Some("Player name cannot contain a colon.");
+    }
+    None
+}
 
 /// Which of the form's two round buttons for sex the player chose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,15 +385,23 @@ pub enum SessionEvent {
         received: usize,
         total: usize,
     },
-    /// The map is ready (decompressed `.lvl` bytes). Cache it if it was downloaded.
     /// The arena's extra files (LVZ), listed after its map. Answer each with
     /// [`Session::use_cached_file`] or [`Session::download_file`].
     FilesListed(Vec<ArenaFile>),
-    /// An extra file is ready (raw bytes). Cache it if it was downloaded.
+    /// An extra file is ready (raw bytes) and its CRC is the one the zone
+    /// listed. Cache it if it was downloaded.
     FileReady {
         name: String,
         data: Vec<u8>,
         downloaded: bool,
+    },
+    /// An extra file came down damaged twice (its CRC was not the one the zone
+    /// listed), so it is left out: no [`SessionEvent::FileReady`] follows for it.
+    /// The visit goes on, since the files are not part of any answer to the
+    /// zone. `reason` says what was wrong with the last copy.
+    FileRejected {
+        name: String,
+        reason: String,
     },
     /// The zone's news file, as text ([`Session::request_news`] asked for it).
     News(String),
@@ -436,10 +472,24 @@ pub enum SessionEvent {
     ObjectsToggled(Vec<(u16, bool)>),
     /// LVZ object properties changed (S2C `0x36`).
     ObjectsChanged(Vec<ObjectChange>),
+    /// The map is ready (decompressed `.lvl` bytes) and its CRC is the one the
+    /// zone announced. Cache it if it was downloaded.
     MapReady {
         name: String,
         data: Vec<u8>,
         downloaded: bool,
+    },
+    /// The map cannot be used: it came down damaged twice (its CRC was not the
+    /// one the zone announced, or it would not decompress), or it has the zone's
+    /// CRC but does not read as a map. The session has hung up rather than
+    /// answer the zone's security checks with a map known to be wrong; a
+    /// [`SessionEvent::Closed`] follows. `reason` finishes a sentence that
+    /// starts with the map's name -- "arrived damaged twice (...)", "has the
+    /// zone's checksum but does not read as a map (...)" -- for the log and
+    /// for the player.
+    MapRejected {
+        name: String,
+        reason: String,
     },
     /// The arena entry sequence finished; positions can flow.
     Playing,
@@ -499,6 +549,14 @@ pub enum SessionEvent {
         prize: i16,
     },
     Closed(DisconnectReason),
+    /// The zone sent something a security answer is built from in a form the
+    /// session cannot read -- its arena settings or its map announcement -- and
+    /// neither can be asked for again, so the session has hung up rather than
+    /// answer with checksums known to be wrong. A [`SessionEvent::Closed`]
+    /// follows. `reason` is a sentence for the player.
+    Refused {
+        reason: String,
+    },
     /// The zone sent the player on to another zone (S2C `0x3B`), and this
     /// session has hung up on the first. Connect to `server` with the same name
     /// and password, put `login_id` in [`SessionConfig::redirect_id`], and enter
@@ -547,9 +605,23 @@ pub struct ArenaFile {
 struct MapInfo {
     name: String,
     checksum: u32,
-    /// Row-major 1024×1024 tiles, for the security map checksum.
+    /// Row-major 1024×1024 tiles, for the security map checksum, with large
+    /// objects expanded over their area. Set only from a map whose CRC matched
+    /// `checksum` and which read as a map.
     tiles: Option<Vec<u8>>,
+    /// Downloads of this map that arrived damaged (a checksum that is not the
+    /// zone's, or data that would not decompress).
+    bad_downloads: u8,
 }
+
+/// How many damaged copies of the map a session takes before it gives up: the
+/// first is asked for again, the second ends the visit
+/// ([`SessionEvent::MapRejected`]).
+const MAX_BAD_MAP_DOWNLOADS: u8 = 2;
+
+/// The same for each extra file: the first damaged copy is asked for again, the
+/// second leaves the file out ([`SessionEvent::FileRejected`]).
+const MAX_BAD_FILE_DOWNLOADS: u8 = 2;
 
 pub struct Session {
     conn: Connection,
@@ -566,6 +638,11 @@ pub struct Session {
     map: Option<MapInfo>,
     /// Extra files listed with the map.
     files: Vec<ArenaFile>,
+    /// Indices of listed files already accepted (downloaded with the right CRC,
+    /// or taken from a cache that matched). A repeat of one changes nothing.
+    files_accepted: std::collections::BTreeSet<u16>,
+    /// Damaged copies received so far, by file index.
+    files_bad: BTreeMap<u16, u8>,
     /// Flag ids the server reported as turf (static) flags.
     turf_flags: std::collections::BTreeSet<u16>,
     /// File requests waiting for the current transfer to finish (0 = the map).
@@ -604,6 +681,9 @@ pub struct Session {
     awaiting_new_user: bool,
     /// [`SessionEvent::RegistrationWanted`] is waiting for an answer.
     awaiting_registration: bool,
+    /// Which security mechanism the connection uses, when the session was
+    /// opened with [`Session::with_negotiation`].
+    mechanism: Option<security::MechanismInUse>,
 }
 
 impl Session {
@@ -635,7 +715,25 @@ impl Session {
         self.endpoint = (server_ip, bound_port);
     }
 
-    /// A session with any client handshake (e.g. unencrypted, or a private cipher).
+    /// A session opened with a handshake built from the mechanism registry
+    /// ([`security::client_handshake`]), which also says which mechanism the
+    /// connection uses. The login form is then checked against the era that
+    /// mechanism declares, so a mechanism from outside this repository is
+    /// checked like the built-in ones.
+    pub fn with_negotiation(
+        cfg: SessionConfig,
+        now_ms: u64,
+        negotiation: security::Negotiation,
+    ) -> Self {
+        let mut session = Self::with_handshake(cfg, now_ms, negotiation.handshake);
+        session.mechanism = Some(negotiation.mechanism);
+        session
+    }
+
+    /// A session with any client handshake (e.g. unencrypted). Nothing says
+    /// which mechanism it is, so the login form is checked against the kind of
+    /// cipher it ends with; [`Session::with_negotiation`] is the way to open one
+    /// from the mechanism registry.
     pub fn with_handshake(cfg: SessionConfig, now_ms: u64, handshake: Box<dyn Handshake>) -> Self {
         Self {
             conn: Connection::client(Config::client(), handshake, now_ms),
@@ -648,6 +746,8 @@ impl Session {
             settings_raw: Vec::new(),
             map: None,
             files: Vec::new(),
+            files_accepted: Default::default(),
+            files_bad: BTreeMap::new(),
             downloads: VecDeque::new(),
             turf_flags: Default::default(),
             downloading: None,
@@ -668,6 +768,7 @@ impl Session {
             new_user_sent: false,
             awaiting_new_user: false,
             awaiting_registration: false,
+            mechanism: None,
         }
     }
 
@@ -800,6 +901,22 @@ impl Session {
     /// The connection's encryption ("opensec", "vie", ...) once connected.
     pub fn cipher_name(&self) -> Option<&'static str> {
         self.conn.cipher_name()
+    }
+
+    /// Which security mechanism the connection uses, when the session was
+    /// opened with [`Session::with_negotiation`].
+    pub fn mechanism(&self) -> Option<&security::MechanismInUse> {
+        self.mechanism.as_ref()
+    }
+
+    /// What is wrong with sending `form` on this connection, if anything: the
+    /// login form checked against the era of the connection's mechanism, or of
+    /// its cipher's kind when the session does not know its mechanism.
+    fn login_complaint(&self, form: &LoginForm) -> Option<&'static str> {
+        login_form_mismatch(
+            login_era(self.mechanism.as_ref(), self.conn.cipher_kind()),
+            form.kind == c2s::kind::CONT_LOGIN,
+        )
     }
 
     /// The server's OpenSec key, when it sent one.
@@ -969,7 +1086,9 @@ impl Session {
                     self.state = State::Closed;
                     self.events.push_back(SessionEvent::Closed(reason));
                 }
-                _ => {}
+                NetEvent::SizedIncomingCancelled => self.on_transfer_cancelled(),
+                // Transfers this session sends; it sends none.
+                NetEvent::SizedSent(_) | NetEvent::SizedCancelled(_) => {}
             }
         }
     }
@@ -982,18 +1101,16 @@ impl Session {
         // The profile and the cipher are chosen separately and have to agree: a zone
         // picks the login form it expects from the *encryption*, not from the packet's
         // type byte, and drops a mismatch with nothing on the wire to say why. This is
-        // the one place both are in hand. `Connection::establish` sets the cipher
-        // before it pushes `Connected`, and this runs from that arm, so the kind is
-        // already known here.
+        // the one place both are in hand. `Connection::establish` sets the cipher,
+        // and a ladder records which rung won, before `Connected` is pushed, and this
+        // runs from that arm, so both are already known here.
         //
-        // Logged, not asserted: with `SecurityMode::Auto` the cipher we end up with is
-        // partly the *server's* choice (OpenSec, falling back to VIE), so a remote peer
+        // Logged, not asserted: with the automatic order the mechanism we end up with
+        // is partly the *server's* choice (the strongest it answers), so a remote peer
         // can decide whether this fires — and in this repo network data never panics
         // the client. The send goes ahead; the zone's refusal is the real outcome and
         // this is the line that explains it.
-        if let Some(complaint) =
-            login_form_mismatch(self.conn.cipher_kind(), form.kind == c2s::kind::CONT_LOGIN)
-        {
+        if let Some(complaint) = self.login_complaint(&form) {
             log::error!(
                 "{complaint} (cipher {}); the zone will drop this login",
                 self.conn.cipher_name().unwrap_or("?")
@@ -1053,10 +1170,7 @@ impl Session {
         let packet = match S2CPacket::decode(data) {
             Ok(p) => p,
             Err(e) => {
-                log::debug!(
-                    "bad S2C packet {:#04x}: {e}",
-                    data.first().copied().unwrap_or(0)
-                );
+                self.on_unreadable(data.first().copied().unwrap_or(0), &e.to_string());
                 return;
             }
         };
@@ -1147,6 +1261,7 @@ impl Session {
                 self.settings_raw = data.to_vec();
                 self.settings = Some(cs.clone());
                 self.events.push_back(SessionEvent::Settings(cs));
+                self.answer_held_check();
             }
             S2CPacket::PlayerEntering(pe) => {
                 for d in pe.players {
@@ -1183,10 +1298,18 @@ impl Session {
                     },
                 };
                 self.files = match &m {
+                    // An entry with no name, checksum or size is a slot the zone
+                    // keeps but does not offer. A subgame zone was seen listing
+                    // one to a client that had not asked for optional files,
+                    // which keeps the indices after it the same; asked for anyway,
+                    // it sent the file behind the slot, under a name the list
+                    // never gave. Real Continuum is not known to ask for one. It
+                    // is skipped; the indices of the others are kept as they are.
                     MapFilename::Files(files) => files
                         .iter()
                         .enumerate()
                         .skip(1)
+                        .filter(|(_, f)| !fixed_to_string(f.name.as_bytes()).is_empty())
                         .map(|(i, f)| ArenaFile {
                             index: i.min(u16::MAX as usize) as u16,
                             name: fixed_to_string(f.name.as_bytes()),
@@ -1196,11 +1319,14 @@ impl Session {
                         .collect(),
                     MapFilename::Single { .. } => Vec::new(),
                 };
+                self.files_accepted.clear();
+                self.files_bad.clear();
                 self.downloads.clear();
                 self.map = Some(MapInfo {
                     name: name.clone(),
                     checksum,
                     tiles: None,
+                    bad_downloads: 0,
                 });
                 if self.state == State::EnteringArena || self.state == State::Playing {
                     self.state = State::WaitingForMap;
@@ -1219,10 +1345,17 @@ impl Session {
                     .map
                     .as_ref()
                     .is_some_and(|i| i.name.eq_ignore_ascii_case(&name));
-                if !is_map && let Some(f) = self.file_named(&name).cloned() {
+                // Routed by name only. A file the arena did not list is not the map,
+                // whatever is being fetched: taking one for the map used to replace
+                // a good map with an LVZ's bytes, and the next security answer then
+                // carried a map checksum the zone could not accept.
+                if is_map {
+                    self.on_map_data(&m.data);
+                } else if let Some(f) = self.file_named(&name).cloned() {
                     self.on_file_data(&f, m.data);
                 } else {
-                    self.on_map_data(&m.data);
+                    log::info!("the zone sent {name:?}, a file this arena does not list; ignored");
+                    return;
                 }
                 self.downloading = None;
                 self.next_download();
@@ -1303,6 +1436,7 @@ impl Session {
                 .push_back(SessionEvent::ObjectsChanged(m.changes)),
             S2CPacket::EnteringArena(_) => {
                 self.entering_done = true;
+                self.answer_held_check();
                 self.maybe_playing();
             }
             S2CPacket::Security(s) => self.on_security(now_ms, &s),
@@ -1523,6 +1657,9 @@ impl Session {
 
     /// Offers a cached copy of the map named in [`SessionEvent::MapNeeded`]. Returns
     /// false (and changes nothing) if it doesn't match the server's checksum.
+    /// A copy that matches but does not read as a map ends the visit
+    /// ([`SessionEvent::MapRejected`]), since downloading it would only bring
+    /// the same bytes.
     pub fn use_cached_map(&mut self, data: &[u8]) -> bool {
         let Some(info) = self.map.as_ref() else {
             return false;
@@ -1567,6 +1704,7 @@ impl Session {
             return false;
         }
         let name = f.name.clone();
+        self.files_accepted.insert(f.index);
         if let Some(r) = self.recorder.as_mut() {
             r.file(self.last_now_ms, &name, data);
         }
@@ -1737,50 +1875,200 @@ impl Session {
         self.events.push_back(SessionEvent::News(text));
     }
 
+    /// A listed file arrived. It is used only if its CRC is the one the zone
+    /// listed, as the map is: a damaged copy is asked for once more, and a second
+    /// one leaves the file out ([`SessionEvent::FileRejected`]). The visit goes
+    /// on without it, since no answer to the zone depends on the files.
     fn on_file_data(&mut self, file: &ArenaFile, data: Vec<u8>) {
-        if checksum::crc32(&data) != file.checksum {
-            log::warn!(
-                "{} checksum differs from the server's; using it anyway",
+        if self.files_accepted.contains(&file.index) {
+            log::debug!(
+                "{} arrived again; keeping the copy already checked",
                 file.name
             );
+            return;
         }
-        if let Some(r) = self.recorder.as_mut() {
-            r.file(self.last_now_ms, &file.name, &data);
+        let got = checksum::crc32(&data);
+        if got == file.checksum {
+            self.files_accepted.insert(file.index);
+            if let Some(r) = self.recorder.as_mut() {
+                r.file(self.last_now_ms, &file.name, &data);
+            }
+            self.events.push_back(SessionEvent::FileReady {
+                name: file.name.clone(),
+                data,
+                downloaded: true,
+            });
+            return;
         }
-        self.events.push_back(SessionEvent::FileReady {
-            name: file.name.clone(),
-            data,
-            downloaded: true,
-        });
+        let problem = format!(
+            "its checksum is {got:08x}, not the {:08x} the zone listed",
+            file.checksum
+        );
+        self.file_copy_failed(file, problem);
     }
 
+    /// A copy of a listed file could not be used (`problem` says why): asked for
+    /// once more, ahead of the queue, and left out after the second.
+    fn file_copy_failed(&mut self, file: &ArenaFile, problem: String) {
+        let bad = self.files_bad.entry(file.index).or_insert(0);
+        *bad = bad.saturating_add(1);
+        let bad = *bad;
+        if self.playback {
+            log::warn!(
+                "{} in the recording is damaged ({problem}); not used",
+                file.name
+            );
+        } else if bad < MAX_BAD_FILE_DOWNLOADS {
+            log::warn!(
+                "{} arrived damaged ({problem}); asking for it again",
+                file.name
+            );
+            self.downloads.retain(|&i| i != file.index);
+            self.downloads.push_front(file.index);
+        } else {
+            log::warn!(
+                "{} arrived damaged again ({problem}); left out of this arena",
+                file.name
+            );
+            self.events.push_back(SessionEvent::FileRejected {
+                name: file.name.clone(),
+                reason: problem,
+            });
+        }
+    }
+
+    /// The map arrived. It is used only if its CRC is the one the zone announced:
+    /// the map is part of every security answer, so a map known to be wrong would
+    /// be an answer known to be wrong. A damaged copy is asked for once more; a
+    /// second one ends the visit with [`SessionEvent::MapRejected`], and any
+    /// security check waiting for the map is never answered.
     fn on_map_data(&mut self, compressed: &[u8]) {
         let Some(info) = self.map.as_ref() else {
             return;
         };
-        let data = match map::inflate(compressed) {
-            Ok(d) => d,
-            Err(e) => {
-                log::warn!("map download for {} is corrupt: {e}", info.name);
-                return;
-            }
-        };
-        if checksum::crc32(&data) != info.checksum {
-            log::warn!(
-                "map {} checksum differs from the server's; using it anyway",
+        if info.tiles.is_some() {
+            // A repeat of a map already accepted changes nothing.
+            log::debug!(
+                "map {} arrived again; keeping the copy already checked",
                 info.name
             );
+            return;
         }
         let name = info.name.clone();
-        self.set_map(name, data, true);
+        let expected = info.checksum;
+        let problem = match map::inflate(compressed) {
+            Ok(data) => {
+                let got = checksum::crc32(&data);
+                if got == expected {
+                    self.set_map(name, data, true);
+                    return;
+                }
+                format!("its checksum is {got:08x}, not the {expected:08x} the zone announced")
+            }
+            Err(e) => format!("it does not decompress ({e})"),
+        };
+        self.map_copy_failed(name, problem);
+    }
+
+    /// A copy of the map could not be used (`problem` says why): asked for once
+    /// more, ahead of the queue, and after the second the visit ends.
+    fn map_copy_failed(&mut self, name: String, problem: String) {
+        let bad = match self.map.as_mut() {
+            Some(info) => {
+                info.bad_downloads = info.bad_downloads.saturating_add(1);
+                info.bad_downloads
+            }
+            None => return,
+        };
+        if self.playback {
+            // A recording is played as it was; there is no zone to ask again.
+            log::warn!("map {name} in the recording is damaged ({problem}); not used");
+        } else if bad < MAX_BAD_MAP_DOWNLOADS {
+            log::warn!("map {name} arrived damaged ({problem}); asking for it again");
+            // Ahead of any files still queued: a security check may be waiting
+            // for the map, and the files are not.
+            self.downloads.retain(|&i| i != 0);
+            self.downloads.push_front(0);
+        } else {
+            self.reject_map(name, format!("arrived damaged twice ({problem})"));
+        }
+    }
+
+    /// The transfer in flight was cancelled: by the zone, or by the transport
+    /// because it was not a transfer it could take (too large, or inconsistent
+    /// from one piece to the next). Nothing more will arrive for that request,
+    /// so it counts as a damaged copy: asked for again once, then the map is
+    /// refused or the file left out. Before this, the session kept waiting for
+    /// it, a security check held for the map was never answered, and the
+    /// client never left its download screen.
+    ///
+    /// The retry is not swallowed by the transport's "ignore the rest of the
+    /// cancelled transfer" state: the zone acknowledges the cancel (`00 0C`,
+    /// ASSS `net.c` and oss-net alike), which clears it, before it can answer
+    /// the new request.
+    fn on_transfer_cancelled(&mut self) {
+        self.on_transfer_failed("its transfer was cancelled");
+    }
+
+    /// The request in flight will bring nothing usable (`problem` says why).
+    fn on_transfer_failed(&mut self, problem: &str) {
+        let Some(index) = self.downloading.take() else {
+            log::debug!("a transfer nobody asked for failed ({problem})");
+            return;
+        };
+        let problem = problem.to_string();
+        if index == 0 {
+            match self.map.as_ref() {
+                Some(m) if m.tiles.is_none() => {
+                    let name = m.name.clone();
+                    self.map_copy_failed(name, problem);
+                }
+                _ => {}
+            }
+        } else if let Some(f) = self.files.iter().find(|f| f.index == index).cloned()
+            && !self.files_accepted.contains(&index)
+        {
+            self.file_copy_failed(&f, problem);
+        }
+        if self.state != State::Closed {
+            self.next_download();
+        }
+    }
+
+    /// Ends the visit because the map cannot be used ([`SessionEvent::MapRejected`]):
+    /// every security answer carries the map, so playing on would only answer
+    /// with a checksum known to be wrong. A check waiting for the map stays
+    /// unanswered. Playback, which has no zone to answer, only logs it.
+    fn reject_map(&mut self, name: String, reason: String) {
+        if self.playback {
+            log::warn!("map {name} in the recording {reason}; not used");
+            return;
+        }
+        log::error!("map {name} {reason}; leaving the zone");
+        self.downloads.clear();
+        self.events
+            .push_back(SessionEvent::MapRejected { name, reason });
+        self.disconnect();
     }
 
     fn set_map(&mut self, name: String, data: Vec<u8>, downloaded: bool) {
+        // Its CRC is the zone's, so another copy would be the same bytes: there
+        // is nothing to ask for again. An empty map in its place would answer
+        // every check with a checksum known to be wrong.
         let tiles = match oss_formats::Level::parse(&data) {
-            Ok(level) => level.tile_grid().cells().to_vec(),
+            // The grid as servers hold it, with large asteroids, stations and
+            // wormholes covering their whole area. ASSS (`mapdata.c`,
+            // `read_plain_tile_data`), Subspace Server .NET (`BasicLvl.cs`,
+            // `ReadPlainTileData`) and oss-server all compute the checksum
+            // they expect from that grid; the plain one differs wherever an
+            // object covers a wall listed before it.
+            Ok(level) => level.server_tile_grid().0.cells().to_vec(),
             Err(e) => {
-                log::warn!("map {name} doesn't parse ({e}); using an empty map");
-                vec![0; 1024 * 1024]
+                self.reject_map(
+                    name,
+                    format!("has the zone's checksum but does not read as a map ({e})"),
+                );
+                return;
             }
         };
         if let Some(info) = self.map.as_mut() {
@@ -1794,9 +2082,7 @@ impl Session {
             data,
             downloaded,
         });
-        if let Some(key) = self.pending_security.take() {
-            self.answer_security(self.last_now_ms, key);
-        }
+        self.answer_held_check();
         self.maybe_playing();
     }
 
@@ -1807,14 +2093,94 @@ impl Session {
             timestamp: s.timestamp,
         });
         if s.key == 0 {
+            log::debug!("seeds only: no security challenge");
             return;
         }
-        let map_loading = self.map.as_ref().is_some_and(|m| m.tiles.is_none());
-        if map_loading {
+        if self.check_must_wait() {
+            log::info!(
+                "{}",
+                challenge_line(s.key, Challenge::Waiting(self.waiting_for()))
+            );
             self.pending_security = Some(s.key);
         } else {
             self.answer_security(now_ms, s.key);
         }
+    }
+
+    /// What a held security check is waiting for, in the order
+    /// [`Session::check_must_wait`] tests it.
+    fn waiting_for(&self) -> &'static str {
+        if self.settings_raw.is_empty() {
+            "the arena's settings"
+        } else if self.map.is_some() {
+            "the map"
+        } else {
+            "the end of the arena entry"
+        }
+    }
+
+    /// Whether a security check has to wait: for the arena's settings, which
+    /// every answer checksums; for a map the zone announced and that is still on
+    /// its way; or, with no map announced, for the end of the arena entry
+    /// (S2C `0x02`), since servers announce the map before it (ASSS
+    /// `arenaman.c` sends `0x29`, then `0x02`) and only then is "no map" known.
+    /// Answering earlier would send a checksum known to be wrong, where it
+    /// used to send 0 for missing settings.
+    fn check_must_wait(&self) -> bool {
+        self.settings_raw.is_empty()
+            || match &self.map {
+                Some(m) => m.tiles.is_none(),
+                None => !self.entering_done,
+            }
+    }
+
+    /// Answers a held security check once nothing it needs is missing.
+    fn answer_held_check(&mut self) {
+        if self.pending_security.is_some() && !self.check_must_wait() {
+            let key = self.pending_security.take().expect("checked above");
+            self.answer_security(self.last_now_ms, key);
+        }
+    }
+
+    /// A packet of a known type that did not decode. Most are dropped, as
+    /// before: nothing is built from them. Two are refused instead, because a
+    /// security answer is built from each and neither can be asked for again:
+    /// unreadable settings would leave the previous ones (or none) in every
+    /// answer, and an unreadable map announcement would leave no map, or the
+    /// previous arena's. A map-data packet that does not decode is a failed
+    /// copy of whatever is being fetched.
+    fn on_unreadable(&mut self, kind: u8, error: &str) {
+        match kind {
+            s2c::kind::SETTINGS | s2c::kind::MAP_FILENAME => {
+                let what = if kind == s2c::kind::SETTINGS {
+                    "arena settings"
+                } else {
+                    "map announcement"
+                };
+                self.refuse(format!(
+                    "The zone sent its {what} in a form this client cannot read ({error})"
+                ));
+            }
+            s2c::kind::MAP_DATA if !self.playback => {
+                log::warn!("a file transfer arrived malformed ({error})");
+                self.on_transfer_failed("it arrived malformed");
+            }
+            _ => log::debug!("bad S2C packet {kind:#04x}: {error}"),
+        }
+    }
+
+    /// Ends the visit because the zone sent something the session needs and
+    /// cannot use ([`SessionEvent::Refused`]). Playback only logs it.
+    fn refuse(&mut self, reason: String) {
+        if self.playback {
+            log::warn!("{reason}; in a recording, played on");
+            return;
+        }
+        log::error!("{reason}; leaving the zone");
+        self.pending_security = None;
+        self.downloads.clear();
+        self.events.push_back(SessionEvent::Refused { reason });
+        self.disconnect();
     }
 
     fn answer_security(&mut self, now_ms: u64, key: u32) {
@@ -1834,13 +2200,36 @@ impl Session {
                     }
                 })
             })
-            .unwrap_or(0);
+            // No map announced by the end of the arena entry: the zone has
+            // none (see `check_must_wait`). ASSS's `GetChecksum`
+            // (`mapdata.c`) then returns the key itself, which is the sum over
+            // an empty map; Subspace Server .NET does not check the field.
+            .unwrap_or_else(|| checksum::map_checksum(key, |_, _| 0));
+        log::debug!(
+            "security check {key:08x}: settings checksum {settings_checksum:08x}, \
+             map checksum {map_checksum:08x}"
+        );
         // The profile supplies only what depends on the client binary; everything
         // above and below it is the same for either client.
         let answer = self.cfg.client.security(SecurityChallenge {
             key,
             map_crc32: tiles.map(|t| checksum::map_crc32(t)),
         });
+        // One line for every challenge, whichever profile answers it, so that a
+        // live run says what the zone asked. A profile that answers in the
+        // Continuum form names itself in a line of its own, so the session's
+        // goes to the debug log there rather than saying it twice.
+        let line = challenge_line(
+            key,
+            Challenge::Answered {
+                continuum_form: answer.continuum.is_some(),
+            },
+        );
+        if answer.continuum.is_some() {
+            log::debug!("{line}");
+        } else {
+            log::info!("{line}");
+        }
         let ping = (self.conn.rtt_ms() / 10).min(u16::MAX as u64) as u16;
         let stats = self.conn.stats();
         let resp = SecurityResponse {
@@ -2120,9 +2509,38 @@ fn arena_target(arena: &str) -> (i16, FixedStr<16>) {
     }
 }
 
-/// Human-readable login failure.
-/// Whether a login form and the cipher it will be sent under disagree, and what to
-/// say about it.
+/// The era a login is sent under: the one the connection's mechanism declares,
+/// when the session knows its mechanism, and otherwise the one its cipher's kind
+/// implies.
+///
+/// The mechanism comes first because it is the one that knows: a cipher from
+/// outside oss-core reports [`CipherKind::Other`], which says nothing, while its
+/// mechanism declares an era like any other.
+pub(crate) fn login_era(
+    mechanism: Option<&security::MechanismInUse>,
+    cipher: Option<CipherKind>,
+) -> Option<Era> {
+    mechanism
+        .and_then(security::MechanismInUse::era)
+        .or_else(|| era_of_cipher(cipher))
+}
+
+/// The era a built-in cipher's kind implies, for a session that does not know
+/// its mechanism. `None` means "cannot tell": [`CipherKind`] is
+/// `#[non_exhaustive]` and [`CipherKind::Other`] is the `Cipher` trait's default.
+pub(crate) fn era_of_cipher(cipher: Option<CipherKind>) -> Option<Era> {
+    match cipher? {
+        // A VIE handshake that ended unencrypted is still the VIE module as far as
+        // the zone is concerned.
+        CipherKind::Vie | CipherKind::None => Some(Era::SubSpace),
+        CipherKind::OpenSec => Some(Era::Modern),
+        CipherKind::Continuum => Some(Era::Continuum),
+        _ => None,
+    }
+}
+
+/// Whether a login form and the era of the connection it will be sent under
+/// disagree, and what to say about it.
 ///
 /// A zone picks the login form it expects from the **encryption**, not from the
 /// packet's type byte — ASSS `core.c`'s `PLogin` is registered for both `0x09` and
@@ -2131,21 +2549,17 @@ fn arena_target(arena: &str) -> (i16, FixedStr<16>) {
 /// from the conn-init byte and `modules/core.rs` then holds a VIE client to
 /// [`Login::VIE_LEN`] and a Continuum one to `Login::CONT_LEN`.
 ///
-/// `None` means "cannot tell", which is not the same as agreement:
-/// [`CipherKind`] is `#[non_exhaustive]` and [`CipherKind::Other`] is the `Cipher`
-/// trait's default, so an external cipher that does not override `kind()` turns this
-/// check off rather than failing it.
-fn login_form_mismatch(cipher: Option<CipherKind>, continuum_form: bool) -> Option<&'static str> {
-    match (cipher?, continuum_form) {
-        // A VIE handshake that ended unencrypted is still the VIE module as far as the
-        // zone is concerned, and an OpenSec client hello is a `00 01` packet, which
-        // oss-server classifies as a VIE client. All three want the SubSpace form.
-        (CipherKind::Vie | CipherKind::None | CipherKind::OpenSec, true) => {
+/// `None` for the era means "cannot tell", which is not the same as agreement: the
+/// check is then off rather than failing. A mechanism that declares its era
+/// ([`Session::with_negotiation`]) is never in that position.
+pub(crate) fn login_form_mismatch(era: Option<Era>, continuum_form: bool) -> Option<&'static str> {
+    match (era?, continuum_form) {
+        // An OpenSec client hello is a `00 01` packet, which oss-server classifies as
+        // a VIE client, so the modern era wants the SubSpace form too.
+        (Era::SubSpace | Era::Modern, true) => {
             Some("Continuum login form on a connection that is not Continuum-encrypted")
         }
-        (CipherKind::Continuum, false) => {
-            Some("SubSpace login form on a Continuum-encrypted connection")
-        }
+        (Era::Continuum, false) => Some("SubSpace login form on a Continuum-encrypted connection"),
         _ => None,
     }
 }
@@ -2270,9 +2684,174 @@ mod redaction_tests {
     }
 }
 
+/// Where a security challenge has got to, for its log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Challenge {
+    /// Held until the session has what every answer checksums.
+    Waiting(&'static str),
+    /// Answered, in the SubSpace form or the longer Continuum one.
+    Answered { continuum_form: bool },
+}
+
+/// The log line for a security challenge: its key, and what was done about it.
+///
+/// It names the checksums an answer carries and never their values. The key
+/// is the zone's, sent in the challenge, and is what ties this line to the
+/// zone's own record of the check.
+fn challenge_line(key: u32, state: Challenge) -> String {
+    match state {
+        Challenge::Waiting(what) => {
+            format!("security challenge {key:08x}: waiting for {what} before answering")
+        }
+        Challenge::Answered {
+            continuum_form: false,
+        } => format!(
+            "security challenge {key:08x}: answered as subspace (settings, map and executable checksums)"
+        ),
+        Challenge::Answered {
+            continuum_form: true,
+        } => format!(
+            "security challenge {key:08x}: answered in the continuum form (settings, map and executable checksums, and the continuum fields)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This thread's log lines while `f` runs, for the tests that check what is
+    /// logged. Other threads' lines are dropped, so tests running alongside do
+    /// not show up in each other's captures.
+    fn logged<T>(f: impl FnOnce() -> T) -> (T, Vec<(log::Level, String)>) {
+        use std::cell::RefCell;
+        thread_local! {
+            static LINES: RefCell<Option<Vec<(log::Level, String)>>> = const { RefCell::new(None) };
+        }
+        struct Capture;
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record) {
+                LINES.with(|l| {
+                    if let Some(v) = l.borrow_mut().as_mut() {
+                        v.push((r.level(), r.args().to_string()));
+                    }
+                });
+            }
+            fn flush(&self) {}
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            if log::set_logger(&Capture).is_ok() {
+                log::set_max_level(log::LevelFilter::Trace);
+            }
+        });
+        LINES.with(|l| *l.borrow_mut() = Some(Vec::new()));
+        let out = f();
+        (
+            out,
+            LINES.with(|l| l.borrow_mut().take().unwrap_or_default()),
+        )
+    }
+
+    fn info(lines: &[(log::Level, String)]) -> Vec<&str> {
+        lines
+            .iter()
+            .filter(|(level, _)| *level == log::Level::Info)
+            .map(|(_, line)| line.as_str())
+            .collect()
+    }
+
+    fn challenge(key: u32) -> s2c::Security {
+        s2c::Security {
+            green_seed: 1,
+            door_seed: 2,
+            timestamp: 3,
+            key,
+        }
+    }
+
+    /// A challenge answered on a SubSpace connection left no line in the log,
+    /// so "no challenge" could not be told from "answered quietly". Every one
+    /// now says its key and what became of it -- held, then answered -- and
+    /// never what the answer was.
+    #[test]
+    fn every_security_challenge_is_logged_without_its_answer() {
+        let mut s = Session::new(SessionConfig::default(), 0, 1);
+        let (_, lines) = logged(|| s.on_security(0, &challenge(0)));
+        assert_eq!(info(&lines), Vec::<&str>::new(), "seeds only: no challenge");
+
+        let (_, lines) = logged(|| s.on_security(0, &challenge(0x1234_5678)));
+        assert_eq!(
+            info(&lines),
+            ["security challenge 12345678: waiting for the arena's settings before answering"]
+        );
+
+        // The settings arrive and the arena entry ends with no map: answered.
+        s.settings_raw = vec![7; 1428];
+        s.entering_done = true;
+        let (_, lines) = logged(|| s.answer_held_check());
+        assert_eq!(
+            info(&lines),
+            [
+                "security challenge 12345678: answered as subspace (settings, map and executable checksums)"
+            ]
+        );
+
+        let key = 0x0bad_cafe;
+        let (_, lines) = logged(|| s.on_security(10, &challenge(key)));
+        assert_eq!(
+            info(&lines),
+            [
+                "security challenge 0badcafe: answered as subspace (settings, map and executable checksums)"
+            ]
+        );
+        // The settings checksum is the answer value to look for. The map one is
+        // not, here: with no map it is the key itself, which the line does name.
+        let settings = format!("{:08x}", checksum::settings_checksum(key, &s.settings_raw));
+        assert_ne!(settings, format!("{key:08x}"));
+        for line in info(&lines) {
+            assert!(!line.contains(&settings), "no answer value at INFO: {line}");
+        }
+    }
+
+    /// A profile that answers in the Continuum form names itself in a line of
+    /// its own, so the session does not say it a second time at INFO.
+    #[test]
+    fn a_continuum_form_answer_is_not_logged_twice() {
+        #[derive(Debug)]
+        struct LongForm;
+        impl ClientProfile for LongForm {
+            fn login(&self) -> LoginForm {
+                LoginForm::vie()
+            }
+            fn security(&self, _: SecurityChallenge) -> SecurityAnswer {
+                SecurityAnswer {
+                    exe_checksum: 0,
+                    continuum: Some((0, None)),
+                }
+            }
+        }
+        let mut s = Session::new(
+            SessionConfig {
+                client: std::sync::Arc::new(LongForm),
+                ..SessionConfig::default()
+            },
+            0,
+            1,
+        );
+        s.settings_raw = vec![7; 1428];
+        s.entering_done = true;
+        let (_, lines) = logged(|| s.on_security(0, &challenge(0x0000_0042)));
+        assert_eq!(info(&lines), Vec::<&str>::new());
+        assert!(
+            lines.iter().any(|(_, l)| l
+                .starts_with("security challenge 00000042: answered in the continuum form")),
+            "at debug: {lines:?}"
+        );
+    }
 
     #[test]
     fn tracks_server_silence() {
@@ -2737,6 +3316,42 @@ mod tests {
         assert_eq!(arena_target("65535").0, i16::MAX);
     }
 
+    /// The check as the session that sends the login makes it: opened by name
+    /// with a mechanism of each era, it knows which form the zone will expect
+    /// before it has connected, though the mechanism's cipher reports no kind.
+    #[test]
+    fn a_session_checks_its_login_against_its_mechanisms_era() {
+        use crate::security::{MechanismRegistry, SecurityMode, client_handshake, context};
+        use crate::test_zone::dummy_mechanism;
+
+        let subspace_form = LoginForm::vie();
+        let continuum_form = LoginForm::continuum(0, [0; 64]);
+        for era in [Era::Continuum, Era::SubSpace, Era::Modern] {
+            let mut registry = MechanismRegistry::builtin();
+            registry
+                .register(dummy_mechanism("dummy@example.org", "Dummy", era, 2000))
+                .unwrap();
+            let named = SecurityMode::parse("dummy@example.org", &registry).unwrap();
+            let negotiation = client_handshake(&registry, &named, &context(1, None, None)).unwrap();
+            let session = Session::with_negotiation(SessionConfig::default(), 0, negotiation);
+            let continuum = era == Era::Continuum;
+            assert_eq!(
+                session.login_complaint(&continuum_form).is_none(),
+                continuum,
+                "{era:?}, Continuum form"
+            );
+            assert_eq!(
+                session.login_complaint(&subspace_form).is_none(),
+                !continuum,
+                "{era:?}, SubSpace form"
+            );
+        }
+        // Without a mechanism, and before any cipher, there is nothing to go on.
+        let plain = Session::new(SessionConfig::default(), 0, 1);
+        assert_eq!(plain.login_complaint(&continuum_form), Option::None);
+        assert_eq!(plain.login_complaint(&subspace_form), Option::None);
+    }
+
     /// The pairing the session cannot otherwise catch: the profile picks the login
     /// form, the handshake picks the cipher, and a zone that disagrees drops the
     /// login silently. Every arm is pinned, including the two that must stay quiet.
@@ -2744,34 +3359,39 @@ mod tests {
     fn a_login_form_must_match_the_cipher_it_is_sent_under() {
         use CipherKind::*;
 
+        // A session that does not know its mechanism goes by its cipher's kind.
+        let check = |k: Option<CipherKind>, continuum_form| {
+            login_form_mismatch(login_era(Option::None, k), continuum_form)
+        };
+
         // The three that mean "the zone expects the SubSpace form".
         for k in [Vie, None, OpenSec] {
             assert!(
-                login_form_mismatch(Some(k), true).is_some(),
+                check(Some(k), true).is_some(),
                 "{k:?} + Continuum form is a mismatch"
             );
             assert_eq!(
-                login_form_mismatch(Some(k), false),
+                check(Some(k), false),
                 Option::None,
                 "{k:?} + SubSpace form is right"
             );
         }
 
-        assert!(login_form_mismatch(Some(Continuum), false).is_some());
-        assert_eq!(login_form_mismatch(Some(Continuum), true), Option::None);
+        assert!(check(Some(Continuum), false).is_some());
+        assert_eq!(check(Some(Continuum), true), Option::None);
 
         // `Other` is the `Cipher` trait's default, so an external cipher that does not
         // override `kind()` lands here. It must read as "cannot tell" in **both**
         // directions -- never as a mismatch, which would cry wolf at every private
         // implementation, and never as agreement either.
-        assert_eq!(login_form_mismatch(Some(Other), true), Option::None);
-        assert_eq!(login_form_mismatch(Some(Other), false), Option::None);
+        assert_eq!(check(Some(Other), true), Option::None);
+        assert_eq!(check(Some(Other), false), Option::None);
 
         // Before the cipher is known there is nothing to compare. In practice this
         // cannot happen -- `Connection::establish` sets the cipher before it pushes
         // `Connected`, and `send_login` runs from that arm -- but the signature allows
         // it and silence is the only safe answer.
-        assert_eq!(login_form_mismatch(Option::None, true), Option::None);
-        assert_eq!(login_form_mismatch(Option::None, false), Option::None);
+        assert_eq!(check(Option::None, true), Option::None);
+        assert_eq!(check(Option::None, false), Option::None);
     }
 }
