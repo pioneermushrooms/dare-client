@@ -158,6 +158,7 @@ impl Sandbox {
             MenuChoice::Bots => {
                 self.bot_menu = true;
                 self.bots_refreshed = None;
+                self.bots_ui.open();
             }
         }
         true
@@ -167,11 +168,6 @@ impl Sandbox {
     fn bot_menu_input(&mut self, strokes: &[Stroke]) {
         match self.bots_ui.input(strokes) {
             crate::game::bots_ui::BotsAction::Send(cmd) => self.send_chat_line(&cmd),
-            crate::game::bots_ui::BotsAction::SendMany(cmds) => {
-                for cmd in cmds {
-                    self.send_chat_line(&cmd);
-                }
-            }
             crate::game::bots_ui::BotsAction::Close => {
                 self.bot_menu = false;
                 self.chat.scroll_to_bottom();
@@ -428,6 +424,10 @@ mod tests {
         assert!("PgUp/PgDn = Scroll messages".chars().count() <= cols(2.0));
     }
 
+    /// "There's no spectator mode anywhere in the game options menu." Offline,
+    /// that was exactly true: the menu hid the row and the ship change refused
+    /// spectator outright, so the sandbox -- where the lead was -- could not
+    /// stop flying.
     #[test]
     fn the_menu_offers_spectator_with_or_without_a_zone() {
         // `false` here is "no news", which offline always is. S used to be

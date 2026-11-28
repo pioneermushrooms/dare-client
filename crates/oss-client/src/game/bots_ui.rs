@@ -12,6 +12,7 @@
 use winit::keyboard::KeyCode;
 
 use crate::game::bots_view::BotsView;
+use crate::game::chat::wrap;
 use crate::game::input::Stroke;
 use crate::game::start_spots::Rect;
 use crate::game::view::{Canvas, color};
@@ -23,8 +24,6 @@ pub enum BotsAction {
     None,
     /// Send this `?bots …` command to the zone.
     Send(String),
-    /// Send these, in order.
-    SendMany(Vec<String>),
     /// Close the window.
     Close,
 }
@@ -52,8 +51,12 @@ pub struct BotsUi {
     /// The selected list row (owners have "Create a bot" as row 0).
     sel: usize,
     mode: Mode,
-    /// The zone's last `Bots: …` answer, shown above the keys.
-    status: Option<String>,
+    /// The zone's `Bots: …` answers since the window last sent a command, shown above the keys.
+    status: Vec<String>,
+    /// Whether a list has arrived since the window was opened.
+    loaded: bool,
+    /// The command just made set its own status line ("Making X..."): don't clear it.
+    keep_status: bool,
     /// Digits typed for the team or priority line, sent on Enter.
     typed: String,
 }
@@ -122,6 +125,17 @@ impl Draft {
 const STEPS: [&str; 5] = ["Name", "Behaviour", "Ship", "Team", "Chat"];
 /// Longest bot name (the zone's rule).
 const NAME_MAX: usize = 20;
+/// Most lines of the zone's answers shown at once.
+const STATUS_LINES: usize = 4;
+
+/// Whether `c` may come next in a bot name: the zone's rule (letters, digits, single spaces,
+/// `_ - .`, starting with a letter or digit).
+fn name_char(name: &str, c: char) -> bool {
+    if name.is_empty() {
+        return c.is_ascii_alphanumeric();
+    }
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') || (c == ' ' && !name.ends_with(' '))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
@@ -154,9 +168,25 @@ fn fit(text: String) -> String {
 }
 
 impl BotsUi {
-    /// A fresh list from the zone.
+    /// The window is being opened: start from a clean list until the zone answers.
+    pub fn open(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A fresh list from the zone. The selection stays on the same bot.
     pub fn set_view(&mut self, view: BotsView) {
+        let keep = self.selected().map(|i| self.view.bots[i].name.clone());
         self.view = view;
+        self.loaded = true;
+        if let Some(name) = keep
+            && let Some(i) = self
+                .view
+                .bots
+                .iter()
+                .position(|b| b.name.eq_ignore_ascii_case(&name))
+        {
+            self.sel = i + usize::from(self.owner());
+        }
         let rows = self.rows();
         if self.sel >= rows {
             self.sel = rows.saturating_sub(1);
@@ -206,6 +236,12 @@ impl BotsUi {
     pub fn input(&mut self, strokes: &[Stroke]) -> BotsAction {
         for stroke in strokes {
             let action = self.key(*stroke);
+            if let BotsAction::Send(_) = &action
+                && !std::mem::take(&mut self.keep_status)
+            {
+                // a new command: its answer replaces the last one
+                self.status.clear();
+            }
             if action != BotsAction::None {
                 return action;
             }
@@ -369,7 +405,7 @@ impl BotsUi {
                     return BotsAction::None;
                 } else if code == Some(KeyCode::Backspace) {
                     draft.name.pop();
-                } else if let Some(c) = stroke.text.filter(|c| c.is_ascii_graphic() || *c == ' ')
+                } else if let Some(c) = stroke.text.filter(|c| name_char(&draft.name, *c))
                     && draft.name.chars().count() < NAME_MAX
                 {
                     draft.name.push(c);
@@ -401,11 +437,12 @@ impl BotsUi {
                 let create = draft.command();
                 let action = match ch {
                     Some('d') => BotsAction::Send(create),
-                    Some('s') => BotsAction::SendMany(vec![create, format!("?bots stop {name}")]),
+                    Some('s') => BotsAction::Send(format!("{create} stopped")),
                     _ => return BotsAction::None,
                 };
                 self.mode = Mode::List;
-                self.status = Some(format!("Making {name}..."));
+                self.status = vec![format!("Making {name}...")];
+                self.keep_status = true;
                 return action;
             }
         }
@@ -483,7 +520,7 @@ impl BotsUi {
     pub fn reply(&mut self, text: &str) -> bool {
         match text.strip_prefix("Bots:") {
             Some(rest) => {
-                self.status = Some(rest.trim().to_string());
+                self.status.push(rest.trim().to_string());
                 true
             }
             None => false,
@@ -512,20 +549,31 @@ impl BotsUi {
                 if self.owner() {
                     push("   Create a bot".into(), color::WHITE, self.sel == 0, None);
                 }
-                if self.view.bots.is_empty() {
+                if !self.loaded {
+                    push("   Loading...".into(), color::YELLOW, false, None);
+                } else if self.view.bots.is_empty() {
                     push("   No bots yet.".into(), color::YELLOW, false, None);
                 }
                 for (i, b) in self.view.bots.iter().enumerate() {
                     let row = i + usize::from(self.owner());
                     let ship = &SHIPS[(b.ship.clamp(1, 8) - 1) as usize][..3];
+                    let behaviour = match b.behaviour.as_str() {
+                        "fighter" => "fight",
+                        other => other,
+                    };
+                    let status = match (b.deployed, b.status.as_str()) {
+                        (false, _) => "stopped",
+                        (_, "spectating") => "spec",
+                        (_, "not launched") => "failed",
+                        (_, other) => other,
+                    };
                     push(
                         format!(
-                            "{} {:<13.13} {:<7.7} {ship} t{:<4} {}",
+                            "{} {:<12.12} {:<6.6} {ship} t{:<4} {status}",
                             if b.deployed { "+" } else { " " },
                             b.name,
-                            b.behaviour,
+                            behaviour,
                             b.team,
-                            b.status
                         ),
                         if b.problem.is_some() {
                             color::RED
@@ -665,8 +713,12 @@ impl BotsUi {
                 }
             }
         }
-        if let Some(status) = &self.status {
-            push(status.clone(), color::YELLOW, false, None);
+        let mut status = Vec::new();
+        for reply in &self.status {
+            status.extend(wrap(reply, INNER, true));
+        }
+        for line in status.into_iter().take(STATUS_LINES) {
+            push(line, color::YELLOW, false, None);
         }
         for (text, stroke) in self.foot() {
             push(text.into(), color::YELLOW, false, Some(stroke));
@@ -750,6 +802,12 @@ impl BotsUi {
         }
         spots
     }
+}
+
+/// Whether the keyboard belongs to a window rather than the ship: held arrows must not fly the
+/// ship while the arena-settings or bots window is open.
+pub fn keyboard_captured(arena_settings_open: bool, bots_open: bool) -> bool {
+    arena_settings_open || bots_open
 }
 
 /// Whether a `?bots data` refresh is due: only while the window is open, at once on opening
@@ -1015,12 +1073,12 @@ mod tests {
         keys.extend(typed("Quiet"));
         keys.extend([key(KeyCode::Enter); 5]); // name, behaviour, ship, team, chat
         assert!(actions(&mut u, &keys).is_empty());
+        // one command: the zone saves it stopped, and refuses it whole if the name is taken
         assert_eq!(
             actions(&mut u, &[ch('s')]),
-            vec![BotsAction::SendMany(vec![
-                "?bots create Quiet fighter ship 1 team 0 chat off".into(),
-                "?bots stop Quiet".into(),
-            ])]
+            vec![BotsAction::Send(
+                "?bots create Quiet fighter ship 1 team 0 chat off stopped".into()
+            )]
         );
     }
 
@@ -1045,5 +1103,106 @@ mod tests {
         let mut u = ui(true, vec![]);
         assert!(actions(&mut u, &[ch('c'), key(KeyCode::Enter), key(KeyCode::Enter)]).is_empty());
         assert!(u.lines().iter().any(|l| l.text.contains("Name")));
+    }
+
+    #[test]
+    fn the_whole_answer_shows_wrapped_and_a_new_command_clears_it() {
+        let mut u = ui(true, vec![bot("Alpha", true)]);
+        sends(&mut u, &[key(KeyCode::ArrowDown), ch('d')]);
+        assert!(
+            u.reply("Bots: Alpha stopped. It leaves within a few seconds; its settings are kept.")
+        );
+        assert!(u.reply("Bots: second line."));
+        let status: Vec<String> = u
+            .lines()
+            .into_iter()
+            .filter(|l| l.color == color::YELLOW && l.stroke.is_none())
+            .map(|l| l.text)
+            .collect();
+        let joined = status.join(" ");
+        assert!(joined.contains("its settings are kept."), "{status:?}");
+        assert!(joined.contains("second line."), "{status:?}");
+        assert!(status.iter().all(|l| l.chars().count() <= INNER));
+        // the next command starts a fresh answer
+        sends(&mut u, &[ch('d')]);
+        assert!(!u.lines().iter().any(|l| l.text.contains("second line")));
+    }
+
+    #[test]
+    fn the_name_box_takes_only_the_zones_characters() {
+        let mut u = ui(true, vec![]);
+        let mut keys = vec![ch('c')];
+        keys.extend(typed("%Bo  b!_x"));
+        keys.extend([key(KeyCode::Enter); 5]);
+        assert!(actions(&mut u, &keys).is_empty());
+        assert_eq!(
+            actions(&mut u, &[ch('d')]),
+            vec![BotsAction::Send(
+                "?bots create Bo b_x fighter ship 1 team 0 chat off".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_selection_follows_the_bot_across_refreshes() {
+        let mut u = ui(true, vec![bot("Bravo", true)]);
+        sends(&mut u, &[key(KeyCode::ArrowDown)]);
+        u.set_view(BotsView {
+            arena: "botlab".into(),
+            owner: true,
+            bots: vec![bot("Alpha", true), bot("Bravo", true)],
+            matches: vec![],
+        });
+        assert_eq!(sends(&mut u, &[ch('d')]), vec!["?bots stop Bravo"]);
+    }
+
+    #[test]
+    fn opening_starts_fresh() {
+        let mut u = ui(true, vec![bot("Alpha", true)]);
+        sends(&mut u, &[key(KeyCode::ArrowDown), key(KeyCode::Enter)]);
+        u.reply("Bots: old news.");
+        u.open();
+        assert!(!u.back(), "back at the list");
+        let text: Vec<String> = u.lines().into_iter().map(|l| l.text).collect();
+        assert!(
+            !text
+                .iter()
+                .any(|l| l.contains("old news") || l.contains("Alpha")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|l| l.contains("Loading")), "{text:?}");
+    }
+
+    #[test]
+    fn list_rows_show_whole_status_words() {
+        let mut spec = bot("Spec", true);
+        spec.status = "spectating".into();
+        let mut failed = bot("Broken", true);
+        failed.status = "not launched".into();
+        failed.problem = Some("Not launched: a pilot uses this name".into());
+        let u = ui(true, vec![spec, failed, bot("Off", false)]);
+        let text: Vec<String> = u.lines().into_iter().map(|l| l.text).collect();
+        assert!(
+            text.iter()
+                .any(|l| l.contains("Spec") && l.ends_with("spec")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("Broken") && l.ends_with("failed")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.contains("Off") && l.ends_with("stopped")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_window_takes_the_keyboard_from_the_ship() {
+        assert!(keyboard_captured(false, true));
+        assert!(keyboard_captured(true, false));
+        assert!(!keyboard_captured(false, false));
     }
 }

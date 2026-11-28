@@ -860,7 +860,10 @@ impl Sandbox {
         input.set_typing(self.menu || self.arena_settings_open || self.keys_type());
         // The settings window is not the menu: its arrows pick settings, so
         // they must not also fly the ship or slide the spectator camera.
-        input.set_captured(self.arena_settings_open);
+        input.set_captured(crate::game::bots_ui::keyboard_captured(
+            self.arena_settings_open,
+            self.bot_menu,
+        ));
         self.voice.tick(self.clock);
         // The help shows the player's own keys, so it reads the live table. Copied
         // only while it is open, which is the only time anything looks at it.
