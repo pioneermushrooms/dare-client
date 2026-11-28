@@ -55,6 +55,36 @@ impl Default for Supplied {
     }
 }
 
+/// Whether `server` is the Foundation zone, by either of its addresses.
+pub fn is_foundation(server: &str) -> bool {
+    let server = server.trim().to_ascii_lowercase();
+    matches!(
+        server.as_str(),
+        "5.161.238.245:5000" | "subspacefoundation.com:5000"
+    )
+}
+
+/// The mechanism a connection asks for.
+///
+/// Foundation speaks VIE and nothing stronger, so the automatic order there
+/// offered OpenSec first and waited [`oss_session::security::FALLBACK_AFTER_MS`]
+/// (1.5 s) for an answer that never came before stepping down, every time.
+/// There, `auto` asks for VIE by name, as the browser (which reaches nowhere
+/// else) always has. A mechanism the player named wins, and every other zone
+/// keeps the automatic order. If Foundation ever offers OpenSec, drop it here.
+fn security_mode(
+    server: &str,
+    asked: &SecurityMode,
+    browser: bool,
+    registry: &MechanismRegistry,
+) -> Result<SecurityMode, String> {
+    if *asked == SecurityMode::Auto && (browser || is_foundation(server)) {
+        SecurityMode::parse("vie", registry)
+    } else {
+        Ok(asked.clone())
+    }
+}
+
 /// The client a connection presents when nothing is supplied.
 ///
 /// The browser build connects to the Foundation zone only (its transport refuses
@@ -328,12 +358,12 @@ impl Online {
                 }
             }
         });
-        // The browser's transport reaches only the Foundation zone, which speaks
-        // VIE: it asks for that by name rather than waiting out OpenSec first.
-        #[cfg(target_arch = "wasm32")]
-        let mode = SecurityMode::parse("vie", &supplied.mechanisms)?;
-        #[cfg(not(target_arch = "wasm32"))]
-        let mode = opts.security.clone();
+        let mode = security_mode(
+            &opts.server,
+            &opts.security,
+            cfg!(target_arch = "wasm32"),
+            &supplied.mechanisms,
+        )?;
         // A key on record is OpenSec's, so `auto` then uses OpenSec alone; a
         // mechanism asked for by name wins over it.
         let negotiation =
@@ -1141,6 +1171,37 @@ mod tests {
         unknown.security =
             SecurityMode::Named(oss_session::security::MechanismId::new("x@example.org").unwrap());
         assert!(Online::connect(&unknown, (800, 600), &supplied).is_err());
+    }
+
+    /// Foundation is asked for VIE outright instead of waiting out OpenSec; a
+    /// mechanism named by the player, and every other zone, are left alone.
+    #[test]
+    fn foundation_skips_the_opensec_wait() {
+        use super::{is_foundation, security_mode};
+        let reg = oss_session::security::MechanismRegistry::builtin();
+        let vie = SecurityMode::parse("vie", &reg).unwrap();
+        let auto = SecurityMode::Auto;
+        for server in [
+            "5.161.238.245:5000",
+            "subspacefoundation.com:5000",
+            " SubspaceFoundation.com:5000 ",
+        ] {
+            assert!(is_foundation(server), "{server}");
+            assert_eq!(security_mode(server, &auto, false, &reg).unwrap(), vie);
+        }
+        assert!(!is_foundation("subspacefoundation.com:5001"));
+        assert_eq!(
+            security_mode("ssr.example:5000", &auto, false, &reg).unwrap(),
+            auto
+        );
+        // The browser reaches only Foundation, whatever the address says.
+        assert_eq!(security_mode("anything:1", &auto, true, &reg).unwrap(), vie);
+        // Named wins, Foundation or not.
+        let none = SecurityMode::parse("none", &reg).unwrap();
+        assert_eq!(
+            security_mode("5.161.238.245:5000", &none, false, &reg).unwrap(),
+            none
+        );
     }
 
     /// The browser build plays on Foundation only, whose zone verifies the keyed

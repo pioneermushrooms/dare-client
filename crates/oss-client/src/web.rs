@@ -330,7 +330,7 @@ pub(crate) struct WebDriver {
 
 impl WebDriver {
     pub fn connect(server: &str) -> io::Result<Self> {
-        if !matches!(server, "5.161.238.245:5000" | "subspacefoundation.com:5000") {
+        if !crate::game::online::is_foundation(server) {
             return Err(io::Error::other("Browser play connects to Foundation only"));
         }
         let link = open_gateway()
