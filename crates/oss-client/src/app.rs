@@ -2146,6 +2146,16 @@ impl App {
             Screen::Empty => None,
         };
 
+        // Checked before drawing: a covered window runs without drawing, and a
+        // timed run must still end on time.
+        if let Some(at) = self.options.quit_at
+            && run.started.elapsed().as_secs_f32() >= at
+        {
+            log::info!("--quit-at {at}: leaving");
+            leave_zone(&mut run.screen);
+            event_loop.exit();
+            return;
+        }
         if !draw {
             return;
         }
@@ -2175,14 +2185,6 @@ impl App {
             conn.tell_page();
         }
         run.renderer.perf().frame_done(frame_at.elapsed());
-        if let Some(at) = self.options.quit_at
-            && run.started.elapsed().as_secs_f32() >= at
-        {
-            log::info!("--quit-at {at}: leaving");
-            leave_zone(&mut run.screen);
-            event_loop.exit();
-            return;
-        }
         // A skipped frame (e.g. occluded window) keeps the capture pending.
         if run.captured && run.renderer.capture.is_none() {
             leave_zone(&mut run.screen);
