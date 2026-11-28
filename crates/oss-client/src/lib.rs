@@ -71,6 +71,7 @@ pub mod cli;
 
 mod audio;
 mod config;
+mod cursor;
 mod game;
 mod gfx;
 

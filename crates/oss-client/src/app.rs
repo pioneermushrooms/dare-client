@@ -1386,6 +1386,19 @@ impl App {
             Ok(renderer) => renderer,
             Err(error) => return self.fail(event_loop, format!("graphics: {error}")),
         };
+        // Our own pointer over the game, so it reads as a game that takes the
+        // mouse. The system's comes back should this ever fail.
+        let (hx, hy) = crate::cursor::HOTSPOT;
+        match winit::window::CustomCursor::from_rgba(
+            crate::cursor::rgba(),
+            crate::cursor::SIZE,
+            crate::cursor::SIZE,
+            hx,
+            hy,
+        ) {
+            Ok(source) => window.set_cursor(event_loop.create_custom_cursor(source)),
+            Err(e) => log::warn!("cursor: {e}"),
+        }
         let scale = wanted_scale(self.options.scale, window.scale_factor());
         let screen = match &self.options.mode {
             Mode::Sandbox { ship, .. } => {

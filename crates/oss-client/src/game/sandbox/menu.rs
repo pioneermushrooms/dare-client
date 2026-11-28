@@ -3,7 +3,7 @@
 use oss_session::SPECTATOR;
 use winit::keyboard::KeyCode;
 
-use super::Sandbox;
+use super::{Sandbox, arena_settings};
 use crate::game::input::{Action, Stroke};
 use crate::game::start_spots::Rect;
 use crate::game::view::{Canvas, color};
@@ -115,6 +115,15 @@ impl Sandbox {
     /// that dismisses the menu wherever it lands would make the ships
     /// unclickable at the edges.
     pub fn click(&mut self, x: f32, y: f32) -> Option<Stroke> {
+        if self.arena_settings_open
+            && let Some(editor) = self.arena_settings.as_mut()
+        {
+            // The window takes every click while it is up, so a miss cannot
+            // fly or fire behind it.
+            let (_, out) = editor.click(x, y);
+            self.arena_settings_outcome(out);
+            return None;
+        }
         if self.click_arena_list(x, y) {
             return None;
         }
@@ -129,7 +138,8 @@ impl Sandbox {
 
     /// One of the menu's own keys, or `false` for "any other key".
     fn menu_key(&mut self, ch: char) -> bool {
-        let Some(choice) = menu_choice(ch, !self.news.is_empty(), self.online()) else {
+        let settings = self.settings_access == arena_settings::Access::Yes;
+        let Some(choice) = menu_choice(ch, !self.news.is_empty(), self.online(), settings) else {
             return false;
         };
         match choice {
@@ -144,6 +154,7 @@ impl Sandbox {
             MenuChoice::Ship(kind) => self.request_ship(kind),
             MenuChoice::FrameRate => self.fps_view = self.fps_view.next(),
             MenuChoice::Arenas => self.ask_for_arenas(),
+            MenuChoice::ArenaSettings => self.open_arena_settings(),
             MenuChoice::Bots => {
                 self.bot_menu = true;
                 self.send_chat_line("?bots list");
@@ -250,6 +261,12 @@ impl Sandbox {
         if self.online() {
             keys.push((" A = Arena list", Stroke::press(KeyCode::KeyA).typing('a')));
             keys.push((" B = Manage bots", Stroke::press(KeyCode::KeyB).typing('b')));
+            if self.settings_access == arena_settings::Access::Yes {
+                keys.push((
+                    " E = Arena settings",
+                    Stroke::press(KeyCode::KeyE).typing('e'),
+                ));
+            }
         }
         if !self.news.is_empty() {
             keys.push((" N = Zone news", Stroke::press(KeyCode::KeyN).typing('n')));
@@ -426,6 +443,8 @@ enum MenuChoice {
     /// Esc then A: the zone's arena list.
     Arenas,
     Bots,
+    /// Esc then E: the arena settings window, where the zone offers it.
+    ArenaSettings,
 }
 
 /// What a character typed on the menu does, or `None` for "any other key to
@@ -436,7 +455,7 @@ enum MenuChoice {
 /// news row, which is there when the zone sent any news: spectator used to vary
 /// too -- it was answered only when there was a zone -- and that is what left
 /// the offline sandbox's menu with no spectator on it at all.
-fn menu_choice(ch: char, has_news: bool, online: bool) -> Option<MenuChoice> {
+fn menu_choice(ch: char, has_news: bool, online: bool, settings: bool) -> Option<MenuChoice> {
     match ch.to_ascii_lowercase() {
         'q' => Some(MenuChoice::Quit),
         'o' => Some(MenuChoice::Options),
@@ -446,6 +465,7 @@ fn menu_choice(ch: char, has_news: bool, online: bool) -> Option<MenuChoice> {
         'f' => Some(MenuChoice::FrameRate),
         'a' if online => Some(MenuChoice::Arenas),
         'b' if online => Some(MenuChoice::Bots),
+        'e' if online && settings => Some(MenuChoice::ArenaSettings),
         d @ '1'..='8' => Some(MenuChoice::Ship(d as u8 - b'1')),
         _ => None,
     }
@@ -454,6 +474,16 @@ fn menu_choice(ch: char, has_news: bool, online: bool) -> Option<MenuChoice> {
 #[cfg(test)]
 mod tests {
     use super::{MenuChoice, may_leave, menu_choice};
+
+    #[test]
+    fn the_settings_row_is_there_only_where_the_zone_offers_it() {
+        assert_eq!(menu_choice('e', false, true, false), None);
+        assert_eq!(menu_choice('e', false, false, true), None);
+        assert_eq!(
+            menu_choice('E', false, true, true),
+            Some(MenuChoice::ArenaSettings)
+        );
+    }
 
     #[test]
     fn quitting_waits_for_half_your_energy() {
@@ -541,29 +571,66 @@ mod tests {
     fn the_menu_offers_spectator_with_or_without_a_zone() {
         // `false` here is "no news", which offline always is. S used to be
         // answered only when there was a zone, so this is the case that failed.
-        assert_eq!(menu_choice('s', false, false), Some(MenuChoice::Spectate));
-        assert_eq!(menu_choice('S', true, false), Some(MenuChoice::Spectate));
-        // The news row is the one that genuinely varies, and still does.
-        assert_eq!(menu_choice('n', false, false), None, "no news, no row");
-        assert_eq!(menu_choice('n', true, false), Some(MenuChoice::News));
-        // The rest of the menu, so that pulling this out changed nothing else.
-        assert_eq!(menu_choice('q', false, false), Some(MenuChoice::Quit));
-        assert_eq!(menu_choice('o', false, false), Some(MenuChoice::Options));
-        assert_eq!(menu_choice('g', false, false), Some(MenuChoice::Graphics));
-        assert_eq!(menu_choice('G', true, true), Some(MenuChoice::Graphics));
-        assert_eq!(menu_choice('1', false, false), Some(MenuChoice::Ship(0)));
-        assert_eq!(menu_choice('8', false, false), Some(MenuChoice::Ship(7)));
-        assert_eq!(menu_choice('f', false, false), Some(MenuChoice::FrameRate));
         assert_eq!(
-            menu_choice('9', false, false),
+            menu_choice('s', false, false, false),
+            Some(MenuChoice::Spectate)
+        );
+        assert_eq!(
+            menu_choice('S', true, false, false),
+            Some(MenuChoice::Spectate)
+        );
+        // The news row is the one that genuinely varies, and still does.
+        assert_eq!(
+            menu_choice('n', false, false, false),
+            None,
+            "no news, no row"
+        );
+        assert_eq!(menu_choice('n', true, false, false), Some(MenuChoice::News));
+        // The rest of the menu, so that pulling this out changed nothing else.
+        assert_eq!(
+            menu_choice('q', false, false, false),
+            Some(MenuChoice::Quit)
+        );
+        assert_eq!(
+            menu_choice('o', false, false, false),
+            Some(MenuChoice::Options)
+        );
+        assert_eq!(
+            menu_choice('g', false, false, false),
+            Some(MenuChoice::Graphics)
+        );
+        assert_eq!(
+            menu_choice('G', true, true, false),
+            Some(MenuChoice::Graphics)
+        );
+        assert_eq!(
+            menu_choice('1', false, false, false),
+            Some(MenuChoice::Ship(0))
+        );
+        assert_eq!(
+            menu_choice('8', false, false, false),
+            Some(MenuChoice::Ship(7))
+        );
+        assert_eq!(
+            menu_choice('f', false, false, false),
+            Some(MenuChoice::FrameRate)
+        );
+        assert_eq!(
+            menu_choice('9', false, false, false),
             None,
             "any other key resumes"
         );
-        assert_eq!(menu_choice('x', true, false), None);
+        assert_eq!(menu_choice('x', true, false, false), None);
         // The arena list is the zone's, so the row is there only in a zone;
         // offline, A is any other key.
-        assert_eq!(menu_choice('a', false, true), Some(MenuChoice::Arenas));
-        assert_eq!(menu_choice('A', false, true), Some(MenuChoice::Arenas));
-        assert_eq!(menu_choice('a', false, false), None);
+        assert_eq!(
+            menu_choice('a', false, true, false),
+            Some(MenuChoice::Arenas)
+        );
+        assert_eq!(
+            menu_choice('A', false, true, false),
+            Some(MenuChoice::Arenas)
+        );
+        assert_eq!(menu_choice('a', false, false, false), None);
     }
 }
