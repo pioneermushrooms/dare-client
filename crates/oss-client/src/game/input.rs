@@ -777,6 +777,9 @@ pub struct InputState {
     /// The chat line has something on it, so keys that type characters belong to
     /// it rather than to the game.
     typing: bool,
+    /// A window has the keyboard (the arena settings): no key or pad button
+    /// drives anything, the arrows included.
+    captured: bool,
     pad: PadState,
 }
 
@@ -802,6 +805,7 @@ impl InputState {
             edges: Vec::new(),
             strokes: Vec::new(),
             typing: false,
+            captured: false,
             pad: PadState::default(),
         }
     }
@@ -814,7 +818,7 @@ impl InputState {
     pub fn press(&mut self, stroke: Stroke) {
         if let Some(code) = stroke.key {
             let fresh = self.held.insert(code);
-            if fresh && !stroke.repeat {
+            if fresh && !stroke.repeat && !self.captured {
                 let (shift, ctrl) = (self.shift(), self.ctrl());
                 let typing = self.typing;
                 for a in Action::ALL {
@@ -877,6 +881,12 @@ impl InputState {
         self.typing = typing;
     }
 
+    /// Hands the whole keyboard to a window, or gives it back. While it is held
+    /// nothing flies, turns, fires or moves the spectator camera.
+    pub fn set_captured(&mut self, captured: bool) {
+        self.captured = captured;
+    }
+
     /// Whether `key` with these modifiers is bound to anything, and so is the
     /// game's rather than a character when the chat line is empty.
     pub fn key_is_bound(&self, key: KeyCode, shift: bool, ctrl: bool) -> bool {
@@ -890,6 +900,9 @@ impl InputState {
 
     /// Whether any binding of `action` is held right now.
     pub fn action_held(&self, action: Action) -> bool {
+        if self.captured {
+            return false;
+        }
         let (shift, ctrl) = (self.shift(), self.ctrl());
         self.bindings.get(action).iter().any(|b| {
             self.held(b.key)
@@ -922,7 +935,11 @@ impl InputState {
 
     /// Builds one tick of ship input from held keys, the gamepad and the given edges.
     pub fn ship_input(&self, edges: &[Action]) -> ShipInput {
-        let pad = self.pad;
+        let pad = if self.captured {
+            PadState::default()
+        } else {
+            self.pad
+        };
         let h = |a| self.action_held(a);
         let e = |a| edges.contains(&a);
         ShipInput {
@@ -1035,6 +1052,27 @@ mod tests {
             i.action_held(Action::Repel),
             "line sent: the key repels again"
         );
+    }
+
+    #[test]
+    fn a_captured_keyboard_drives_nothing_not_even_the_arrows() {
+        let mut i = InputState::default();
+        i.set_typing(true);
+        i.set_captured(true);
+        i.key(KeyCode::ArrowUp, true);
+        i.key(KeyCode::ArrowLeft, true);
+        i.key(KeyCode::ControlLeft, true);
+        i.key(KeyCode::Tab, true);
+        let ship = i.ship_input(&[]);
+        assert!(!ship.forward && !ship.left && !ship.gun && !ship.bomb);
+        assert!(
+            !i.action_held(Action::Left),
+            "the spectator camera stays put"
+        );
+        assert!(i.take_edges().is_empty());
+
+        i.set_captured(false);
+        assert!(i.ship_input(&[]).forward, "given back, held keys fly again");
     }
 
     #[test]

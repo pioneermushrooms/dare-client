@@ -775,6 +775,9 @@ impl Sandbox {
         // is on". The chat line's rule already draws exactly that line between
         // the two kinds of key, so the menu borrows it.
         input.set_typing(self.menu || self.arena_settings_open || self.keys_type());
+        // The settings window is not the menu: its arrows pick settings, so
+        // they must not also fly the ship or slide the spectator camera.
+        input.set_captured(self.arena_settings_open);
         self.voice.tick(self.clock);
         // The help shows the player's own keys, so it reads the live table. Copied
         // only while it is open, which is the only time anything looks at it.

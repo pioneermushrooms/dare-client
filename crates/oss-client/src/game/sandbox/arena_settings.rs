@@ -200,6 +200,8 @@ const COLS: f32 = 64.0;
 const LEFT_COLS: f32 = 13.0;
 const PITCH: f32 = 12.0;
 const HELP_LINES: usize = 3;
+/// The key lines at the foot.
+const FOOT_LINES: f32 = 2.0;
 
 impl Editor {
     /// An empty window waiting for the zone's list.
@@ -502,12 +504,16 @@ impl Editor {
         let left_w = LEFT_COLS * 8.0;
         // The top part of the screen, so the chat log (where the zone answers)
         // stays in view beneath it.
-        let room = ((c.view_h * 0.62 - 14.0 - 12.0 - (HELP_LINES as f32 + 2.0) * PITCH - 14.0)
+        let room = ((c.view_h * 0.62
+            - 14.0
+            - 12.0
+            - (HELP_LINES as f32 + 1.0 + FOOT_LINES) * PITCH
+            - 14.0)
             / PITCH)
             .floor();
         self.lines = (room.max(4.0) as usize).min(24);
         let list_h = self.lines as f32 * PITCH;
-        let h = 16.0 + 12.0 + list_h + 6.0 + (HELP_LINES as f32 + 1.0) * PITCH + 16.0;
+        let h = 16.0 + 12.0 + list_h + 6.0 + (HELP_LINES as f32 + FOOT_LINES) * PITCH + 16.0;
         let x = ((c.view_w - w) / 2.0).floor().max(4.0);
         let top = 4.0;
         c.panel(r, x, top, w, h);
@@ -548,7 +554,12 @@ impl Editor {
             } else {
                 color::GREEN
             };
-            let name: String = s.chars().take(LEFT_COLS as usize - 1).collect();
+            // The current section carries a marker, so the two lists' picks
+            // are told apart: this one moves with Left and Right.
+            let mark = if n == self.section { '>' } else { ' ' };
+            let name: String = std::iter::once(mark)
+                .chain(s.chars().take(LEFT_COLS as usize - 2))
+                .collect();
             c.text(r, x + 4.0, y, colour, &name);
         }
         c.color_rect(
@@ -566,7 +577,22 @@ impl Editor {
         let key_cols = 22usize;
         let vx = px + key_cols as f32 * 8.0;
         let value_cols = ((x + w - 6.0 - vx) / 8.0).max(4.0) as usize;
-        c.text(r, px, y0, color::DARK_RED, "Setting");
+        // The header names the section, between the arrows that change it
+        // (they are buttons too).
+        if let Some(name) = self.sections.get(self.section) {
+            let head = format!("< {name} >");
+            c.text(r, px, y0, color::WHITE, &head);
+            let at = |col: usize| Rect::new(px + col as f32 * 8.0 - 2.0, y0 - 1.0, 12.0, 12.0);
+            if self.section > 0 {
+                self.spots.push((at(0), Spot::Section(self.section - 1)));
+            }
+            if self.section + 1 < self.sections.len() {
+                self.spots
+                    .push((at(head.len() - 1), Spot::Section(self.section + 1)));
+            }
+        } else {
+            c.text(r, px, y0, color::DARK_RED, "Setting");
+        }
         c.text(r, vx, y0, color::DARK_RED, "Value");
         let rows = self.current();
         for (n, &i) in rows.iter().enumerate().skip(self.top).take(self.lines) {
@@ -669,21 +695,50 @@ impl Editor {
         }
 
         // The keys, which are buttons too.
-        let fy = top + h - 13.0;
-        let foot = if self.edit.is_some() {
-            "Enter = Keep   Esc = Undo   Ctrl+S = Send"
-        } else {
-            "Arrows = Pick   Enter = Edit   Ctrl+S = Send   Esc = Close"
-        };
-        c.text(r, x + 4.0, fy, color::YELLOW, foot);
-        if let Some(at) = foot.find("Ctrl+S") {
-            let rect = Rect::new(x + 4.0 + at as f32 * 8.0, fy - 1.0, 13.0 * 8.0, 12.0);
+        let fy = top + h - 13.0 - PITCH;
+        let toggle = self.picked().is_some_and(|i| self.rows[i].is_toggle());
+        let (keys, buttons) = foot(self.edit.is_some(), toggle);
+        c.text(r, x + 4.0, fy, color::YELLOW, keys);
+        c.text(r, x + 4.0, fy + PITCH, color::YELLOW, buttons);
+        if let Some(at) = buttons.find("Ctrl+S") {
+            let rect = Rect::new(
+                x + 4.0 + at as f32 * 8.0,
+                fy + PITCH - 1.0,
+                13.0 * 8.0,
+                12.0,
+            );
             self.spots.push((rect, Spot::Save));
         }
-        if let Some(at) = foot.find("Esc") {
-            let rect = Rect::new(x + 4.0 + at as f32 * 8.0, fy - 1.0, 11.0 * 8.0, 12.0);
+        if let Some(at) = buttons.find("Esc") {
+            let rect = Rect::new(
+                x + 4.0 + at as f32 * 8.0,
+                fy + PITCH - 1.0,
+                11.0 * 8.0,
+                12.0,
+            );
             self.spots.push((rect, Spot::Close));
         }
+    }
+}
+
+/// The foot's two lines: what the keys do, then the buttons (which the mouse
+/// can click as well).
+fn foot(editing: bool, toggle: bool) -> (&'static str, &'static str) {
+    if editing {
+        (
+            "Type a value   Enter = Keep   Esc = Undo",
+            "Ctrl+S = Send   Or click another setting",
+        )
+    } else if toggle {
+        (
+            "Left/Right = Section   Up/Down = Setting   Enter = Flip",
+            "Ctrl+S = Send   Esc = Close   Or click anything",
+        )
+    } else {
+        (
+            "Left/Right = Section   Up/Down = Setting   Enter = Edit",
+            "Ctrl+S = Send   Esc = Close   Or click anything",
+        )
     }
 }
 
