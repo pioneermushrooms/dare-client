@@ -196,6 +196,10 @@ pub struct Sandbox {
     bot_menu: bool,
     /// The zone's bot list for the bots window (`?bots data` lines, kept out of chat).
     bots_feed: crate::game::bots_view::BotsFeed,
+    /// The bots window (Esc then B), shown while `bot_menu` is set.
+    bots_ui: crate::game::bots_ui::BotsUi,
+    /// When the open bots window last asked for `?bots data` (None: ask at once).
+    bots_refreshed: Option<f32>,
     pub(super) fps_view: hud::FpsView,
     /// The zone's arena list, while it is on screen (Esc then A, or `?arena`).
     arena_list: Option<arenas::ArenaList>,
@@ -492,6 +496,8 @@ impl Sandbox {
             menu: false,
             bot_menu: false,
             bots_feed: Default::default(),
+            bots_ui: Default::default(),
+            bots_refreshed: None,
             fps_view: Default::default(),
             arena_list: None,
             last_ship: 0,
@@ -709,6 +715,22 @@ impl Sandbox {
         self.chat.push(Message::local(text, color));
     }
 
+    /// While the bots window is open: take each new list from the zone, and ask for one every
+    /// couple of seconds. Closed, it asks for nothing.
+    fn bots_window_tick(&mut self) {
+        if !self.bot_menu {
+            self.bots_refreshed = None;
+            return;
+        }
+        if let Some(view) = self.bots_feed.take_fresh() {
+            self.bots_ui.set_view(view);
+        }
+        if crate::game::bots_ui::refresh_due(true, self.clock, self.bots_refreshed) {
+            self.bots_refreshed = Some(self.clock);
+            self.send_chat_line("?bots data");
+        }
+    }
+
     /// Adds a chat line that arrived (or was echoed) as chat type `kind`.
     /// A tutorial hint line from the zone goes to the page instead (see
     /// [`tutorial`]).
@@ -787,6 +809,7 @@ impl Sandbox {
         let dt = gap.min(Duration::from_millis(250));
         self.last = now;
         self.clock += dt.as_secs_f32();
+        self.bots_window_tick();
         if std::mem::take(&mut self.chat_help_due) {
             self.message(voice::chat_help(self.enter_to_chat), color::GREEN);
         }
@@ -1153,7 +1176,9 @@ impl Sandbox {
         }
         if edges.contains(&Action::Menu) {
             if self.bot_menu {
-                self.bot_menu = false;
+                if !self.bots_ui.back() {
+                    self.bot_menu = false;
+                }
             } else {
                 self.menu = !self.menu;
                 if self.menu {
@@ -1760,6 +1785,9 @@ impl Sandbox {
                         self.chat.saw_private(&from);
                     }
                     if name.is_none() && self.bots_feed.line(&text) {
+                        continue;
+                    }
+                    if name.is_none() && self.bot_menu && self.bots_ui.reply(&text) {
                         continue;
                     }
                     if name.is_none() && self.settings_chat(&text) {

@@ -4,6 +4,7 @@ pub mod account;
 pub mod arenas;
 pub mod art;
 pub mod balls;
+pub mod bots_ui;
 pub mod bots_view;
 pub mod chat;
 pub mod connect_screen;

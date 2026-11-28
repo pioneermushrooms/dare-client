@@ -40,6 +40,8 @@ pub struct BotsView {
 pub struct BotsFeed {
     building: Option<BotsView>,
     latest: Option<BotsView>,
+    /// Whether `latest` arrived since the last `take_fresh`.
+    fresh: bool,
 }
 
 impl BotsFeed {
@@ -98,6 +100,7 @@ impl BotsFeed {
             ["end"] => {
                 if let Some(view) = self.building.take() {
                     self.latest = Some(view);
+                    self.fresh = true;
                 }
             }
             _ => {}
@@ -105,8 +108,16 @@ impl BotsFeed {
         true
     }
 
+    /// The newest complete answer, once: None until another one finishes.
+    pub fn take_fresh(&mut self) -> Option<BotsView> {
+        if !std::mem::take(&mut self.fresh) {
+            return None;
+        }
+        self.latest.clone()
+    }
+
     /// The last complete answer.
-    #[allow(dead_code)] // read by the bots window (next commit)
+    #[allow(dead_code)] // kept for tests and callers that only peek
     pub fn latest(&self) -> Option<&BotsView> {
         self.latest.as_ref()
     }
@@ -188,6 +199,17 @@ mod tests {
         assert_eq!(f.latest().unwrap().bots[0].name, "One");
         assert!(f.line("\tbots\tend"));
         assert_eq!(f.latest().unwrap().bots[0].name, "Two");
+    }
+
+    #[test]
+    fn a_fresh_answer_is_handed_over_once() {
+        let mut f = feed(&["\tbots\thead\ta\tyes", "\tbots\tend"]);
+        assert_eq!(f.take_fresh().map(|v| v.arena), Some("a".to_string()));
+        assert!(f.take_fresh().is_none());
+        assert!(f.line("\tbots\thead\tb\tyes"));
+        assert!(f.take_fresh().is_none(), "not finished yet");
+        assert!(f.line("\tbots\tend"));
+        assert_eq!(f.take_fresh().map(|v| v.arena), Some("b".to_string()));
     }
 
     #[test]
