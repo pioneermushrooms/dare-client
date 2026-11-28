@@ -153,8 +153,9 @@ pub struct Options {
     pub assets_dir: Option<PathBuf>,
     /// A Continuum install to take assets from (`--continuum-dir`).
     pub continuum_dir: Option<PathBuf>,
-    /// Integer pixel scale; `None` picks one from the display's DPI.
-    pub scale: Option<u32>,
+    /// World zoom (screen pixels per game pixel); `None` picks a whole number
+    /// from the display's DPI.
+    pub scale: Option<f32>,
     pub vsync: bool,
     pub fullscreen: bool,
     /// Save a frame to this file after a short warm-up, then exit.
@@ -228,7 +229,8 @@ pub struct Options {
     pub open_zones: bool,
     /// Accessibility settings.
     pub palette: crate::game::palette::PaletteKind,
-    pub ui_scale: u32,
+    /// The HUD, radar, chat and labels.
+    pub view: crate::config::GameView,
     /// Gamepad buttons per action.
     pub pad: crate::game::input::PadBindings,
     /// `--lvz`: LVZ files to show in the sandbox.
@@ -749,7 +751,7 @@ fn draw_skin_screen(
     let s = skin_view::skin_scale(size, main);
     ui.dialog_spots.clear();
     if login.profile_open() {
-        let c = Canvas::new(art, *atlas, size, s, (0.0, 0.0));
+        let c = Canvas::new(art, *atlas, size, s as f32, (0.0, 0.0));
         let at = pointer.map(|(x, y)| (x / s as f32, y / s as f32));
         ui.dialog_spots = crate::game::profile_dialog::draw_profile_dialog(&c, r, login, at);
     }
@@ -897,6 +899,10 @@ struct App {
     gilrs: Option<gilrs::Gilrs>,
     /// The settings window, while it is open over whichever screen opened it.
     settings: Option<SettingsUi>,
+    /// The settings the game behind the window was last shown, while the window
+    /// is open over a game: what is picked is applied as it is picked, so the
+    /// zoom or the HUD can be judged on the game itself.
+    previewed: Option<crate::config::Config>,
     error: Option<String>,
     /// How far through [`Options::press`] the clock has got.
     pressed: usize,
@@ -1009,6 +1015,7 @@ Put the game graphics in assets/classic beside the program, or point --assets-di
         input,
         gilrs,
         settings: None,
+        previewed: None,
         error: None,
         pressed: 0,
         pointed: 0,
@@ -1424,7 +1431,12 @@ impl App {
                         s.macros = self.options.macros.clone();
                         s.enter_to_chat = self.options.enter_to_chat;
                         s.palette = self.options.palette;
-                        s.ui_scale_extra = self.options.ui_scale;
+                        let factor = window.scale_factor();
+                        s.set_view(
+                            &self.options.view,
+                            world_zoom(self.options.scale, factor),
+                            display_scale(factor),
+                        );
                         Screen::Game(Box::new(s))
                     }
                     Err(e) => return self.fail(event_loop, e),
@@ -1612,6 +1624,29 @@ impl App {
         let Some(run) = self.running.as_mut() else {
             return;
         };
+        if let Screen::Game(game) = &mut run.screen {
+            let factor = run.window.scale_factor();
+            match self.settings.as_ref() {
+                Some(ui) if self.previewed.as_ref() != Some(&ui.cfg) => {
+                    let cfg = &ui.cfg;
+                    game.apply_settings(cfg.volume, cfg.macros.clone(), cfg.palette);
+                    game.set_view(
+                        &cfg.view,
+                        world_zoom(cfg.scale, factor),
+                        display_scale(factor),
+                    );
+                    self.previewed = Some(cfg.clone());
+                }
+                // Closed: back to what is in force, which a Save has just made
+                // the same as what was shown, and closing unsaved has not.
+                None if self.previewed.take().is_some() => {
+                    let o = &self.options;
+                    game.apply_settings(o.volume, o.macros.clone(), o.palette);
+                    game.set_view(&o.view, world_zoom(o.scale, factor), display_scale(factor));
+                }
+                _ => {}
+            }
+        }
         if self.options.autopilot {
             self.input.autopilot(run.started.elapsed().as_secs_f32());
         }
@@ -1835,7 +1870,12 @@ impl App {
                             s.macros = self.options.macros.clone();
                             s.enter_to_chat = self.options.enter_to_chat;
                             s.palette = self.options.palette;
-                            s.ui_scale_extra = self.options.ui_scale;
+                            let factor = run.window.scale_factor();
+                            s.set_view(
+                                &self.options.view,
+                                world_zoom(self.options.scale, factor),
+                                display_scale(factor),
+                            );
                             // The start screen goes away here; its skin's texture
                             // goes with it rather than staying on the GPU.
                             if let Some(ui) = ls.skin.take() {
@@ -2035,7 +2075,12 @@ impl App {
                     s.macros = self.options.macros.clone();
                     s.enter_to_chat = self.options.enter_to_chat;
                     s.palette = self.options.palette;
-                    s.ui_scale_extra = self.options.ui_scale;
+                    let factor = run.window.scale_factor();
+                    s.set_view(
+                        &self.options.view,
+                        world_zoom(self.options.scale, factor),
+                        display_scale(factor),
+                    );
                     run.screen = Screen::Game(Box::new(s));
                 }
                 Err(e) => return self.fail(event_loop, e),
@@ -2071,9 +2116,12 @@ impl App {
                     // answers to, put on the queue in front of everything the
                     // keyboard sent, so the menu reads it as a key and never
                     // learns a pointer was involved.
+                    // The pointer is measured at the interface's scale; the
+                    // menus are drawn at the HUD's, which its size can change.
+                    let k = run.scale as f32 / game.hud_scale();
                     if std::mem::take(&mut self.clicked)
                         && let Some((mx, my)) = cursor
-                        && let Some(stroke) = game.click(mx, my)
+                        && let Some(stroke) = game.click(mx * k, my * k)
                     {
                         self.input.press(stroke);
                         // A click is a press and a release. Without the release
@@ -2133,7 +2181,7 @@ impl App {
                     &conn.art,
                     conn.atlas,
                     run.renderer.size(),
-                    run.scale,
+                    run.scale as f32,
                     (0.0, 0.0),
                 );
                 let t = conn.since.elapsed().as_secs_f32();
@@ -2166,6 +2214,7 @@ impl App {
             run.captured = true;
         }
         if let Some(ui) = self.settings.as_mut() {
+            ui.set_display_scale(display_scale(run.window.scale_factor()));
             draw_settings(ui, &run.screen, &mut run.renderer, run.scale, cursor);
         }
         let shown = match run.renderer.render(stars, 0.0) {
@@ -2229,7 +2278,7 @@ fn draw_settings(
         Screen::Game(game) => game.artwork(),
         Screen::Empty => return,
     };
-    let mut c = Canvas::new(art, atlas, r.size(), scale, (0.0, 0.0));
+    let mut c = Canvas::new(art, atlas, r.size(), scale as f32, (0.0, 0.0));
     // In the palette being chosen, so a player picking one for their eyes sees
     // it before saving it rather than after.
     c.tints = ui.cfg.palette.text_tints();
@@ -2265,6 +2314,11 @@ impl App {
                 }
                 Err(e) => format!("Couldn't save: {e}"),
             },
+            #[cfg(target_arch = "wasm32")]
+            None if crate::web::save_settings(&cfg.to_text(&self.options.supplied.mechanisms)) => {
+                ui.mark_saved();
+                "Saved in this browser, for this pilot".into()
+            }
             None => {
                 ui.mark_saved();
                 "No settings folder; applied for this session only".into()
@@ -2281,7 +2335,7 @@ impl App {
         o.macros = cfg.macros.clone();
         o.enter_to_chat = cfg.enter_to_chat;
         o.palette = cfg.palette;
-        o.ui_scale = cfg.ui_scale;
+        o.view = cfg.view;
         o.pad = cfg.pad.clone();
         self.input.set_bindings(cfg.bindings.clone());
         self.input.set_pad_bindings(cfg.pad.clone());
@@ -2297,15 +2351,14 @@ impl App {
             // choosing 0 look as though it did nothing: the old scale stayed
             // until the next start. The same function the first frame used, so
             // the two cannot answer differently.
-            let wanted = wanted_scale(cfg.scale, run.window.scale_factor());
-            run.scale = wanted;
+            let factor = run.window.scale_factor();
+            run.scale = wanted_scale(cfg.scale, factor);
             if let Screen::Game(game) = &mut run.screen {
-                game.apply_settings(
-                    Some(wanted),
-                    cfg.volume,
-                    cfg.macros.clone(),
-                    cfg.palette,
-                    cfg.ui_scale,
+                game.apply_settings(cfg.volume, cfg.macros.clone(), cfg.palette);
+                game.set_view(
+                    &cfg.view,
+                    world_zoom(cfg.scale, factor),
+                    display_scale(factor),
                 );
                 game.set_enter_to_chat(cfg.enter_to_chat);
             }
@@ -2331,10 +2384,24 @@ fn set_title(window: &Window, title: &str) {
 /// stayed.
 /// Used both for the first frame and when the settings are saved, so the two
 /// cannot disagree.
-fn wanted_scale(chosen: Option<u32>, display_factor: f64) -> u32 {
-    chosen
-        .unwrap_or_else(|| display_factor.round().max(1.0) as u32)
-        .clamp(1, 8)
+///
+/// This is the whole-number scale the start-up screen and the settings window
+/// are drawn at. A zoom between whole numbers (1.5) is the world's alone: the
+/// interface keeps the display's scale, or the zoom's whole part where that is
+/// more, so its 8x12 letters stay crisp.
+fn wanted_scale(chosen: Option<f32>, display_factor: f64) -> u32 {
+    let zoom = chosen.map_or(0, |z| z.floor() as u32);
+    display_scale(display_factor).max(zoom).clamp(1, 8)
+}
+
+/// The display's own whole-number scale: 2 on a high-DPI screen.
+fn display_scale(display_factor: f64) -> u32 {
+    (display_factor.round().max(1.0) as u32).clamp(1, 8)
+}
+
+/// The world's zoom: the one chosen, or the display's own scale.
+fn world_zoom(chosen: Option<f32>, display_factor: f64) -> f32 {
+    chosen.unwrap_or_else(|| display_scale(display_factor) as f32)
 }
 
 /// A new screenshot file: `screenshots/oss-YYYY-MM-DD-HHMMSS.png` beside the
@@ -2439,7 +2506,7 @@ fn draw_start_screen(
     scale: u32,
     cursor: Option<(f32, f32)>,
 ) {
-    let c = Canvas::new(&ls.art, ls.atlas, r.size(), scale, (0.0, 0.0));
+    let c = Canvas::new(&ls.art, ls.atlas, r.size(), scale as f32, (0.0, 0.0));
     let (login, b) = (&ls.login, &ls.browser);
     let focus = login.focused();
     // The regions are collected here, as each thing is drawn, so what a pointer
@@ -2819,7 +2886,7 @@ scale = 3
 
         // This run does what the command line asked.
         assert!(o.directories.iter().any(|d| d == "127.0.0.1:4991"));
-        assert_eq!(o.scale, Some(1));
+        assert_eq!(o.scale, Some(1.0));
         assert!(o.mute);
         // What a Save would write is the file's own, untouched.
         let saved = current_config(&o).to_text(&o.supplied.mechanisms);
@@ -2931,10 +2998,20 @@ scale = 3
         assert_eq!(wanted_scale(None, 2.0), 2, "a high-DPI one");
         assert_eq!(wanted_scale(None, 1.5), 2, "rounded, not truncated");
         assert_eq!(wanted_scale(None, 0.0), 1, "never zero, whatever is asked");
-        // A chosen scale is kept, and kept inside what the renderer accepts.
-        assert_eq!(wanted_scale(Some(3), 1.0), 3);
-        assert_eq!(wanted_scale(Some(99), 1.0), 8);
-        assert_eq!(wanted_scale(Some(0), 2.0), 1, "0 as a value, not as None");
+        // A chosen zoom's whole part lifts the interface with it, inside what
+        // the renderer accepts; never below the display's own.
+        assert_eq!(wanted_scale(Some(3.0), 1.0), 3);
+        assert_eq!(wanted_scale(Some(99.0), 1.0), 8);
+        assert_eq!(
+            wanted_scale(Some(1.5), 2.0),
+            2,
+            "a fine zoom keeps the display's"
+        );
+        assert_eq!(wanted_scale(Some(2.5), 1.0), 2);
+        // The world takes the zoom as chosen, or the display's own.
+        assert_eq!(world_zoom(Some(1.375), 2.0), 1.375);
+        assert_eq!(world_zoom(None, 2.0), 2.0);
+        assert_eq!(world_zoom(None, 1.0), 1.0);
     }
 
     /// The zone's name between "Open SubSpace" and the address when the zone

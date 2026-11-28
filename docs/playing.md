@@ -33,8 +33,8 @@ rather than "the keys".
 | Up / Down | Zone selection on the start screen; double-click a zone to play it |
 | F11 | Spectator mode on and off, as in Continuum (off goes back to the ship you last flew) |
 | Print Screen | Save a screenshot (a `screenshots` folder beside the settings file) |
-| F12 | Frame rate and ping; press again for the technical detail (pixel scale, how frames reach the screen, tick count), and again to hide it |
-| Ctrl +/- | Pixel scale |
+| F12 | Frame rate and ping; press again for the technical detail (zoom, how frames reach the screen, tick count), and again to hide it |
+| Ctrl +/- | Zoom in or out, in the settings window's steps |
 
 Gamepads: left stick or D-pad steers, RT/LT thrust and reverse, bumpers afterburner, A guns,
 B bombs, X mines, Y multifire. Every key and button is rebindable on the settings window

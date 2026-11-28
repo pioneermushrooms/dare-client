@@ -69,7 +69,7 @@ Options:
   --graphic <name>=<file>   Use this PNG/BMP as the pilot's own graphic <name>
                             (bombs, prizes...; bombs@3 for ship 3's shots only), as
                             browser play's Graphics overlay does (repeatable; testing)
-  --scale <n>               Integer pixel scale (default: from display DPI)
+  --scale <n>               Zoom, 1-8 in steps (1.25, 1.5...; default: from display DPI)
   --vsync                   Cap frame rate to the display refresh
   --fullscreen              Borderless fullscreen
   --mute                    No sound
@@ -232,9 +232,10 @@ fn parse_args(
             "--scale" => {
                 scale = Some(
                     value("--scale")?
-                        .parse::<u32>()
+                        .parse::<f32>()
                         .ok()
-                        .filter(|s| (1..=8).contains(s))
+                        .filter(|s| (1.0..=8.0).contains(s))
+                        .map(config::nearest_zoom)
                         .ok_or("--scale must be 1-8")?,
                 )
             }
@@ -448,7 +449,7 @@ fn parse_args(
             macros: Vec::new(),
             enter_to_chat: true,
             palette: Default::default(),
-            ui_scale: 0,
+            view: Default::default(),
             directories: directories.clone(),
             security: security.clone().unwrap_or_default(),
             security_from_cli: security.is_some(),
@@ -536,7 +537,7 @@ fn parse_args(
         macros: Vec::new(),
         enter_to_chat: true,
         palette: Default::default(),
-        ui_scale: 0,
+        view: Default::default(),
         directories,
         security_from_cli: security.is_some(),
         security: security.unwrap_or_default(),
@@ -619,7 +620,7 @@ fn finish_options(opts: &mut app::Options, cfg: config::Config) -> Result<(), St
     opts.macros = cfg.macros;
     opts.enter_to_chat = cfg.enter_to_chat;
     opts.palette = cfg.palette;
-    opts.ui_scale = cfg.ui_scale;
+    opts.view = cfg.view;
     opts.pad = cfg.pad;
     opts.directories.extend(cfg.directories);
     // The command line wins over the settings file. The file's word is read
@@ -921,7 +922,7 @@ mod tests {
             &o.mode,
             app::Mode::Sandbox { map: Some(map), ship: 2 } if map == &PathBuf::from("m.lvl")
         ));
-        assert_eq!((o.scale, o.vsync), (Some(2), true));
+        assert_eq!((o.scale, o.vsync), (Some(2.0), true));
         let o = parse("--sandbox --ship 2").unwrap().unwrap();
         assert!(matches!(&o.mode, app::Mode::Sandbox { map: None, ship: 1 }));
         let o = parse("--server 127.0.0.1:5000 --name Bob --ship 4 --password pw")
@@ -937,7 +938,7 @@ mod tests {
         );
         let cfg = config::Config {
             name: Some("Ace".into()),
-            scale: Some(3),
+            scale: Some(3.0),
             vsync: true,
             ..Default::default()
         };
@@ -946,7 +947,7 @@ mod tests {
             .unwrap();
         finish_options(&mut o, cfg).unwrap();
         assert!(matches!(&o.mode, app::Mode::Zone(z) if z.name == "Ace"));
-        assert_eq!((o.scale, o.vsync), (Some(2), true), "flags win");
+        assert_eq!((o.scale, o.vsync), (Some(2.0), true), "flags win");
         assert!(parse("--ship 9 --sandbox m.lvl").is_err());
         assert!(parse("--sandbox m.lvl --ship spec").is_err());
         assert!(matches!(

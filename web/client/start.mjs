@@ -602,6 +602,18 @@ async function play() {
   }
 }
 
+// The game's own settings (zoom, HUD, radar, sound...), kept per pilot in this browser: the
+// Options window's Save hands the whole file over, and the next Enter gives it back.
+const SETTINGS_KEY = "dare.settings.";
+function localSettings(name) {
+  try { return localStorage.getItem(SETTINGS_KEY + name.toLowerCase()) ?? ""; } catch { return ""; }
+}
+function keepSettings(name) {
+  globalThis.dareSaveSettings = (text) => {
+    try { localStorage.setItem(SETTINGS_KEY + name.toLowerCase(), String(text)); return true; } catch { return false; }
+  };
+}
+
 function enter(name, pass, arena, settings) {
   try {
     entry.hidden = true;
@@ -623,7 +635,8 @@ function enter(name, pass, arena, settings) {
       return stage?.(step, ...rest);
     };
     setTimeout(() => { sounds ??= loadSounds(); }, 30000); // (a game that never says)
-    game.start_dare_in(name, pass, arena, settings);
+    keepSettings(name);
+    game.start_dare_in(name, pass, arena, settings, localSettings(name));
   } catch (error) {
     entry.hidden = false;
     document.body.classList.remove("playing");

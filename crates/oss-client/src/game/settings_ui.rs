@@ -1,4 +1,4 @@
-//! The settings window: video, audio, accessibility, keys, gamepad and macros.
+//! The settings window: video, HUD, audio, accessibility, keys, gamepad and macros.
 //!
 //! Drawn the way the start-up screen is drawn, in the game's own box: the grey
 //! three-ply border, the 8x12 font, green labels, white values, red headings and
@@ -18,14 +18,20 @@
 //! who changed it here and saw no effect had been lied to.
 //!
 //! Opened from the start-up screen (F2, or Options) and from the Esc menu (O).
-//! Edits a copy of the settings; Save writes `oss-client.ini` and applies what
-//! can change while playing (bindings, macros, volume, pixel scale, fullscreen).
+//! Edits a copy of the settings; Save writes `oss-client.ini` (in the browser,
+//! the pilot's own copy kept by the page) and applies what can change while
+//! playing (bindings, macros, volume, zoom, fullscreen). Opened over the game,
+//! the zoom, the HUD, the volumes and the palette change behind the window as
+//! they are picked, and go back as they were if it is closed unsaved.
 //! Rebinding waits for the next key press, which is captured with its modifiers
 //! (see [`SettingsUi::capture`]).
 
 use winit::keyboard::KeyCode;
 
-use crate::config::Config;
+use crate::config::{
+    CHAT_LINES_MAX, Config, FrameRate, HUD_SIZE, NAME_WIDTH_MAX, RADAR_SIZE, RADAR_ZOOM, ShipNames,
+    ZOOM_STEPS,
+};
 use crate::game::chat::{MAX_CHAT, wrap};
 use crate::game::input::{Action, Binding, Mods, PadButton, Stroke, key_name};
 use crate::game::palette::PaletteKind;
@@ -55,6 +61,7 @@ enum Capture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Video,
+    Hud,
     Audio,
     Accessibility,
     Keys,
@@ -63,8 +70,9 @@ pub enum Section {
 }
 
 impl Section {
-    pub const ALL: [Section; 6] = [
+    pub const ALL: [Section; 7] = [
         Section::Video,
+        Section::Hud,
         Section::Audio,
         Section::Accessibility,
         Section::Keys,
@@ -75,6 +83,7 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Section::Video => "Video",
+            Section::Hud => "HUD",
             Section::Audio => "Audio",
             Section::Accessibility => "Accessibility",
             Section::Keys => "Keys",
@@ -93,7 +102,9 @@ impl Section {
     /// The two column headings over the section's lines.
     fn columns(self) -> (&'static str, &'static str) {
         match self {
-            Section::Video | Section::Audio | Section::Accessibility => ("Setting", "Value"),
+            Section::Video | Section::Hud | Section::Audio | Section::Accessibility => {
+                ("Setting", "Value")
+            }
             Section::Keys => ("Action", "Keys"),
             Section::Gamepad => ("Action", "Buttons"),
             Section::Macros => ("Key", "Sends"),
@@ -117,9 +128,10 @@ impl Section {
     /// over its name.
     fn hint(self) -> &'static str {
         match self {
-            Section::Video => "Pixel scale, fullscreen and vsync.",
+            Section::Video => "Zoom, fullscreen and vsync.",
+            Section::Hud => "How large the HUD and radar are, chat, and names on ships.",
             Section::Audio => "Sound on or off, and how loud.",
-            Section::Accessibility => "Colours for colour-blind players, and text size.",
+            Section::Accessibility => "Colours for colour-blind players, and what Enter does.",
             Section::Keys => "The keys for every action.",
             Section::Gamepad => "The gamepad buttons for every action.",
             Section::Macros => "Keys that send a line of chat.",
@@ -130,6 +142,7 @@ impl Section {
 /// One line of a section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
+    /// The world's zoom (`[video] scale`).
     Scale,
     Fullscreen,
     Vsync,
@@ -140,7 +153,14 @@ enum Row {
     Palette,
     /// The start screen's skin, from the names given by [`SettingsUi::set_skins`].
     Skin,
-    InterfaceSize,
+    HudSize,
+    RadarSize,
+    RadarZoom,
+    ShipNames,
+    ChatLines,
+    NameWidth,
+    FrameRate,
+    VoiceVolume,
     Key(Action),
     RestoreKeys,
     Pad(Action),
@@ -191,9 +211,16 @@ impl Part {
 impl Row {
     fn kind(self) -> Kind {
         match self {
-            Row::Scale | Row::Volume | Row::InterfaceSize => Kind::Number,
+            Row::Scale
+            | Row::Volume
+            | Row::VoiceVolume
+            | Row::HudSize
+            | Row::RadarSize
+            | Row::RadarZoom
+            | Row::ChatLines
+            | Row::NameWidth => Kind::Number,
             Row::Fullscreen | Row::Vsync | Row::Mute | Row::EnterToChat => Kind::Toggle,
-            Row::Palette | Row::Skin => Kind::Choice,
+            Row::Palette | Row::Skin | Row::ShipNames | Row::FrameRate => Kind::Choice,
             Row::Key(_) | Row::Pad(_) | Row::Macro(_) => Kind::Parts,
             Row::RestoreKeys | Row::RestorePad | Row::AddMacro => Kind::Button,
         }
@@ -257,6 +284,11 @@ pub struct SettingsUi {
     spots: Vec<(Rect, Spot)>,
     /// Skins the Skin line can pick; none means no Skin line.
     skins: Vec<String>,
+    /// The display's own whole-number scale, which the zoom's Auto is.
+    display: u32,
+    /// The screen in screen pixels, as last drawn, for how much of the map a
+    /// zoom shows.
+    screen: (f32, f32),
 }
 
 /// How a binding reads in the window and its messages: the key as a player
@@ -291,10 +323,6 @@ fn fit(s: &str, room: usize) -> String {
     cut
 }
 
-/// The highest pixel scale the window offers; the renderer takes no more.
-const SCALE_MAX: i32 = 8;
-/// The most the interface can be drawn larger than the world.
-const INTERFACE_MAX: i32 = 4;
 /// How far one press moves the volume.
 const VOLUME_STEP: i32 = 5;
 
@@ -313,7 +341,14 @@ impl SettingsUi {
             warned: false,
             spots: Vec::new(),
             skins: Vec::new(),
+            display: 1,
+            screen: (0.0, 0.0),
         }
+    }
+
+    /// The display's own whole-number scale, for the zoom's Auto to name.
+    pub fn set_display_scale(&mut self, scale: u32) {
+        self.display = scale.max(1);
     }
 
     /// Waiting for a key press to bind.
@@ -388,8 +423,17 @@ impl SettingsUi {
                 }
                 v
             }
-            Section::Audio => vec![Row::Mute, Row::Volume],
-            Section::Accessibility => vec![Row::Palette, Row::InterfaceSize, Row::EnterToChat],
+            Section::Hud => vec![
+                Row::HudSize,
+                Row::RadarSize,
+                Row::RadarZoom,
+                Row::ShipNames,
+                Row::ChatLines,
+                Row::NameWidth,
+                Row::FrameRate,
+            ],
+            Section::Audio => vec![Row::Mute, Row::Volume, Row::VoiceVolume],
+            Section::Accessibility => vec![Row::Palette, Row::EnterToChat],
             Section::Keys => Action::ALL
                 .into_iter()
                 .map(Row::Key)
@@ -594,22 +638,59 @@ impl SettingsUi {
         };
         match row {
             Row::Scale => {
-                let v = around(self.cfg.scale.unwrap_or(0) as i32 + dir, SCALE_MAX);
-                self.cfg.scale = (v > 0).then_some(v as u32);
-            }
-            Row::Volume => {
-                // To the next multiple of the step, so a volume of 63 from the
-                // old slider goes to 65 or 60 rather than staying off the grid.
-                let v = self.cfg.volume as i32;
-                let next = if dir > 0 {
-                    (v / VOLUME_STEP + 1) * VOLUME_STEP
+                // Auto stands where the display's own zoom is among the steps,
+                // so Left is always further out and Right always closer, from
+                // Auto as from anywhere else.
+                let auto = self.display as f32;
+                let now = self.cfg.scale.unwrap_or(auto);
+                let n = ZOOM_STEPS.len() as i32;
+                let i = ZOOM_STEPS
+                    .iter()
+                    .position(|z| *z == crate::config::nearest_zoom(now))
+                    .unwrap_or(0) as i32;
+                let j = if wrap && i + dir >= n {
+                    0
                 } else {
-                    (v + VOLUME_STEP - 1) / VOLUME_STEP * VOLUME_STEP - VOLUME_STEP
+                    (i + dir).clamp(0, n - 1)
                 };
-                self.cfg.volume = around(next, 100) as u32;
+                let z = ZOOM_STEPS[j as usize];
+                self.cfg.scale = (z != auto).then_some(z);
             }
-            Row::InterfaceSize => {
-                self.cfg.ui_scale = around(self.cfg.ui_scale as i32 + dir, INTERFACE_MAX) as u32;
+            Row::Volume => self.cfg.volume = volume_step(self.cfg.volume, dir, wrap),
+            Row::VoiceVolume => {
+                self.cfg.view.voice_volume = volume_step(self.cfg.view.voice_volume, dir, wrap);
+            }
+            Row::HudSize => {
+                self.cfg.view.hud_size = percent(self.cfg.view.hud_size, HUD_SIZE, dir, wrap)
+            }
+            Row::RadarSize => {
+                self.cfg.view.radar_size = percent(self.cfg.view.radar_size, RADAR_SIZE, dir, wrap);
+            }
+            Row::RadarZoom => {
+                self.cfg.view.radar_zoom = percent(self.cfg.view.radar_zoom, RADAR_ZOOM, dir, wrap);
+            }
+            Row::ChatLines => {
+                let v = around(
+                    self.cfg.view.chat_lines.unwrap_or(0) as i32 + dir,
+                    CHAT_LINES_MAX as i32,
+                );
+                self.cfg.view.chat_lines = (v > 0).then_some(v as u32);
+            }
+            Row::NameWidth => {
+                let v = self.cfg.view.name_width as i32 + dir;
+                self.cfg.view.name_width = if wrap && v > NAME_WIDTH_MAX as i32 {
+                    1
+                } else {
+                    v.clamp(1, NAME_WIDTH_MAX as i32) as u32
+                };
+            }
+            Row::ShipNames => {
+                self.cfg.view.ship_names =
+                    cycle(&ShipNames::ALL, self.cfg.view.ship_names, dir, wrap);
+            }
+            Row::FrameRate => {
+                self.cfg.view.frame_rate =
+                    cycle(&FrameRate::ALL, self.cfg.view.frame_rate, dir, wrap);
             }
             Row::Palette => {
                 let all = PaletteKind::ALL;
@@ -742,7 +823,7 @@ impl SettingsUi {
 
     fn label(&self, row: Row) -> String {
         match row {
-            Row::Scale => "Pixel scale".into(),
+            Row::Scale => "Zoom".into(),
             Row::Fullscreen => "Fullscreen".into(),
             Row::Vsync => "Vsync".into(),
             Row::Mute => "Mute".into(),
@@ -750,7 +831,14 @@ impl SettingsUi {
             Row::Volume => "Volume".into(),
             Row::Palette => "Colour palette".into(),
             Row::Skin => "Start screen skin".into(),
-            Row::InterfaceSize => "Interface size".into(),
+            Row::HudSize => "HUD size".into(),
+            Row::RadarSize => "Radar size".into(),
+            Row::RadarZoom => "Radar zoom".into(),
+            Row::ShipNames => "Names on ships".into(),
+            Row::ChatLines => "Chat lines".into(),
+            Row::NameWidth => "Name column".into(),
+            Row::FrameRate => "Frame rate".into(),
+            Row::VoiceVolume => "Voice volume".into(),
             Row::Key(a) | Row::Pad(a) => action_title(a),
             Row::Macro(i) => self
                 .cfg
@@ -767,10 +855,7 @@ impl SettingsUi {
     fn value(&self, row: Row) -> String {
         let on = |b: bool| if b { "On" } else { "Off" }.to_string();
         match row {
-            Row::Scale => match self.cfg.scale {
-                Some(n) if n > 0 => n.to_string(),
-                _ => "from display".into(),
-            },
+            Row::Scale => self.zoom_value(),
             Row::Fullscreen => on(self.cfg.fullscreen),
             Row::Vsync => on(self.cfg.vsync),
             Row::Mute => on(self.cfg.mute),
@@ -778,10 +863,27 @@ impl SettingsUi {
             Row::Volume => self.cfg.volume.to_string(),
             Row::Palette => self.cfg.palette.name().replace('_', " "),
             Row::Skin => self.cfg.skin.clone(),
-            Row::InterfaceSize => match self.cfg.ui_scale {
-                0 => "normal".into(),
-                n => format!("+{n}"),
+            Row::HudSize => format!("{}%", self.cfg.view.hud_size),
+            Row::RadarSize => format!("{}%", self.cfg.view.radar_size),
+            Row::RadarZoom => format!("{}%", self.cfg.view.radar_zoom),
+            Row::VoiceVolume => self.cfg.view.voice_volume.to_string(),
+            Row::ShipNames => match self.cfg.view.ship_names {
+                ShipNames::NameAndBounty => "Name & bounty",
+                ShipNames::Name => "Name only",
+                ShipNames::Off => "Off",
+            }
+            .into(),
+            Row::ChatLines => match self.cfg.view.chat_lines {
+                Some(n) => n.to_string(),
+                None => "Auto".into(),
             },
+            Row::NameWidth => format!("{} letters", self.cfg.view.name_width),
+            Row::FrameRate => match self.cfg.view.frame_rate {
+                FrameRate::Off => "Off",
+                FrameRate::On => "On",
+                FrameRate::Detail => "With detail",
+            }
+            .into(),
             Row::Key(a) => {
                 // Each name once: the left and right Shift are two bindings
                 // that a player would only ever call "Shift".
@@ -820,7 +922,11 @@ impl SettingsUi {
     fn hint(&self, row: Row) -> String {
         match row {
             Row::Scale => {
-                "Screen pixels to each game pixel. The zoom keys change it in game.".into()
+                let auto = format!("Auto is {}x, the display's own.", self.display);
+                format!(
+                    "How much of the map is on screen: further right is closer. \
+                     Ctrl+= and Ctrl+- zoom in game. {auto}"
+                )
             }
             Row::Fullscreen => "Borderless fullscreen. Applies when saved.".into(),
             Row::Vsync => "Caps the frame rate to the display's. Applies at the next start.".into(),
@@ -829,7 +935,20 @@ impl SettingsUi {
                 "On: Enter opens chat and V opens the voice menu. Off: keys type straight into chat."
                     .into()
             }
-            Row::Volume => "How loud, 0 to 100. Applies when saved.".into(),
+            Row::Volume => "How loud, 0 to 100.".into(),
+            Row::VoiceVolume => "Voice lines and chat sounds, 0 to 100 of the volume.".into(),
+            Row::HudSize => {
+                "Text, gauges, chat and menus, against the size the game picks itself.".into()
+            }
+            Row::RadarSize => "The radar in the corner. Alt still shows the whole map.".into(),
+            Row::RadarZoom => "How close the radar's map is: 200% shows half as much, larger.".into(),
+            Row::ShipNames => "What the label beside other ships says.".into(),
+            Row::ChatLines => {
+                "Lines of chat under the world. Auto follows the screen's height, as ?lines does."
+                    .into()
+            }
+            Row::NameWidth => "How much of a sender's name chat shows, as ?namelen sets.".into(),
+            Row::FrameRate => "The frame rate line as the game starts. F12 still cycles it.".into(),
             Row::Skin => {
                 "The start screen's look. Cmd-K or F7 cycles it there too. Applies when saved."
                     .into()
@@ -842,13 +961,28 @@ impl SettingsUi {
                 PaletteKind::HighContrast => "Strong colours on the text and the radar.",
             }
             .into(),
-            Row::InterfaceSize => "Draws chat, the HUD and menus larger than the world.".into(),
             Row::Key(_) | Row::Pad(_) => format!("{}: {}", self.label(row), self.value(row)),
             Row::RestoreKeys => "Puts every key back as Continuum has it.".into(),
             Row::RestorePad => "Puts every button back to the default layout.".into(),
             Row::Macro(_) => "Type the line it sends; Backspace takes from it.".into(),
             Row::AddMacro => "Then press the key the new macro goes on.".into(),
         }
+    }
+
+    /// The zoom as the window shows it: by how many tiles of the map are on
+    /// screen across and down, which is what a player is choosing, with the
+    /// factor beside it.
+    fn zoom_value(&self) -> String {
+        let (zoom, name) = match self.cfg.scale {
+            Some(z) => (z, format!("{z}x")),
+            None => (self.display as f32, "Auto".to_string()),
+        };
+        let (w, h) = self.screen;
+        if w < 1.0 || h < 1.0 {
+            return name;
+        }
+        let tiles = |px: f32| (px / zoom / 16.0).round() as u32;
+        format!("{name}: {}x{} tiles", tiles(w), tiles(h))
     }
 
     /// The question while a key is being waited for.
@@ -869,6 +1003,7 @@ impl SettingsUi {
     /// everything went for [`SettingsUi::click`].
     pub fn draw(&mut self, c: &Canvas, r: &mut Renderer, cursor: Option<(f32, f32)>) {
         self.spots.clear();
+        self.screen = (c.view_w * c.scale, c.view_h * c.scale);
         let hovered = |rect: Rect| cursor.is_some_and(|(mx, my)| rect.holds(mx, my));
         let w = COLS * 8.0;
         let left_w = LEFT_COLS * 8.0;
@@ -1117,6 +1252,45 @@ impl SettingsUi {
     }
 }
 
+/// A volume one step of [`VOLUME_STEP`] up or down, landing on the steps:
+/// a volume of 63 from the old slider goes to 65 or 60 rather than staying off
+/// the grid. `wrap` goes from the top round to nought.
+fn volume_step(v: u32, dir: i32, wrap: bool) -> u32 {
+    let v = v as i32;
+    let next = if dir > 0 {
+        (v / VOLUME_STEP + 1) * VOLUME_STEP
+    } else {
+        (v + VOLUME_STEP - 1) / VOLUME_STEP * VOLUME_STEP - VOLUME_STEP
+    };
+    if wrap && next > 100 {
+        0
+    } else {
+        next.clamp(0, 100) as u32
+    }
+}
+
+/// A percentage one step along `(least, most, step)`, landing on the steps.
+fn percent(v: u32, (min, max, step): (u32, u32, u32), dir: i32, wrap: bool) -> u32 {
+    let next = (v as i32 / step as i32 + dir) * step as i32;
+    if wrap && next > max as i32 {
+        min
+    } else {
+        next.clamp(min as i32, max as i32) as u32
+    }
+}
+
+/// The choice before or after `now` in `all`; `wrap` goes round.
+fn cycle<T: Copy + PartialEq>(all: &[T], now: T, dir: i32, wrap: bool) -> T {
+    let n = all.len() as i32;
+    let i = all.iter().position(|x| *x == now).unwrap_or(0) as i32;
+    let next = if wrap {
+        (i + dir).rem_euclid(n)
+    } else {
+        (i + dir).clamp(0, n - 1)
+    };
+    all[next as usize]
+}
+
 /// `text` wrapped onto at most two lines of `width`. What does not fit is cut
 /// from the middle rather than the end, because the end is what matters in the
 /// longest message there is: the file a save went to, whose name is last.
@@ -1137,8 +1311,9 @@ const COLS: f32 = 72.0;
 const LEFT_COLS: f32 = 15.0;
 /// Where a line's value starts, in characters from the left of its pane.
 const LABEL_COLS: usize = 15;
-/// The room a number or a choice has between its arrows.
-const VALUE_COLS: usize = 14;
+/// The room a number or a choice has between its arrows: enough for the
+/// zoom's "1.375x: 120x70 tiles".
+const VALUE_COLS: usize = 21;
 /// Line spacing, as the start-up screen's profile lines have it.
 const PITCH: f32 = 14.0;
 /// The spacing of a section's note.
@@ -1150,7 +1325,7 @@ const HEAD_H: f32 = 16.0;
 /// The rule, two lines of message and the keys.
 const FOOT_H: f32 = 56.0;
 /// The fewest and the most lines a section shows at once.
-const MIN_LINES: usize = 6;
+const MIN_LINES: usize = 7;
 const MAX_LINES: usize = 18;
 
 #[cfg(test)]
@@ -1203,6 +1378,7 @@ mod tests {
         let mut ui = SettingsUi::new(Config::default());
         assert_eq!(ui.section, Section::Video);
         for want in [
+            Section::Hud,
             Section::Audio,
             Section::Accessibility,
             Section::Keys,
@@ -1218,7 +1394,7 @@ mod tests {
     }
 
     /// Up and Down go round the lines; a number moves with Left and Right and
-    /// stops at its ends, and the pixel scale's bottom is "from the display".
+    /// stops at its ends, and the zoom's bottom is Auto, from the display.
     #[test]
     fn the_arrows_move_and_change() {
         let mut ui = SettingsUi::new(Config::default());
@@ -1228,18 +1404,32 @@ mod tests {
         press(&mut ui, &[KeyCode::ArrowDown]);
         assert_eq!(ui.current(), Some(Row::Scale));
 
-        press(&mut ui, &[KeyCode::ArrowRight, KeyCode::ArrowRight]);
-        assert_eq!(ui.cfg.scale, Some(2));
-        press(
-            &mut ui,
-            &[KeyCode::ArrowLeft, KeyCode::ArrowLeft, KeyCode::ArrowLeft],
+        // On a display of scale 1, Auto is 1x: the first steps in are the
+        // fine ones between 1 and 2.
+        press(&mut ui, &[KeyCode::ArrowRight]);
+        assert_eq!(ui.cfg.scale, Some(1.125));
+        press(&mut ui, &[KeyCode::ArrowRight; 3]);
+        assert_eq!(ui.cfg.scale, Some(1.5));
+        press(&mut ui, &[KeyCode::ArrowLeft; 7]);
+        assert_eq!(ui.cfg.scale, None, "the bottom is Auto, from the display");
+        press(&mut ui, &[KeyCode::ArrowRight; 40]);
+        assert_eq!(
+            ui.cfg.scale,
+            Some(8.0),
+            "and the top is the renderer's limit"
         );
-        assert_eq!(ui.cfg.scale, None, "the bottom is from the display");
-        press(&mut ui, &[KeyCode::ArrowRight; 12]);
-        assert_eq!(ui.cfg.scale, Some(8), "and the top is the renderer's limit");
         // Enter steps up and goes round, so one key reaches every value.
         press(&mut ui, &[KeyCode::Enter]);
         assert_eq!(ui.cfg.scale, None);
+        // On a high-DPI display Auto is 2x, between 1.875 and 2.25: Left goes
+        // further out from it and Right closer in.
+        ui.set_display_scale(2);
+        press(&mut ui, &[KeyCode::Home, KeyCode::ArrowLeft]);
+        assert_eq!(ui.cfg.scale, Some(1.875));
+        press(&mut ui, &[KeyCode::ArrowRight]);
+        assert_eq!(ui.cfg.scale, None);
+        press(&mut ui, &[KeyCode::ArrowRight]);
+        assert_eq!(ui.cfg.scale, Some(2.25));
     }
 
     /// The volume moves in fives and lands on them, whatever the old slider left.
@@ -1249,7 +1439,7 @@ mod tests {
             volume: 63,
             ..Config::default()
         });
-        press(&mut ui, &[KeyCode::Tab, KeyCode::ArrowDown]);
+        press(&mut ui, &[KeyCode::Tab, KeyCode::Tab, KeyCode::ArrowDown]);
         assert_eq!(ui.current(), Some(Row::Volume));
         press(&mut ui, &[KeyCode::ArrowRight]);
         assert_eq!(ui.cfg.volume, 65);
@@ -1271,7 +1461,7 @@ mod tests {
         press(&mut ui, &[KeyCode::ArrowRight]);
         assert!(!ui.cfg.fullscreen);
 
-        press(&mut ui, &[KeyCode::Tab, KeyCode::Tab]);
+        press(&mut ui, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Tab]);
         assert_eq!(ui.current(), Some(Row::Palette));
         let mut seen = vec![ui.cfg.palette];
         for _ in 1..PaletteKind::ALL.len() {
@@ -1281,8 +1471,59 @@ mod tests {
         assert_eq!(seen, PaletteKind::ALL);
         press(&mut ui, &[KeyCode::Enter]);
         assert_eq!(ui.cfg.palette, PaletteKind::Standard, "and comes round");
+    }
+
+    /// The HUD section's numbers move in their own steps and stop at their
+    /// ends; its choices go round with Enter.
+    #[test]
+    fn the_hud_section_steps_its_sizes_and_choices() {
+        let mut ui = SettingsUi::new(Config::default());
+        press(&mut ui, &[KeyCode::Tab]);
+        assert_eq!(ui.current(), Some(Row::HudSize));
+        press(&mut ui, &[KeyCode::ArrowRight]);
+        assert_eq!(ui.cfg.view.hud_size, 125);
+        press(&mut ui, &[KeyCode::ArrowLeft; 20]);
+        assert_eq!(ui.cfg.view.hud_size, HUD_SIZE.0);
         press(&mut ui, &[KeyCode::ArrowDown, KeyCode::ArrowRight]);
-        assert_eq!(ui.cfg.ui_scale, 1);
+        assert_eq!(ui.cfg.view.radar_size, 125);
+        press(
+            &mut ui,
+            &[KeyCode::ArrowDown, KeyCode::ArrowRight, KeyCode::ArrowRight],
+        );
+        assert_eq!(ui.cfg.view.radar_zoom, 150);
+        press(&mut ui, &[KeyCode::ArrowDown]);
+        assert_eq!(ui.current(), Some(Row::ShipNames));
+        press(&mut ui, &[KeyCode::Enter]);
+        assert_eq!(ui.cfg.view.ship_names, ShipNames::Name);
+        press(&mut ui, &[KeyCode::Enter, KeyCode::Enter]);
+        assert_eq!(ui.cfg.view.ship_names, ShipNames::NameAndBounty, "round");
+        press(&mut ui, &[KeyCode::ArrowDown, KeyCode::ArrowRight]);
+        assert_eq!(ui.cfg.view.chat_lines, Some(1), "Auto, then one line");
+        press(&mut ui, &[KeyCode::ArrowLeft]);
+        assert_eq!(ui.cfg.view.chat_lines, None);
+        press(&mut ui, &[KeyCode::ArrowDown, KeyCode::ArrowRight]);
+        assert_eq!(ui.cfg.view.name_width, 11);
+        press(&mut ui, &[KeyCode::ArrowDown, KeyCode::ArrowRight]);
+        assert_eq!(ui.cfg.view.frame_rate, FrameRate::On);
+    }
+
+    /// The zoom is named by how much of the map it shows on this screen.
+    #[test]
+    fn the_zoom_reads_as_tiles_on_screen() {
+        let mut ui = SettingsUi::new(Config::default());
+        ui.set_display_scale(2);
+        assert_eq!(
+            ui.zoom_value(),
+            "Auto",
+            "before the window knows the screen"
+        );
+        ui.screen = (1920.0, 1080.0);
+        assert_eq!(ui.zoom_value(), "Auto: 60x34 tiles");
+        ui.cfg.scale = Some(1.5);
+        assert_eq!(ui.zoom_value(), "1.5x: 80x45 tiles");
+        assert!(ui.zoom_value().len() <= VALUE_COLS);
+        ui.cfg.scale = Some(1.375);
+        assert!(ui.zoom_value().len() <= VALUE_COLS, "{}", ui.zoom_value());
     }
 
     /// The Skin line cycles through the skins it was given and comes round;
@@ -1317,7 +1558,7 @@ mod tests {
     #[test]
     fn a_key_is_rebound_from_the_keyboard() {
         let mut ui = SettingsUi::new(Config::default());
-        press(&mut ui, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Tab]);
+        press(&mut ui, &[KeyCode::Tab; 4]);
         let gun = Action::ALL.iter().position(|a| *a == Action::Gun).unwrap();
         for _ in 0..gun {
             press(&mut ui, &[KeyCode::ArrowDown]);
@@ -1349,7 +1590,7 @@ mod tests {
     #[test]
     fn escape_cancels_a_gamepad_capture_first() {
         let mut ui = SettingsUi::new(Config::default());
-        press(&mut ui, &[KeyCode::Tab; 4]);
+        press(&mut ui, &[KeyCode::Tab; 5]);
         assert_eq!(ui.section, Section::Gamepad);
         press(&mut ui, &[KeyCode::Enter]);
         assert!(ui.capture.is_some());
@@ -1421,7 +1662,7 @@ mod tests {
     #[test]
     fn a_long_list_scrolls_with_the_picked_line() {
         let mut ui = SettingsUi::new(Config::default());
-        press(&mut ui, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Tab]);
+        press(&mut ui, &[KeyCode::Tab; 4]);
         ui.visible = 10;
         let len = ui.rows().len();
         assert!(len > 30);
@@ -1486,7 +1727,7 @@ mod tests {
     #[test]
     fn a_click_presses_a_button_or_stops_a_capture() {
         let mut ui = SettingsUi::new(Config::default());
-        press(&mut ui, &[KeyCode::Tab, KeyCode::Tab, KeyCode::Tab]);
+        press(&mut ui, &[KeyCode::Tab; 4]);
         ui.spots = vec![
             (Rect::new(0.0, 0.0, 200.0, 13.0), Spot::Row(0)),
             (Rect::new(100.0, 0.0, 40.0, 13.0), Spot::Part(0, 0)),

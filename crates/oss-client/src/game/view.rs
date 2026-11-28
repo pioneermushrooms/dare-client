@@ -79,6 +79,9 @@ pub struct Canvas {
     /// Text colours from an accessibility palette (tinting the font's white row);
     /// `None` uses the font's own coloured rows.
     pub tints: Option<[[f32; 4]; 8]>,
+    /// The small radar's side as a share of its usual size (the HUD settings'
+    /// radar size); 1 everywhere but the game's HUD.
+    pub radar_size: f32,
 }
 
 impl Canvas {
@@ -86,10 +89,16 @@ impl Canvas {
         art: &Art,
         atlas: TextureId,
         screen: (u32, u32),
-        scale: u32,
+        scale: f32,
         cam: (f32, f32),
     ) -> Self {
-        let scale = scale.max(1) as f32;
+        // A zoom between whole numbers is allowed (1.5 is three screen pixels
+        // to two game pixels); below one is not, nor nothing at all.
+        let scale = if scale.is_finite() {
+            scale.max(1.0)
+        } else {
+            1.0
+        };
         Self {
             atlas,
             white: art.white,
@@ -105,6 +114,7 @@ impl Canvas {
             view_w: screen.0 as f32 / scale,
             view_h: screen.1 as f32 / scale,
             tints: None,
+            radar_size: 1.0,
         }
     }
 
@@ -130,16 +140,18 @@ impl Canvas {
         if region.w == 0 {
             return;
         }
+        let (px, py, w, h) = self.world_box(region, x, y);
+        r.quad(self.atlas, region, px, py, w, h, color);
+    }
+
+    /// Where `region` lands on screen with its top-left at world pixel (x, y):
+    /// both edges snapped to whole screen pixels, so at a zoom between whole
+    /// numbers neighbouring tiles meet exactly instead of leaving a seam or
+    /// overlapping by a fraction.
+    fn world_box(&self, region: Region, x: f32, y: f32) -> (f32, f32, f32, f32) {
         let (px, py) = self.to_screen(x, y);
-        r.quad(
-            self.atlas,
-            region,
-            px,
-            py,
-            region.w as f32 * self.scale,
-            region.h as f32 * self.scale,
-            color,
-        );
+        let (ex, ey) = self.to_screen(x + region.w as f32, y + region.h as f32);
+        (px, py, ex - px, ey - py)
     }
 
     /// Draws `region` of `texture` with its top-left at world pixel (x, y).
@@ -147,16 +159,8 @@ impl Canvas {
         if region.w == 0 {
             return;
         }
-        let (px, py) = self.to_screen(x, y);
-        r.quad(
-            texture,
-            region,
-            px,
-            py,
-            region.w as f32 * self.scale,
-            region.h as f32 * self.scale,
-            [1.0; 4],
-        );
+        let (px, py, w, h) = self.world_box(region, x, y);
+        r.quad(texture, region, px, py, w, h, [1.0; 4]);
     }
 
     /// Draws `region` centred on world pixel (x, y).
@@ -194,15 +198,11 @@ impl Canvas {
         }
         let s = self.scale;
         let (w, h) = size.unwrap_or((region.w as f32, region.h as f32));
-        r.quad(
-            texture,
-            region,
-            (x * s).round(),
-            (y * s).round(),
-            (w * s).round(),
-            (h * s).round(),
-            color,
-        );
+        // Both edges snapped, not the corner and the size: at a scale between
+        // whole numbers, letters and boxes side by side then meet exactly.
+        let (x0, y0) = ((x * s).round(), (y * s).round());
+        let (x1, y1) = (((x + w) * s).round(), ((y + h) * s).round());
+        r.quad(texture, region, x0, y0, x1 - x0, y1 - y0, color);
     }
 
     pub fn rect(&self, r: &mut Renderer, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
@@ -599,7 +599,10 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
         if !is_me && let Some(label) = s.player_label(ship.id) {
             // Continuum puts the name and bounty at the ship's lower right, in team
             // colour (yellow for your team, blue for enemies).
-            let (ux, uy) = c.world_to_ui(x + 14.0, y + 10.0);
+            // In the HUD's own scale, so names are as large as the rest of
+            // the text whatever the zoom.
+            let (wx, wy) = c.world_to_ui(x + 14.0, y + 10.0);
+            let (ux, uy) = (wx * c.scale / ui.scale, wy * c.scale / ui.scale);
             let col = if ship.freq == me.freq {
                 color::YELLOW
             } else {
@@ -611,7 +614,7 @@ pub fn draw_world(s: &Sandbox, c: &Canvas, ui: &Canvas, r: &mut Renderer, alpha:
     }
 
     for (ux, uy, col, label) in labels {
-        c.text(r, ux.round(), uy.round(), col, &label);
+        ui.text(r, ux.round(), uy.round(), col, &label);
     }
 
     // --- Fly-under tiles (drawn over ships) ------------------------------------------------

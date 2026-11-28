@@ -60,6 +60,16 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = globalThis, js_name = dareLoadingStage, catch)]
     fn js_loading_stage(stage: &str, detail: &str, percent: i32) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = dareSaveSettings, catch)]
+    fn js_save_settings(text: &str) -> Result<JsValue, JsValue>;
+}
+
+/// Hands the page the whole settings file, as the settings window's Save has
+/// it, for the page to keep for this pilot in this browser. False when the
+/// page has nowhere to keep it.
+pub(crate) fn save_settings(text: &str) -> bool {
+    js_save_settings(text).is_ok_and(|v| v.as_bool() != Some(false))
 }
 
 /// Tells the page where the way into the arena has got to, so its loader can
@@ -287,8 +297,31 @@ impl log::Log for BrowserLog {
 
 static LOGGER: BrowserLog = BrowserLog;
 
+/// Lays the pilot's browser settings over `options`: `local` as this browser
+/// saved it, `account` the keys and macros the account holds (see
+/// [`crate::config::Config::for_browser`]).
+fn apply_browser_settings(options: &mut crate::app::Options, local: &str, account: &str) {
+    let (saved, warnings) = crate::config::Config::for_browser(local, account);
+    for warning in warnings {
+        log::warn!("{warning}");
+    }
+    options.scale = saved.scale;
+    options.mute = saved.mute;
+    options.volume = saved.volume;
+    options.palette = saved.palette;
+    options.view = saved.view;
+    options.enter_to_chat = saved.enter_to_chat;
+    options.bindings = saved.bindings.clone();
+    options.macros = saved.macros.clone();
+    options.pad = saved.pad.clone();
+    // What the settings window opens on, so it shows the pilot's own.
+    options.saved = saved;
+}
+
+/// Starts the game on its start-up screen. `local` is the settings file as this
+/// browser last saved it (empty or missing for the defaults).
 #[wasm_bindgen]
-pub fn start_dare() -> Result<(), JsValue> {
+pub fn start_dare(local: Option<String>) -> Result<(), JsValue> {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
     }
@@ -297,6 +330,7 @@ pub fn start_dare() -> Result<(), JsValue> {
         .map_err(|error| JsValue::from_str(&error))?
         .ok_or_else(|| JsValue::from_str("Dare client options unavailable"))?;
     options.directories.clear();
+    apply_browser_settings(&mut options, local.as_deref().unwrap_or(""), "");
     crate::run(options).map_err(|error| JsValue::from_str(&error))
 }
 
@@ -305,13 +339,17 @@ pub fn start_dare() -> Result<(), JsValue> {
 /// it was given to log in with. `arena` is the arena to enter, or empty for any
 /// public one. `settings` is the pilot's own keys and macros, as the `[keys]` and
 /// `[macros]` sections of the settings file (empty for the defaults); other
-/// sections in it are ignored. Leaving the zone goes back to the page.
+/// sections in it are ignored. `local` is the whole settings file as this
+/// browser last saved it for the pilot (empty for the defaults): zoom, HUD,
+/// sound and the rest; its keys and macros are used only where `settings`
+/// has none. Leaving the zone goes back to the page.
 #[wasm_bindgen]
 pub fn start_dare_in(
     name: &str,
     password: &str,
     arena: &str,
     settings: &str,
+    local: Option<String>,
 ) -> Result<(), JsValue> {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
@@ -340,14 +378,7 @@ pub fn start_dare_in(
         .map_err(|error| JsValue::from_str(&error))?
         .ok_or_else(|| JsValue::from_str("Dare client options unavailable"))?;
     options.directories.clear();
-    if !settings.trim().is_empty() {
-        let (pilot, warnings) = crate::config::Config::parse(settings);
-        for warning in warnings {
-            log::warn!("pilot settings: {warning}");
-        }
-        options.bindings = pilot.bindings;
-        options.macros = pilot.macros;
-    }
+    apply_browser_settings(&mut options, local.as_deref().unwrap_or(""), settings);
     STARTED_FROM_PAGE.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::run(options).map_err(|error| JsValue::from_str(&error))
 }

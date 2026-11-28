@@ -61,11 +61,19 @@ fn icons_top(c: &Canvas) -> f32 {
 
 /// Side of the small radar.
 pub(super) fn radar_dim(c: &Canvas) -> f32 {
-    small_radar_dim(c.view_w)
+    small_radar_dim(c.view_w, c.view_h, c.radar_size)
 }
 
-fn small_radar_dim(view_w: f32) -> f32 {
-    ((((view_w as u32 / 6) / 4) * 8) / 2) as f32
+/// Continuum's side for the small radar, at `size` times it (the HUD
+/// settings' radar size): an even number of pixels, and never so large that
+/// it leaves no room above it for the clock line.
+fn small_radar_dim(view_w: f32, view_h: f32, size: f32) -> f32 {
+    let usual = ((((view_w as u32 / 6) / 4) * 8) / 2) as f32;
+    if size == 1.0 {
+        return usual;
+    }
+    let most = (view_w.min(view_h) - 40.0).max(16.0);
+    ((usual * size / 2.0).floor() * 2.0).clamp(16.0, most)
 }
 
 /// Where the radar goes on a screen this size: its side, and its top-left
@@ -77,11 +85,11 @@ fn small_radar_dim(view_w: f32) -> f32 {
 /// screen. The whole-zone map keeps its size rule -- the whole map, as large as
 /// the shorter side of the screen allows -- and only its place changed: it was
 /// centred.
-fn radar_place(view_w: f32, view_h: f32, big: bool) -> (f32, f32, f32) {
+fn radar_place(view_w: f32, view_h: f32, big: bool, size: f32) -> (f32, f32, f32) {
     let dim = if big {
         (view_w.min(view_h) - 40.0).floor().max(64.0)
     } else {
-        small_radar_dim(view_w)
+        small_radar_dim(view_w, view_h, size)
     };
     (
         dim,
@@ -612,7 +620,10 @@ fn ensure_radar(s: &mut Sandbox, r: &mut Renderer, view_w: u32) {
     // Radar:MapZoomFactor: the whole map is (screen width * 8 / zoom) pixels across,
     // as in nullspace.
     let zoom = s.map_zoom().unwrap_or(DEFAULT_MAP_ZOOM).max(1);
-    let full_dim = (view_w * 8 / zoom).clamp(64, 4096);
+    // The radar zoom setting scales that: twice the pixels across, half as much
+    // of the map in the same square.
+    let closer = s.radar_factors().1;
+    let full_dim = (((view_w * 8 / zoom) as f32 * closer) as u32).clamp(64, 4096);
     if s.radar.as_ref().is_some_and(|rd| {
         rd.built_for == view_w && rd.revision == revision && rd.full_dim == full_dim
     }) {
@@ -656,7 +667,7 @@ fn draw_radar(s: &mut Sandbox, c: &Canvas, r: &mut Renderer) {
     let to_radar = |px: f32| px * full / 16384.0;
     // The whole map while Alt is held; otherwise about a sixth of the screen
     // width, as in Continuum. Both from the bottom-right corner.
-    let (dim, x0, y0) = radar_place(c.view_w, c.view_h, s.big_radar);
+    let (dim, x0, y0) = radar_place(c.view_w, c.view_h, s.big_radar, c.radar_size);
     let (min_x, min_y) = if s.big_radar {
         (0.0, 0.0)
     } else {
@@ -814,7 +825,8 @@ fn draw_messages(s: &Sandbox, c: &Canvas, r: &mut Renderer) {
         s.fps_view,
         s.fps(),
         s.ping_ms(),
-        c.scale,
+        // The world's zoom, which is what Ctrl +/- moves.
+        s.scale,
         &present,
         s.world.tick,
     ) {
@@ -1142,8 +1154,8 @@ mod tests {
             (1280.0, 800.0),
             (1920.0, 1080.0),
         ] {
-            let (small, sx, sy) = radar_place(w, h, false);
-            let (big, bx, by) = radar_place(w, h, true);
+            let (small, sx, sy) = radar_place(w, h, false, 1.0);
+            let (big, bx, by) = radar_place(w, h, true, 1.0);
             assert_eq!((bx + big, by + big), (sx + small, sy + small), "{w}x{h}");
             assert!(big > small, "{w}x{h}: it grows");
             assert!(bx >= 0.0 && by >= 0.0, "{w}x{h}: and stays on the screen");
@@ -1192,7 +1204,7 @@ mod tests {
     #[test]
     fn the_lvz_anchors_match_continuum_at_1888x1016() {
         let art = crate::game::art::Art::default();
-        let c = Canvas::new(&art, TextureId::for_test(0), (1888, 1016), 1, (0.0, 0.0));
+        let c = Canvas::new(&art, TextureId::for_test(0), (1888, 1016), 1.0, (0.0, 0.0));
         assert_eq!((c.view_w, c.view_h), (1888.0, 1016.0));
         // The radar's own geometry, which reference 8 landing exactly confirms.
         assert_eq!(radar_dim(&c), 312.0);

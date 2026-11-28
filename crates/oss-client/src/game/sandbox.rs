@@ -155,9 +155,12 @@ pub struct Sandbox {
     bindings: super::input::Bindings,
     /// Macro keys: binding and the line they send.
     pub macros: Vec<(super::input::Binding, String)>,
-    /// Accessibility: colour palette and extra interface scale.
+    /// Accessibility: colour palette.
     pub palette: super::palette::PaletteKind,
-    pub ui_scale_extra: u32,
+    /// The HUD, radar, chat and label settings, as last applied.
+    view: crate::config::GameView,
+    /// The display's own whole-number scale, which a HUD size of 100% draws at.
+    base_scale: u32,
     /// The ship you're attached to as a turret.
     attached_to: Option<u16>,
     /// Every turret in the arena: rider → host.
@@ -213,8 +216,9 @@ pub struct Sandbox {
     pub open_settings: bool,
     /// The player asked for a screenshot; the app saves the next frame.
     pub screenshot_request: bool,
-    /// Integer pixel scale (game pixel → physical pixels).
-    pub scale: u32,
+    /// World zoom: screen pixels to each game pixel, one of
+    /// [`crate::config::ZOOM_STEPS`].
+    pub scale: f32,
     audio: Option<Audio>,
     net: Option<Online>,
     /// Where the Esc menu's rows were drawn last frame, and the keystroke each
@@ -469,7 +473,8 @@ impl Sandbox {
             bindings: Default::default(),
             macros: Vec::new(),
             palette: Default::default(),
-            ui_scale_extra: 0,
+            view: Default::default(),
+            base_scale: scale.max(1),
             crowned: Default::default(),
             crown_deadline: None,
             ball_rules: net
@@ -499,7 +504,7 @@ impl Sandbox {
             leave: false,
             open_settings: false,
             screenshot_request: false,
-            scale: scale.max(1),
+            scale: scale.max(1) as f32,
             audio,
             net,
             spectating: false,
@@ -533,7 +538,11 @@ impl Sandbox {
             .map(|i| self.world.ships[i].bounty)
             .unwrap_or(0);
         let crown = if self.crowned.contains(&id) { "^" } else { "" };
-        Some(format!("{crown}{}({bounty})", p.name))
+        match self.view.ship_names {
+            crate::config::ShipNames::NameAndBounty => Some(format!("{crown}{}({bounty})", p.name)),
+            crate::config::ShipNames::Name => Some(format!("{crown}{}", p.name)),
+            crate::config::ShipNames::Off => None,
+        }
     }
 
     pub(super) fn online(&self) -> bool {
@@ -759,6 +768,11 @@ impl Sandbox {
             y,
             start: self.clock,
         });
+    }
+
+    /// How loud voice lines and chat sounds play, under the master volume.
+    fn voice_gain(&self) -> f32 {
+        self.view.voice_volume.min(100) as f32 / 100.0
     }
 
     /// Plays a sound; with a position it is attenuated and panned relative to you.
@@ -1260,8 +1274,8 @@ impl Sandbox {
                 }
                 Action::StatBoxUp => self.statbox.move_selection(false),
                 Action::StatBoxDown => self.statbox.move_selection(true),
-                Action::ZoomIn => self.scale = (self.scale + 1).min(8),
-                Action::ZoomOut => self.scale = self.scale.saturating_sub(1).max(1),
+                Action::ZoomIn => self.scale = crate::config::step_zoom(self.scale, 1),
+                Action::ZoomOut => self.scale = crate::config::step_zoom(self.scale, -1),
                 _ => {}
             }
         }
@@ -1287,7 +1301,7 @@ impl Sandbox {
         }
         if let Some(p) = voice::PHRASES.iter().find(|p| p.code == code) {
             if let Some(clip) = voice::clip_name(p.sound) {
-                self.sound(&clip, 1.0, None);
+                self.sound(&clip, self.voice_gain(), None);
             }
             self.message(p.label, color::WHITE);
         }
@@ -1746,7 +1760,7 @@ impl Sandbox {
                 } => {
                     // Voice lines (128-255) and Continuum's classic chat sounds.
                     if let Some(clip) = voice::clip_name(sound) {
-                        self.sound(&clip, 1.0, None);
+                        self.sound(&clip, self.voice_gain(), None);
                     }
                     if name.is_none()
                         && let Some(secs) = voice::silence_from_notice(&text)
@@ -2091,21 +2105,57 @@ impl Sandbox {
     /// Applies saved settings that can change mid-game.
     pub fn apply_settings(
         &mut self,
-        scale: Option<u32>,
         volume: u32,
         macros: Vec<(super::input::Binding, String)>,
         palette: super::palette::PaletteKind,
-        ui_scale_extra: u32,
     ) {
         self.palette = palette;
-        self.ui_scale_extra = ui_scale_extra.min(4);
-        if let Some(s) = scale {
-            self.scale = s.clamp(1, 8);
-        }
         if let Some(a) = self.audio.as_mut() {
             a.set_volume(volume);
         }
         self.macros = macros;
+    }
+
+    /// The zoom, the display's own whole-number scale, and the HUD, radar,
+    /// chat and label settings. Cheap, so the settings window calls it on
+    /// every change and the game behind it shows each one as it is made.
+    pub fn set_view(&mut self, view: &crate::config::GameView, zoom: f32, base_scale: u32) {
+        self.scale = crate::config::nearest_zoom(zoom);
+        self.base_scale = base_scale.max(1);
+        // The frame-rate line is the one the start chooses: F12 still moves
+        // it, so it is set only when the setting itself changes.
+        if view.frame_rate != self.view.frame_rate {
+            self.fps_view = match view.frame_rate {
+                crate::config::FrameRate::Off => hud::FpsView::Off,
+                crate::config::FrameRate::On => hud::FpsView::Plain,
+                crate::config::FrameRate::Detail => hud::FpsView::Detail,
+            };
+        }
+        if view.chat_lines != self.view.chat_lines {
+            self.chat
+                .set_line_count(view.chat_lines.map(|n| n as usize));
+        }
+        if view.name_width != self.view.name_width {
+            self.chat.namelen = view.name_width.clamp(1, crate::config::NAME_WIDTH_MAX) as usize;
+        }
+        self.view = *view;
+    }
+
+    /// Screen pixels to each pixel of the HUD, chat and menus: the display's
+    /// own scale (or the zoom's whole part, where that is more), at the HUD
+    /// size. Clicks on the menus are measured in these.
+    pub fn hud_scale(&self) -> f32 {
+        let base = self.base_scale.max(self.scale.floor() as u32).max(1) as f32;
+        (base * self.view.hud_size as f32 / 100.0).max(1.0)
+    }
+
+    /// The share of their usual size the radar is drawn at, and how close in
+    /// its map is.
+    pub(super) fn radar_factors(&self) -> (f32, f32) {
+        (
+            self.view.radar_size as f32 / 100.0,
+            self.view.radar_zoom as f32 / 100.0,
+        )
     }
 
     /// Your ship as the ball code needs it.
@@ -2822,14 +2872,9 @@ impl Sandbox {
         c.tints = tints;
         // The interface (HUD, text, stat box, LVZ screen objects) can be drawn larger
         // than the world for readability.
-        let mut ui = Canvas::new(
-            &self.art,
-            self.atlas,
-            r.size(),
-            self.scale + self.ui_scale_extra,
-            cam,
-        );
+        let mut ui = Canvas::new(&self.art, self.atlas, r.size(), self.hud_scale(), cam);
         ui.tints = tints;
+        ui.radar_size = self.radar_factors().0;
         let chat_top = ui.view_h - 16.0 - self.chat.visible_rows(ui.view_h, false) as f32 * 12.0;
         self.radar_line = hud::radar_text(ui.cam.0, ui.cam.1);
         self.screen_refs = hud::screen_refs(

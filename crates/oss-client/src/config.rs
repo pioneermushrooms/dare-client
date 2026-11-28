@@ -9,7 +9,7 @@
 //!
 //! ```ini
 //! [video]
-//! scale = 0          ; 0 = from the display's DPI
+//! scale = 0          ; zoom, 1-8 in steps (1.25, 1.5...); 0 = from the display
 //! [accessibility]
 //! palette = standard ; or deuteranopia, protanopia, tritanopia, high_contrast
 //! [keys]
@@ -64,8 +64,9 @@ pub const DEFAULT_DIRECTORIES: [&str; 4] = [
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// Integer pixel scale; `None` picks one from the display.
-    pub scale: Option<u32>,
+    /// World zoom: screen pixels to each game pixel, one of [`ZOOM_STEPS`];
+    /// `None` picks a whole number from the display.
+    pub scale: Option<f32>,
     pub vsync: bool,
     pub fullscreen: bool,
     pub mute: bool,
@@ -76,9 +77,10 @@ pub struct Config {
     pub bindings: Bindings,
     /// Macro keys: binding and the chat line they send.
     pub macros: Vec<(Binding, String)>,
-    /// Accessibility: colour palette, and extra integer scale for the interface.
+    /// Accessibility: colour palette.
     pub palette: crate::game::palette::PaletteKind,
-    pub ui_scale: u32,
+    /// The HUD, the radar, chat and the rest of what is drawn over the world.
+    pub view: GameView,
     /// Gamepad buttons per action (the left stick always steers).
     pub pad: PadBindings,
     /// Directory servers for the zone browser ("host:port").
@@ -112,7 +114,7 @@ impl Default for Config {
             bindings: Bindings::default(),
             macros: Vec::new(),
             palette: Default::default(),
-            ui_scale: 0,
+            view: GameView::default(),
             pad: PadBindings::default(),
             directories: DEFAULT_DIRECTORIES.iter().map(|&s| s.to_owned()).collect(),
             security: oss_session::security::AUTO.to_owned(),
@@ -123,6 +125,138 @@ impl Default for Config {
         }
     }
 }
+
+/// The zooms the settings window and the zoom keys step through: eighths up to
+/// 2, quarters up to 4, then whole numbers. Each is a whole number of screen
+/// pixels for a 16-pixel tile, so the map's tiles stay the same size as each
+/// other at every one of them.
+pub const ZOOM_STEPS: [f32; 19] = [
+    1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75, 1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75,
+    4.0, 6.0, 8.0,
+];
+
+/// The zoom step nearest `v`, so a value typed into the file lands on one.
+pub fn nearest_zoom(v: f32) -> f32 {
+    ZOOM_STEPS
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - v).abs().total_cmp(&(b - v).abs()))
+        .unwrap_or(1.0)
+}
+
+/// The zoom one step in (`dir` 1) or out (-1) from `v`, stopping at the ends.
+pub fn step_zoom(v: f32, dir: i32) -> f32 {
+    let i = ZOOM_STEPS
+        .iter()
+        .position(|z| *z == nearest_zoom(v))
+        .unwrap_or(0) as i32;
+    ZOOM_STEPS[(i + dir).clamp(0, ZOOM_STEPS.len() as i32 - 1) as usize]
+}
+
+/// What a ship's label shows beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShipNames {
+    /// Name and bounty, as Continuum shows them.
+    #[default]
+    NameAndBounty,
+    /// The name alone.
+    Name,
+    /// No labels.
+    Off,
+}
+
+impl ShipNames {
+    pub const ALL: [ShipNames; 3] = [ShipNames::NameAndBounty, ShipNames::Name, ShipNames::Off];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ShipNames::NameAndBounty => "name_and_bounty",
+            ShipNames::Name => "name",
+            ShipNames::Off => "off",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|n| n.name().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// What the frame-rate line shows when the game starts; F12 still cycles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameRate {
+    #[default]
+    Off,
+    /// Frames per second and the ping.
+    On,
+    /// That, and the renderer's own figures.
+    Detail,
+}
+
+impl FrameRate {
+    pub const ALL: [FrameRate; 3] = [FrameRate::Off, FrameRate::On, FrameRate::Detail];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FrameRate::Off => "off",
+            FrameRate::On => "on",
+            FrameRate::Detail => "detail",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|n| n.name().eq_ignore_ascii_case(s.trim()))
+    }
+}
+
+/// The game's own display settings: the HUD, the radar, chat and labels.
+///
+/// Percentages are of the size the game would pick by itself, so 100 is
+/// always what it looked like before the setting existed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GameView {
+    /// The HUD, chat, menus and every other piece of text, in percent.
+    pub hud_size: u32,
+    /// The small radar's side, in percent.
+    pub radar_size: u32,
+    /// How close the radar's map is, in percent: 200 shows half as much.
+    pub radar_zoom: u32,
+    pub ship_names: ShipNames,
+    /// Chat lines under the world; `None` lets the screen height decide.
+    pub chat_lines: Option<u32>,
+    /// The sender column of the chat log, in characters (`?namelen`).
+    pub name_width: u32,
+    pub frame_rate: FrameRate,
+    /// Voice lines and chat sounds, 0-100, under the master volume.
+    pub voice_volume: u32,
+}
+
+impl Default for GameView {
+    fn default() -> Self {
+        Self {
+            hud_size: 100,
+            radar_size: 100,
+            radar_zoom: 100,
+            ship_names: ShipNames::default(),
+            chat_lines: None,
+            name_width: crate::game::chat::DEFAULT_NAMELEN as u32,
+            frame_rate: FrameRate::default(),
+            voice_volume: 100,
+        }
+    }
+}
+
+/// The ranges of the [`GameView`] numbers: least, most and one step.
+pub const HUD_SIZE: (u32, u32, u32) = (50, 300, 25);
+pub const RADAR_SIZE: (u32, u32, u32) = (50, 250, 25);
+pub const RADAR_ZOOM: (u32, u32, u32) = (25, 400, 25);
+/// The most chat lines a setting asks for (the log's own ceiling).
+pub const CHAT_LINES_MAX: u32 = 20;
+/// The widest sender column (`?namelen` stops there too).
+pub const NAME_WIDTH_MAX: u32 = 24;
 
 /// The settings folder: `%APPDATA%\OpenSubSpace` on Windows, else
 /// `$XDG_CONFIG_HOME/open-subspace` or `~/.config/open-subspace`.
@@ -177,6 +311,25 @@ impl Config {
         }
     }
 
+    /// Browser play's settings: `local` is the whole file as this browser
+    /// last saved it for the pilot, and `account` the keys and macros the
+    /// pilot's account holds, which win over the browser's where it has any.
+    /// Either may be empty. The warnings say which of the two each came from.
+    pub fn for_browser(local: &str, account: &str) -> (Config, Vec<String>) {
+        let (mut c, warnings) = Config::parse(local);
+        let mut warnings: Vec<String> = warnings
+            .into_iter()
+            .map(|w| format!("browser settings: {w}"))
+            .collect();
+        if !account.trim().is_empty() {
+            let (pilot, more) = Config::parse(account);
+            warnings.extend(more.into_iter().map(|w| format!("pilot settings: {w}")));
+            c.bindings = pilot.bindings;
+            c.macros = pilot.macros;
+        }
+        (c, warnings)
+    }
+
     pub fn parse(text: &str) -> (Config, Vec<String>) {
         let mut c = Config::default();
         let mut warnings = Vec::new();
@@ -208,7 +361,7 @@ impl Config {
             };
             let (key, value) = (key.trim().to_ascii_lowercase(), value.trim());
             let result = match (section.as_str(), key.as_str()) {
-                ("video", "scale") => number(value, 0, 8).map(|n| c.scale = (n > 0).then_some(n)),
+                ("video", "scale") => zoom(value).map(|z| c.scale = z),
                 ("video", "vsync") => flag(value).map(|b| c.vsync = b),
                 ("video", "fullscreen") => flag(value).map(|b| c.fullscreen = b),
                 ("video", "skin") => {
@@ -234,7 +387,26 @@ impl Config {
                 ("accessibility", "palette") => crate::game::palette::PaletteKind::from_name(value)
                     .map(|p| c.palette = p)
                     .ok_or_else(|| format!("unknown palette `{value}`")),
-                ("accessibility", "ui_scale") => number(value, 0, 4).map(|n| c.ui_scale = n),
+                // Written before the HUD had a size of its own: each step was
+                // one more whole pixel scale, which is about half as large again.
+                ("accessibility", "ui_scale") => {
+                    number(value, 0, 4).map(|n| c.view.hud_size = (100 + 50 * n).min(HUD_SIZE.1))
+                }
+                ("hud", "size") => stepped(value, HUD_SIZE).map(|n| c.view.hud_size = n),
+                ("hud", "radar_size") => stepped(value, RADAR_SIZE).map(|n| c.view.radar_size = n),
+                ("hud", "radar_zoom") => stepped(value, RADAR_ZOOM).map(|n| c.view.radar_zoom = n),
+                ("hud", "ship_names") => ShipNames::from_name(value)
+                    .map(|n| c.view.ship_names = n)
+                    .ok_or_else(|| format!("unknown ship_names `{value}`")),
+                ("hud", "frame_rate") => FrameRate::from_name(value)
+                    .map(|f| c.view.frame_rate = f)
+                    .ok_or_else(|| format!("unknown frame_rate `{value}`")),
+                ("chat", "lines") => number(value, 0, CHAT_LINES_MAX)
+                    .map(|n| c.view.chat_lines = (n > 0).then_some(n)),
+                ("chat", "name_width") => {
+                    number(value, 1, NAME_WIDTH_MAX).map(|n| c.view.name_width = n)
+                }
+                ("audio", "voice_volume") => number(value, 0, 100).map(|n| c.view.voice_volume = n),
                 ("network", "identity") => flag(value).map(|b| c.identity = b),
                 // Kept as written: which words are good depends on the mechanisms
                 // the build has, and a word this build does not know is not this
@@ -330,8 +502,8 @@ impl Config {
              ; Command-line flags override these for one run, and are never saved here.\n\n[video]\n",
         );
         s += &format!(
-            "scale = {}          ; integer pixel scale 1-8, 0 = from the display\n",
-            self.scale.unwrap_or(0)
+            "scale = {}          ; zoom: screen pixels per game pixel, 1-8 (1.25, 1.5...), 0 = from the display\n",
+            self.scale.unwrap_or(0.0)
         );
         s += &format!("vsync = {}\nfullscreen = {}\n", self.vsync, self.fullscreen);
         s += &format!(
@@ -339,22 +511,46 @@ impl Config {
             self.skin
         );
         s += &format!(
-            "[audio]\nmute = {}\nvolume = {}         ; 0-100\n\n",
-            self.mute, self.volume
+            "[audio]\nmute = {}\nvolume = {}         ; 0-100\n\
+             voice_volume = {}  ; voice lines and chat sounds, 0-100 of the volume\n\n",
+            self.mute, self.volume, self.view.voice_volume
+        );
+        let v = &self.view;
+        s += &format!(
+            "[hud]\n\
+             ; Percent of the size the game picks by itself.\n\
+             size = {}         ; text, gauges, chat and menus, {}-{}\n\
+             radar_size = {}   ; {}-{}\n\
+             radar_zoom = {}   ; {}-{}: 200 shows half as much of the map\n\
+             ship_names = {}   ; name_and_bounty, name or off\n\
+             frame_rate = {}   ; at the start: off, on or detail (F12 cycles it)\n\n",
+            v.hud_size,
+            HUD_SIZE.0,
+            HUD_SIZE.1,
+            v.radar_size,
+            RADAR_SIZE.0,
+            RADAR_SIZE.1,
+            v.radar_zoom,
+            RADAR_ZOOM.0,
+            RADAR_ZOOM.1,
+            v.ship_names.name(),
+            v.frame_rate.name(),
         );
         s += &format!(
             "[chat]\n\
              ; yes: Enter opens the chat line, and V opens the voice menu. no: every\n\
              ; key types straight into chat, as in Continuum.\n\
-             enter_to_chat = {}\n\n",
-            self.enter_to_chat
+             enter_to_chat = {}\n\
+             lines = {}          ; chat lines shown, 0 = from the screen's height\n\
+             name_width = {}     ; the sender column, 1-24 characters\n\n",
+            self.enter_to_chat,
+            self.view.chat_lines.unwrap_or(0),
+            self.view.name_width,
         );
         s += &format!(
             "[accessibility]\n\
-             palette = {}  ; standard, deuteranopia, protanopia, tritanopia, high_contrast\n\
-             ui_scale = {}        ; 0-4: draw the interface (text, HUD) this much larger\n\n",
+             palette = {}  ; standard, deuteranopia, protanopia, tritanopia, high_contrast\n\n",
             self.palette.name(),
-            self.ui_scale
         );
         let order = MechanismPolicy::automatic(mechanisms).automatic_line(mechanisms);
         let names: Vec<&str> = mechanisms.ids().map(|id| id.as_str()).collect();
@@ -445,6 +641,21 @@ fn flag(v: &str) -> Result<bool, String> {
         "false" | "no" | "off" | "0" => Ok(false),
         _ => Err(format!("expected true or false, got `{v}`")),
     }
+}
+
+/// `[video] scale`: 0 for the display's own, else a zoom from 1 to 8, put on
+/// the nearest of [`ZOOM_STEPS`]. Whole numbers are what older files hold.
+fn zoom(v: &str) -> Result<Option<f32>, String> {
+    match v.parse::<f32>() {
+        Ok(0.0) => Ok(None),
+        Ok(z) if (1.0..=8.0).contains(&z) => Ok(Some(nearest_zoom(z))),
+        _ => Err(format!("expected a zoom 1-8, or 0, got `{v}`")),
+    }
+}
+
+/// A number in `range` (least, most, step), put on the nearest step.
+fn stepped(v: &str, (min, max, step): (u32, u32, u32)) -> Result<u32, String> {
+    number(v, min, max).map(|n| (n + step / 2) / step * step)
 }
 
 fn number(v: &str, min: u32, max: u32) -> Result<u32, String> {
@@ -650,12 +861,21 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(back, c);
         let custom = Config {
-            scale: Some(3),
+            scale: Some(1.375),
             vsync: true,
             mute: true,
             volume: 25,
             palette: crate::game::palette::PaletteKind::Tritanopia,
-            ui_scale: 2,
+            view: GameView {
+                hud_size: 150,
+                radar_size: 75,
+                radar_zoom: 200,
+                ship_names: ShipNames::Name,
+                chat_lines: Some(7),
+                name_width: 14,
+                frame_rate: FrameRate::Detail,
+                voice_volume: 40,
+            },
             pad: {
                 let mut p = PadBindings::default();
                 p.set(Action::Gun, vec![PadButton::R2, PadButton::South]);
@@ -670,6 +890,65 @@ mod tests {
             Config::parse(&custom.to_text(&MechanismRegistry::builtin())).0,
             custom
         );
+    }
+
+    /// Zooms from files written when the scale was a whole number still read,
+    /// and anything between the steps lands on the nearest one.
+    #[test]
+    fn zoom_reads_old_whole_numbers_and_lands_on_a_step() {
+        let read = |t: &str| Config::parse(&format!("[video]\nscale = {t}\n"));
+        assert_eq!(read("0").0.scale, None);
+        assert_eq!(read("3").0.scale, Some(3.0));
+        assert_eq!(read("1.5").0.scale, Some(1.5));
+        assert_eq!(read("1.3").0.scale, Some(1.25));
+        assert!(!read("9").1.is_empty(), "past the top is reported");
+        assert_eq!(step_zoom(1.0, -1), 1.0, "the bottom stops");
+        assert_eq!(step_zoom(1.0, 1), 1.125);
+        assert_eq!(step_zoom(4.0, 1), 6.0);
+        assert_eq!(step_zoom(8.0, 1), 8.0, "and so does the top");
+        // Every step draws a 16-pixel tile a whole number of pixels wide.
+        for z in ZOOM_STEPS {
+            assert_eq!((16.0 * z).fract(), 0.0, "{z}");
+        }
+    }
+
+    /// The old interface size becomes a HUD size, and a bad value is reported
+    /// rather than read.
+    #[test]
+    fn hud_settings_read_and_old_interface_size_carries_over() {
+        let (c, w) = Config::parse("[accessibility]\nui_scale = 2\n");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(c.view.hud_size, 200);
+        let (c, w) = Config::parse("[hud]\nsize = 130\nship_names = sideways\n");
+        assert_eq!(c.view.hud_size, 125, "on the nearest step");
+        assert_eq!(c.view.ship_names, ShipNames::NameAndBounty);
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    /// In the browser the zoom and the HUD come from the browser's copy, and
+    /// keys and macros from the account when it has some.
+    #[test]
+    fn browser_settings_take_keys_from_the_account() {
+        let local = Config {
+            scale: Some(1.5),
+            view: GameView {
+                hud_size: 125,
+                ..GameView::default()
+            },
+            macros: vec![(parse_binding("F5").unwrap(), "local".into())],
+            ..Config::default()
+        }
+        .to_text(&MechanismRegistry::builtin());
+        let (c, w) = Config::for_browser(&local, "");
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!((c.scale, c.view.hud_size), (Some(1.5), 125));
+        assert_eq!(c.macros[0].1, "local", "no account keys: the browser's");
+        let (c, _) = Config::for_browser(&local, "[macros]\nF6 = from account\n");
+        assert_eq!(c.scale, Some(1.5));
+        assert_eq!(c.macros.len(), 1);
+        assert_eq!(c.macros[0].1, "from account");
+        let (fresh, _) = Config::for_browser("", "");
+        assert_eq!(fresh, Config::default());
     }
 
     #[test]
@@ -780,7 +1059,7 @@ warpdrive = F9
 loud = yes
 ";
         let (c, warnings) = Config::parse(text);
-        assert_eq!(c.scale, Some(2));
+        assert_eq!(c.scale, Some(2.0));
         assert!(!c.fullscreen);
         assert_eq!(
             c.bindings.get(Action::Gun),

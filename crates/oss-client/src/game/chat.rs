@@ -473,6 +473,12 @@ impl ChatLog {
 
     /// Rows the log shows: what `?lines` asked for, else Continuum's
     /// `view_h / 100 + 1`; or the whole buffer while the menu is open.
+    /// The settings' chat lines: a count, or `None` for the screen's height to
+    /// decide, as `?lines` with no number does.
+    pub fn set_line_count(&mut self, lines: Option<usize>) {
+        self.lines = lines.map(|n| n.clamp(1, FULL_LINES));
+    }
+
     pub fn visible_rows(&self, view_h: f32, menu_open: bool) -> usize {
         if menu_open {
             return FULL_LINES;

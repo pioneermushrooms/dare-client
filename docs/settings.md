@@ -22,14 +22,15 @@ so a screenshot taken after another one shows a local path; use `--screenshot` (
 
 Most of the file can be changed from inside the client. Press **F2** (or click **Options**) on
 the start-up screen, or **Esc then O** in the game. The window is drawn in the game's own box:
-the sections down the left — Video, Audio, Accessibility, Keys, Gamepad, Macros — and the
+the sections down the left — Video, HUD, Audio, Accessibility, Keys, Gamepad, Macros — and the
 picked section's settings on the right.
 
 | Section | Holds |
 |---|---|
-| Video | Pixel scale (or "from display"), fullscreen, vsync |
-| Audio | Mute, volume |
-| Accessibility | Colour palette, interface size |
+| Video | Zoom (Auto, or 1x to 8x in fine steps, shown as how many tiles of the map fit on screen), fullscreen, vsync |
+| HUD | HUD size, radar size, radar zoom, names on ships, chat lines, name column, frame rate |
+| Audio | Mute, volume, voice volume |
+| Accessibility | Colour palette, Enter to chat |
 | Keys | The keys for every action: Change, Add or Clear each one, or restore Continuum's defaults |
 | Gamepad | The button for every action: Change or Clear each one, or restore the default layout |
 | Macros | Keys that send a line of chat: add one, type its line, or remove it |
@@ -50,10 +51,15 @@ cancels the wait, and so does a click. On a macro, typing goes into the line it 
 The line at the foot says what the picked line, or the one under the pointer, does.
 
 Save writes the file and applies at once everything that can change while playing: keys,
-buttons, macros, volume, pixel scale, fullscreen, palette and interface size. Vsync and
-mute take effect at the next start. The window shows the palette you are picking as you
-pick it, so you see it before you save it. It does not have a player name: that is set on
-the start-up screen.
+buttons, macros, volume, zoom, fullscreen, palette and the HUD section. Vsync and
+mute take effect at the next start. Opened over the game (Esc then O), the zoom, the HUD
+section, the volumes and the palette change behind the window as you pick them, so you see
+each one on the game itself; closing without saving puts them back. It does not have a
+player name: that is set on the start-up screen.
+
+In browser play there is no settings file: Save keeps the whole file in the browser, for
+the pilot who is signed in, and the next Enter as that pilot starts with it. Keys and macros
+the pilot's account holds still win over the browser's copy.
 
 ## Accessibility and scaling
 
@@ -61,12 +67,25 @@ the start-up screen.
 Enter opens the chat line and V opens the voice menu. Off, every key types straight into chat
 as in SubSpace and Continuum, and the voice menu is not available.
 
-`[accessibility] palette` picks a colour-blind or high-contrast palette; `ui_scale` draws the
-interface larger than the world, so the chat, stat box and menus can be read at a size that
-suits you without zooming the game. `--scale <n>` sets the integer pixel scale for the world
-(the default comes from the display's DPI), `Ctrl +/-` changes it in game, and `--fullscreen`
-is borderless. `--vsync` caps the frame rate to the display refresh; `--mute` turns the sound
-off.
+`[accessibility] palette` picks a colour-blind or high-contrast palette.
+
+`[video] scale` is the world's zoom: screen pixels to each game pixel, 0 for the display's
+own (2 on a high-DPI screen). Between 1 and 2 it moves in eighths, then quarters up to 4,
+then 6 and 8; every step draws a map tile a whole number of pixels wide. A whole number from
+an older file still reads. `--scale <n>` sets it for one run and `Ctrl +/-` steps it in game.
+
+`[hud]` sizes what is drawn over the world, each in percent of what the game picks by itself:
+`size` (text, gauges, chat and menus, 50-300; the old `[accessibility] ui_scale` is read
+as this), `radar_size` (50-250) and `radar_zoom` (25-400; 200 shows half as much of the map,
+twice as large). `ship_names` is `name_and_bounty`, `name` or `off`; `frame_rate` is what
+F12's line shows at the start (`off`, `on`, `detail`). `[chat] lines` (0 = from the screen's
+height) and `name_width` (1-24) are `?lines` and `?namelen` kept between games, and
+`[audio] voice_volume` sets voice lines and chat sounds under the volume.
+
+The HUD keeps the display's whole-number scale (or the zoom's whole part, where that is
+more) at a size of 100%, so a fine zoom like 1.5x moves the world without blurring the
+8x12 letters. `--fullscreen` is borderless. `--vsync` caps the frame rate to the display
+refresh; `--mute` turns the sound off.
 
 ## Where graphics and sounds come from
 
