@@ -39,10 +39,10 @@ pub struct Supplied {
     /// [`MechanismRegistry::builtin`] unless more are registered.
     pub mechanisms: MechanismRegistry,
     /// Which client the session presents itself as. `None` is
-    /// [`oss_session::VieClient`], as [`SessionConfig`] defaults to, except in
-    /// the browser build, where it is [`oss_session::KeyedVieClient`]: the
-    /// browser plays on the Foundation zone only, which verifies the keyed
-    /// executable checksum.
+    /// [`oss_session::VieClient`], as [`SessionConfig`] defaults to, except on
+    /// the Foundation zone (always, in the browser), where it is
+    /// [`oss_session::KeyedVieClient`]: that zone verifies the keyed executable
+    /// checksum.
     pub client: Option<Profile>,
 }
 
@@ -87,13 +87,13 @@ fn security_mode(
 
 /// The client a connection presents when nothing is supplied.
 ///
-/// The browser build connects to the Foundation zone only (its transport refuses
-/// any other server). That zone runs SubspaceServer, which compares a VIE
-/// client's executable checksum with the keyed value and reports every zero to
-/// its sysops as a mismatch, so the browser answers with the keyed value. The
-/// native client keeps the 1.34 client's zero.
-fn default_client(browser: bool) -> Profile {
-    if browser {
+/// The Foundation zone runs SubspaceServer, which compares a VIE client's
+/// executable checksum with the keyed value and reports every zero to its
+/// sysops as a mismatch, so on Foundation (always, in the browser) the client
+/// answers with the keyed value. Everywhere else it keeps the 1.34 client's
+/// zero, as the 1998 binary does.
+fn default_client(server: &str, browser: bool) -> Profile {
+    if browser || is_foundation(server) {
         oss_session::client::vie_keyed()
     } else {
         SessionConfig::default().client
@@ -318,7 +318,7 @@ impl Online {
             client: supplied
                 .client
                 .clone()
-                .unwrap_or_else(|| default_client(cfg!(target_arch = "wasm32"))),
+                .unwrap_or_else(|| default_client(&opts.server, cfg!(target_arch = "wasm32"))),
             redirect_id,
             ..Default::default()
         };
@@ -1204,26 +1204,29 @@ mod tests {
         );
     }
 
-    /// The browser build plays on Foundation only, whose zone verifies the keyed
-    /// executable checksum; the native client keeps the 1.34 client's zero. Both
-    /// log in as the SubSpace client.
+    /// Foundation (and so the browser, which plays nowhere else) verifies the
+    /// keyed executable checksum; every other zone gets the 1.34 client's zero.
+    /// All log in as the SubSpace client.
     #[test]
-    fn the_browser_answers_with_the_keyed_exe_checksum() {
+    fn foundation_gets_the_keyed_exe_checksum() {
         let challenge = SecurityChallenge {
             key: 0x1234_5678,
             map_crc32: None,
         };
-        let browser = default_client(true);
-        assert_eq!(
-            browser.security(challenge).exe_checksum,
-            oss_proto::checksum::vie_exe_checksum(challenge.key)
-        );
-        assert_eq!(browser.login().kind, 0x09);
-        assert_eq!(browser.security(challenge).continuum, None);
+        let keyed = oss_proto::checksum::vie_exe_checksum(challenge.key);
+        for client in [
+            default_client("anything:1", true),
+            default_client("5.161.238.245:5000", false),
+            default_client("subspacefoundation.com:5000", false),
+        ] {
+            assert_eq!(client.security(challenge).exe_checksum, keyed);
+            assert_eq!(client.login().kind, 0x09);
+            assert_eq!(client.security(challenge).continuum, None);
+        }
 
-        let native = default_client(false);
-        assert_eq!(native.security(challenge).exe_checksum, 0);
-        assert_eq!(native.login().kind, 0x09);
+        let elsewhere = default_client("ssr.example:5000", false);
+        assert_eq!(elsewhere.security(challenge).exe_checksum, 0);
+        assert_eq!(elsewhere.login().kind, 0x09);
     }
 
     /// An arena as it arrives: a big map, then a handful of small files.
