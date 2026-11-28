@@ -70,6 +70,11 @@ const SEARCH: usize = 20_000;
 /// to death.
 const FIRE_ENERGY: f32 = 0.35;
 
+/// A swarm bot holds this far (pixels) either side of its ring before it moves.
+const SWARM_BAND: f32 = 32.0;
+/// Ticks between a swarm bot's shots: 1.5 s at the simulation's 100 ticks a second.
+const SWARM_FIRE_TICKS: u32 = 150;
+
 /// How far ahead (pixels) a bot breaking off aims, away from the nearest enemy.
 const AWAY_PIXELS: f32 = 640.0;
 /// A bot leaving for spectator breaks off for at most this long (ms), and
@@ -174,6 +179,8 @@ pub struct Brain {
     roam_failed: Option<u32>,
     /// State of the little generator that picks roaming spots.
     seed: u32,
+    /// The tick a swarm bot last fired.
+    last_shot_tick: Option<u32>,
 }
 
 impl Brain {
@@ -193,6 +200,7 @@ impl Brain {
             roam: None,
             roam_failed: None,
             seed: 0,
+            last_shot_tick: None,
         }
     }
 
@@ -214,6 +222,7 @@ impl Brain {
             Behaviour::Patrol => self.patrol(v, nav),
             Behaviour::Sentry => self.sentry(v, nav),
             Behaviour::Fighter => self.fighter(v, nav),
+            Behaviour::Swarm => self.swarm(v),
         }
     }
 
@@ -295,6 +304,47 @@ impl Brain {
             input.forward = along > 20.0;
             input.backward = along < -20.0;
         }
+        input
+    }
+
+    /// Holds a ring `range` out from the nearest enemy, facing it: closes in
+    /// when farther, backs off when nearer, brakes within `SWARM_BAND` of the
+    /// ring (so a push out of it is always followed by a return). Fires only
+    /// when lined up and not within `SWARM_FIRE_TICKS` of the last shot; never
+    /// afterburns, bombs or dodges. With no enemy, stops where it is.
+    fn swarm(&mut self, v: &View) -> ShipInput {
+        let target = v
+            .enemies
+            .iter()
+            .min_by(|a, b| len(sub(a.pos, v.pos)).total_cmp(&len(sub(b.pos, v.pos))))
+            .copied();
+        let Some(t) = target else {
+            return seek(v, v.pos, 0.0);
+        };
+        let mut input = self.aim_and_fire(v, t);
+        let ready = self
+            .last_shot_tick
+            .is_none_or(|last| v.tick.wrapping_sub(last) >= SWARM_FIRE_TICKS);
+        if input.gun && ready {
+            self.last_shot_tick = Some(v.tick);
+        } else {
+            input.gun = false;
+        }
+        let to = sub(t.pos, v.pos);
+        let dist = len(to).max(1.0);
+        let err = dist - self.range;
+        // Speed along the line to the enemy: towards it when outside the ring.
+        let radial = if err.abs() <= SWARM_BAND {
+            0.0
+        } else {
+            (err * 2.0).clamp(-v.top_speed * 0.5, v.top_speed * 0.8)
+        };
+        let want = (to.0 / dist * radial, to.1 / dist * radial);
+        let steer = sub(want, v.vel);
+        let nose = heading(self.facing(v));
+        let along = steer.0 * nose.0 + steer.1 * nose.1;
+        input.forward = along > 20.0;
+        input.backward = along < -20.0;
         input
     }
 
@@ -684,6 +734,97 @@ mod tests {
         assert!(!l.ready(8999, true));
         assert!(l.ready(9000, true));
         assert!(l.ready(1000, false));
+    }
+
+    fn swarm_view<'a>(enemies: &'a [Contact], tick: u32) -> View<'a> {
+        View {
+            tick,
+            ..view(enemies, &[])
+        }
+    }
+
+    fn ahead_of_view(dist: f32) -> [Contact; 1] {
+        // The view faces up (rotation 500, direction 0) from (8000, 8000).
+        [Contact {
+            pos: (8000.0, 8000.0 - dist),
+            vel: (0.0, 0.0),
+        }]
+    }
+
+    #[test]
+    fn swarm_closes_to_its_ring_and_stops() {
+        let mut nav = Nav::new(&TileMap::empty(), 14);
+        // Range 12 tiles = 192 px. Enemy 600 px ahead: close in.
+        let mut brain = Brain::new(Behaviour::Swarm, vec![], 12);
+        let far = ahead_of_view(600.0);
+        let i = brain.think(&swarm_view(&far, 0), &mut nav);
+        assert!(
+            i.forward && !i.backward && !i.afterburner && !i.bomb,
+            "{i:?}"
+        );
+        // On the ring, and within 32 px either side of it: no drift.
+        for d in [160.0, 192.0, 224.0] {
+            let e = ahead_of_view(d);
+            let i = brain.think(&swarm_view(&e, 1), &mut nav);
+            assert!(!i.forward && !i.backward, "{d}: {i:?}");
+        }
+        // Much nearer than the ring: back off.
+        let near = ahead_of_view(60.0);
+        let i = brain.think(&swarm_view(&near, 2), &mut nav);
+        assert!(i.backward && !i.forward, "{i:?}");
+        // Drifting in on the ring: brake.
+        let e = ahead_of_view(192.0);
+        let mut v = swarm_view(&e, 3);
+        v.vel = (0.0, -150.0);
+        assert!(brain.think(&v, &mut nav).backward);
+        // Pushed back out (facing the enemy): it returns.
+        let out = ahead_of_view(400.0);
+        assert!(brain.think(&swarm_view(&out, 4), &mut nav).forward);
+    }
+
+    #[test]
+    fn swarm_turns_to_its_enemy_and_idles_without_one() {
+        let mut nav = Nav::new(&TileMap::empty(), 14);
+        let mut brain = Brain::new(Behaviour::Swarm, vec![], 12);
+        let right = [Contact {
+            pos: (8300.0, 8000.0),
+            vel: (0.0, 0.0),
+        }];
+        let i = brain.think(&swarm_view(&right, 0), &mut nav);
+        assert!(i.right && !i.left && !i.gun, "{i:?}");
+        assert_eq!(
+            brain.think(&swarm_view(&[], 1), &mut nav),
+            ShipInput::default()
+        );
+    }
+
+    #[test]
+    fn swarm_fires_no_more_than_every_1_5_s() {
+        let mut nav = Nav::new(&TileMap::empty(), 14);
+        let mut brain = Brain::new(Behaviour::Swarm, vec![], 12);
+        let e = ahead_of_view(192.0);
+        let shots: Vec<u32> = (0..300)
+            .filter(|&tick| brain.think(&swarm_view(&e, tick), &mut nav).gun)
+            .collect();
+        assert_eq!(shots, vec![0, 150], "{shots:?}");
+    }
+
+    #[test]
+    fn swarm_never_afterburns() {
+        let mut nav = Nav::new(&TileMap::empty(), 14);
+        let mut brain = Brain::new(Behaviour::Swarm, vec![], 12);
+        for d in [20.0, 192.0, 700.0, 3000.0] {
+            let e = ahead_of_view(d);
+            let shot = [Contact {
+                pos: (8000.0, 7990.0),
+                vel: (0.0, 400.0),
+            }];
+            let mut v = swarm_view(&e, 0);
+            v.shots = &shot;
+            v.energy = 1.0;
+            let i = brain.think(&v, &mut nav);
+            assert!(!i.afterburner && !i.bomb, "{d}: {i:?}");
+        }
     }
 
     #[test]

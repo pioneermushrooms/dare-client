@@ -52,7 +52,7 @@ Options:
   --count <n>            Run n bots (default 1)
   --fly                  Fly around (needs a ship): thrust, turn and shoot at random
   --script <file|->      Run one scripted bot: name, ship, behaviour (idle, patrol,
-                         sentry, fighter) and chat, read from the file, or from
+                         sentry, fighter, swarm) and chat, read from the file, or from
                          standard input with -. With -, the bot leaves the zone
                          when its standard input closes. Its settings override
                          the options above; the README has the format

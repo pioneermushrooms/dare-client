@@ -21,7 +21,9 @@
 //!
 //! `behaviour` is `idle` (sits still), `patrol` (flies the `point`s in a loop and
 //! never fires), `sentry` (holds the first `point` and fires at anyone within
-//! `range` tiles) or `fighter` (chases the nearest pilot and fires). Points are
+//! `range` tiles), `fighter` (chases the nearest pilot and fires) or `swarm`
+//! (holds a ring `range` tiles out from the nearest pilot, facing them, and fires
+//! a bullet every 1.5 s at most; never afterburns or dodges). Points are
 //! tiles, 0-1023. `greet` is said when a pilot arrives (`{name}` is their name),
 //! `announce` every so many seconds (60 or more), and `reply` answers a chat line
 //! that starts with the keyword, publicly or privately as it was asked. A bot
@@ -36,6 +38,9 @@ pub enum Behaviour {
     Patrol,
     Sentry,
     Fighter,
+    /// The tutorial's training swarm: holds a ring `range` tiles out from the
+    /// nearest pilot and fires slowly, with no dodging.
+    Swarm,
 }
 
 impl Behaviour {
@@ -45,6 +50,7 @@ impl Behaviour {
             "patrol" => Self::Patrol,
             "sentry" => Self::Sentry,
             "fighter" => Self::Fighter,
+            "swarm" => Self::Swarm,
             _ => return None,
         })
     }
@@ -130,7 +136,7 @@ pub fn parse(text: &str) -> Result<Script, String> {
             }
             "behaviour" | "behavior" => {
                 s.behaviour = Behaviour::from_name(rest)
-                    .ok_or_else(|| at("behaviour must be idle, patrol, sentry or fighter"))?
+                    .ok_or_else(|| at("behaviour must be idle, patrol, sentry, fighter or swarm"))?
             }
             "point" => {
                 let mut it = rest.split_whitespace();
