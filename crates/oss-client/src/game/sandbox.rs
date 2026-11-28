@@ -194,6 +194,8 @@ pub struct Sandbox {
     pub(super) effects: Vec<Effect>,
     pub(super) menu: bool,
     bot_menu: bool,
+    /// The zone's bot list for the bots window (`?bots data` lines, kept out of chat).
+    bots_feed: crate::game::bots_view::BotsFeed,
     pub(super) fps_view: hud::FpsView,
     /// The zone's arena list, while it is on screen (Esc then A, or `?arena`).
     arena_list: Option<arenas::ArenaList>,
@@ -489,6 +491,7 @@ impl Sandbox {
             effects: Vec::new(),
             menu: false,
             bot_menu: false,
+            bots_feed: Default::default(),
             fps_view: Default::default(),
             arena_list: None,
             last_ship: 0,
@@ -1755,6 +1758,9 @@ impl Sandbox {
                     }
                     if let Some(from) = chat::private_sender(kind, name.as_deref(), &text) {
                         self.chat.saw_private(&from);
+                    }
+                    if name.is_none() && self.bots_feed.line(&text) {
+                        continue;
                     }
                     if name.is_none() && self.settings_chat(&text) {
                         continue;
