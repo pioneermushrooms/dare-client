@@ -167,6 +167,11 @@ impl Sandbox {
     fn bot_menu_input(&mut self, strokes: &[Stroke]) {
         match self.bots_ui.input(strokes) {
             crate::game::bots_ui::BotsAction::Send(cmd) => self.send_chat_line(&cmd),
+            crate::game::bots_ui::BotsAction::SendMany(cmds) => {
+                for cmd in cmds {
+                    self.send_chat_line(&cmd);
+                }
+            }
             crate::game::bots_ui::BotsAction::Close => {
                 self.bot_menu = false;
                 self.chat.scroll_to_bottom();

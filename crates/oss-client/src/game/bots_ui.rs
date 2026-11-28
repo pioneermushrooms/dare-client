@@ -23,6 +23,8 @@ pub enum BotsAction {
     None,
     /// Send this `?bots …` command to the zone.
     Send(String),
+    /// Send these, in order.
+    SendMany(Vec<String>),
     /// Close the window.
     Close,
 }
@@ -69,7 +71,57 @@ enum Mode {
     Matches {
         row: usize,
     },
+    /// Making a bot, one step at a time.
+    Create(Draft),
 }
+
+/// A bot being made: [`STEPS`] in order, then a summary (`step == STEPS.len()`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Draft {
+    step: usize,
+    name: String,
+    /// Index into [`BEHAVIOURS`].
+    behaviour: usize,
+    ship: u8,
+    /// Typed digits; empty means 0.
+    team: String,
+    chat: bool,
+}
+
+impl Default for Draft {
+    fn default() -> Self {
+        Draft {
+            step: 0,
+            name: String::new(),
+            behaviour: 3, // fighter
+            ship: 1,
+            team: "0".into(),
+            chat: false,
+        }
+    }
+}
+
+impl Draft {
+    fn team(&self) -> i32 {
+        self.team.parse().unwrap_or(0)
+    }
+
+    fn command(&self) -> String {
+        format!(
+            "?bots create {} {} ship {} team {} chat {}",
+            self.name.trim(),
+            BEHAVIOURS[self.behaviour],
+            self.ship,
+            self.team(),
+            if self.chat { "on" } else { "off" }
+        )
+    }
+}
+
+/// The steps of Create, in order.
+const STEPS: [&str; 5] = ["Name", "Behaviour", "Ship", "Team", "Chat"];
+/// Longest bot name (the zone's rule).
+const NAME_MAX: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ask {
@@ -189,7 +241,9 @@ impl BotsUi {
                 if !self.owner() {
                     return BotsAction::None;
                 }
-                if code == Some(KeyCode::Enter) {
+                if ch == Some('c') || (code == Some(KeyCode::Enter) && self.sel == 0) {
+                    self.mode = Mode::Create(Draft::default());
+                } else if code == Some(KeyCode::Enter) {
                     if self.selected().is_some() {
                         self.mode = Mode::Bot { field: 0 };
                         self.typed.clear();
@@ -251,6 +305,13 @@ impl BotsUi {
                 }
                 BotsAction::None
             }
+            Mode::Create(mut draft) => {
+                let action = self.create_key(&mut draft, stroke, code, ch);
+                if let Mode::Create(_) = self.mode {
+                    self.mode = Mode::Create(draft);
+                }
+                action
+            }
             Mode::Matches { row } => {
                 let teams = self.teams();
                 if up || down {
@@ -283,6 +344,75 @@ impl BotsUi {
                 }
             }
         }
+    }
+
+    /// A key while making a bot.
+    fn create_key(
+        &mut self,
+        draft: &mut Draft,
+        stroke: Stroke,
+        code: Option<KeyCode>,
+        ch: Option<char>,
+    ) -> BotsAction {
+        let enter = code == Some(KeyCode::Enter);
+        let step = match code {
+            Some(KeyCode::ArrowRight) => 1,
+            Some(KeyCode::ArrowLeft) => -1,
+            _ => 0,
+        };
+        match draft.step {
+            0 => {
+                if enter {
+                    if !draft.name.trim().is_empty() {
+                        draft.step = 1;
+                    }
+                    return BotsAction::None;
+                } else if code == Some(KeyCode::Backspace) {
+                    draft.name.pop();
+                } else if let Some(c) = stroke.text.filter(|c| c.is_ascii_graphic() || *c == ' ')
+                    && draft.name.chars().count() < NAME_MAX
+                {
+                    draft.name.push(c);
+                }
+            }
+            1 => draft.behaviour = (draft.behaviour as i32 + step).rem_euclid(4) as usize,
+            2 => draft.ship = ((draft.ship as i32 - 1 + step).rem_euclid(8) + 1) as u8,
+            3 => {
+                if let Some(d) = stroke.text.filter(|c| c.is_ascii_digit()) {
+                    if draft.team == "0" {
+                        draft.team.clear();
+                    }
+                    if draft.team.len() < 4 {
+                        draft.team.push(d);
+                    }
+                } else if code == Some(KeyCode::Backspace) {
+                    draft.team.pop();
+                } else if step != 0 {
+                    draft.team = (draft.team() + step).clamp(0, 9999).to_string();
+                }
+            }
+            4 => {
+                if step != 0 || ch == Some(' ') {
+                    draft.chat = !draft.chat;
+                }
+            }
+            _ => {
+                let name = draft.name.trim().to_string();
+                let create = draft.command();
+                let action = match ch {
+                    Some('d') => BotsAction::Send(create),
+                    Some('s') => BotsAction::SendMany(vec![create, format!("?bots stop {name}")]),
+                    _ => return BotsAction::None,
+                };
+                self.mode = Mode::List;
+                self.status = Some(format!("Making {name}..."));
+                return action;
+            }
+        }
+        if enter && draft.step > 0 && draft.step < STEPS.len() {
+            draft.step += 1;
+        }
+        BotsAction::None
     }
 
     /// D: deploy a stopped bot, stop a deployed one.
@@ -340,10 +470,11 @@ impl BotsUi {
     /// Esc: back one level. False when already at the list (the caller closes the window).
     pub fn back(&mut self) -> bool {
         self.typed.clear();
-        if self.mode == Mode::List {
-            return false;
+        match &mut self.mode {
+            Mode::List => return false,
+            Mode::Create(draft) if draft.step > 0 => draft.step -= 1,
+            _ => self.mode = Mode::List,
         }
-        self.mode = Mode::List;
         true
     }
 
@@ -477,6 +608,44 @@ impl BotsUi {
                 push("-= Are you sure? =-".into(), color::GREEN, false, None);
                 push(question, color::YELLOW, false, None);
             }
+            Mode::Create(draft) => {
+                let done = draft.step >= STEPS.len();
+                push(
+                    if done {
+                        "-= New bot: ready =-".to_string()
+                    } else {
+                        format!("-= New bot: step {} of {} =-", draft.step + 1, STEPS.len())
+                    },
+                    color::GREEN,
+                    false,
+                    None,
+                );
+                let values = [
+                    format!("{}{}", draft.name, if draft.step == 0 { "_" } else { "" }),
+                    format!("< {} >", BEHAVIOURS[draft.behaviour]),
+                    format!("< {} ({}) >", draft.ship, SHIPS[(draft.ship - 1) as usize]),
+                    format!("{}{}", draft.team, if draft.step == 3 { "_" } else { "" }),
+                    format!("< {} >", if draft.chat { "on" } else { "off" }),
+                ];
+                for (i, (label, value)) in STEPS.iter().zip(values).enumerate().take(draft.step + 1)
+                {
+                    push(
+                        format!("   {label:<10} {value}"),
+                        color::WHITE,
+                        i == draft.step,
+                        None,
+                    );
+                }
+                let hint = match draft.step {
+                    0 => "Type its name (up to 20 characters).",
+                    1 => "fighter chases pilots, patrol flies a route.",
+                    2 => "The ship it flies.",
+                    3 => "Its team (frequency), 0-9999.",
+                    4 => "Chat on: it answers when named.",
+                    _ => "Deploy it now, or save it stopped.",
+                };
+                push(hint.into(), color::GREEN, false, None);
+            }
             Mode::Matches { row } => {
                 push("-= Team sizes =-".into(), color::GREEN, false, None);
                 push(
@@ -517,6 +686,7 @@ impl BotsUi {
                     "Enter = Open   Up/Down = Pick",
                     Stroke::press(KeyCode::Enter),
                 ),
+                ("C = Create a bot", letter(KeyCode::KeyC, 'c')),
                 ("D = Deploy / stop", letter(KeyCode::KeyD, 'd')),
                 ("M = Team sizes", letter(KeyCode::KeyM, 'm')),
                 ("Del = Remove", Stroke::press(KeyCode::Delete)),
@@ -540,6 +710,20 @@ impl BotsUi {
                     "Left/Right = Change   Up/Down = Pick",
                     Stroke::press(KeyCode::ArrowRight),
                 ),
+                ("Esc = Back", esc),
+            ],
+            Mode::Create(ref d) if d.step >= STEPS.len() => vec![
+                ("D = Deploy now", letter(KeyCode::KeyD, 'd')),
+                ("S = Save stopped", letter(KeyCode::KeyS, 's')),
+                ("Esc = Back", esc),
+            ],
+            Mode::Create(ref d) if d.step == 0 => vec![
+                ("Enter = Next", Stroke::press(KeyCode::Enter)),
+                ("Esc = Back", esc),
+            ],
+            Mode::Create(_) => vec![
+                ("Left/Right = Change", Stroke::press(KeyCode::ArrowRight)),
+                ("Enter = Next", Stroke::press(KeyCode::Enter)),
                 ("Esc = Back", esc),
             ],
         }
@@ -767,5 +951,99 @@ mod tests {
         assert!(refresh_due(true, 10.0, None));
         assert!(!refresh_due(true, 10.0, Some(9.0)));
         assert!(refresh_due(true, 10.0, Some(8.0)));
+    }
+
+    fn typed(text: &str) -> Vec<Stroke> {
+        text.chars().map(Stroke::text).collect()
+    }
+
+    fn actions(ui: &mut BotsUi, strokes: &[Stroke]) -> Vec<BotsAction> {
+        strokes
+            .iter()
+            .map(|s| ui.input(std::slice::from_ref(s)))
+            .filter(|a| *a != BotsAction::None)
+            .collect()
+    }
+
+    #[test]
+    fn create_walks_the_steps_and_sends_one_create() {
+        let mut u = ui(true, vec![bot("Alpha", true)]);
+        let mut keys = vec![key(KeyCode::Enter)]; // "Create a bot" is row 0
+        keys.extend(typed("Big Bob")); // d and s type, they don't deploy or stop all
+        keys.push(key(KeyCode::Enter)); // name
+        keys.push(key(KeyCode::Enter)); // behaviour: fighter
+        keys.push(key(KeyCode::ArrowRight)); // ship 2
+        keys.push(key(KeyCode::Enter));
+        keys.extend(typed("3")); // team 3
+        keys.push(key(KeyCode::Enter));
+        keys.push(key(KeyCode::ArrowRight)); // chat on
+        keys.push(key(KeyCode::Enter));
+        assert!(actions(&mut u, &keys).is_empty());
+        assert!(u.lines().iter().any(|l| l.text.contains("Big Bob")));
+        assert_eq!(
+            actions(&mut u, &[ch('d')]),
+            vec![BotsAction::Send(
+                "?bots create Big Bob fighter ship 2 team 3 chat on".into()
+            )]
+        );
+        // back at the list
+        assert!(!u.back());
+    }
+
+    #[test]
+    fn c_starts_create_too_and_esc_goes_back_one_step() {
+        let mut u = ui(true, vec![]);
+        assert!(actions(&mut u, &[ch('c')]).is_empty());
+        let mut keys = typed("Zed");
+        keys.push(key(KeyCode::Enter));
+        keys.push(key(KeyCode::ArrowLeft)); // behaviour: sentry
+        keys.push(key(KeyCode::Enter));
+        assert!(actions(&mut u, &keys).is_empty());
+        assert!(u.lines().iter().any(|l| l.text.contains("Ship")));
+        assert!(u.back()); // back to behaviour
+        assert!(u.lines().iter().any(|l| l.text.contains("sentry")));
+        assert!(u.back()); // back to name, still typed
+        assert!(u.lines().iter().any(|l| l.text.contains("Zed")));
+        assert!(u.back()); // back to the list
+        assert!(!u.back());
+    }
+
+    #[test]
+    fn save_stopped_creates_then_stops() {
+        let mut u = ui(true, vec![]);
+        let mut keys = vec![ch('c')];
+        keys.extend(typed("Quiet"));
+        keys.extend([key(KeyCode::Enter); 5]); // name, behaviour, ship, team, chat
+        assert!(actions(&mut u, &keys).is_empty());
+        assert_eq!(
+            actions(&mut u, &[ch('s')]),
+            vec![BotsAction::SendMany(vec![
+                "?bots create Quiet fighter ship 1 team 0 chat off".into(),
+                "?bots stop Quiet".into(),
+            ])]
+        );
+    }
+
+    #[test]
+    fn a_name_over_20_characters_is_cut() {
+        let mut u = ui(true, vec![]);
+        let mut keys = vec![ch('c')];
+        keys.extend(typed("Abcdefghijklmnopqrstuvwxyz"));
+        keys.push(key(KeyCode::Backspace));
+        keys.extend([key(KeyCode::Enter); 5]);
+        assert!(actions(&mut u, &keys).is_empty());
+        assert_eq!(
+            actions(&mut u, &[ch('d')]),
+            vec![BotsAction::Send(
+                "?bots create Abcdefghijklmnopqrs fighter ship 1 team 0 chat off".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn an_empty_name_does_not_go_on() {
+        let mut u = ui(true, vec![]);
+        assert!(actions(&mut u, &[ch('c'), key(KeyCode::Enter), key(KeyCode::Enter)]).is_empty());
+        assert!(u.lines().iter().any(|l| l.text.contains("Name")));
     }
 }
