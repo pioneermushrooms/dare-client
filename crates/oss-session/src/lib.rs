@@ -369,6 +369,13 @@ pub enum SessionEvent {
     },
     /// The zone's news file, as text ([`Session::request_news`] asked for it).
     News(String),
+    /// A file the zone sent on its own (S2C `0x10` with a name), such as the
+    /// `server.set` list of arena settings a zone sends in answer to
+    /// `?quickfix`. Raw bytes, as sent.
+    IncomingFile {
+        name: String,
+        data: Vec<u8>,
+    },
     /// A flag is on the map at tile (x, y), owned by `freq` (`0xFFFF` neutral)
     /// (S2C `0x12`).
     FlagLocation {
@@ -1581,6 +1588,20 @@ impl Session {
     /// Asks for the zone's news file (C2S `0x0D`). It arrives as an S2C `0x10`
     /// with an all-zero name, zlib-compressed, and is reported as
     /// [`SessionEvent::News`]. Does nothing when the zone has no news.
+    /// Sends arena setting changes (C2S `0x1D`), each as `(section, key, value)`,
+    /// the way Continuum's settings window does. The zone decides whether to
+    /// take them and says so in chat.
+    pub fn send_setting_changes(&mut self, changes: &[(String, String, String)]) {
+        if changes.is_empty() {
+            return;
+        }
+        let entries = changes
+            .iter()
+            .map(|(section, key, value)| format!("{section}:{key}:{value}").into_bytes())
+            .collect();
+        self.send(&c2s::SettingChange { entries }, true);
+    }
+
     pub fn request_news(&mut self) {
         if self.news_checksum == 0 || self.news_pending {
             return;
@@ -1687,12 +1708,16 @@ impl Session {
         }
     }
 
-    /// S2C `0x10`. An all-zero name is the news file; anything else is a file
-    /// transfer this client never starts, so it is only logged.
+    /// S2C `0x10`. An all-zero name is the news file; anything else is a file the
+    /// zone pushed (the settings list `?quickfix` asks for), handed on as
+    /// [`SessionEvent::IncomingFile`] for the client to use or ignore.
     fn on_news(&mut self, name: &FixedStr<16>, data: &[u8]) {
         let name = fixed_to_string(name.as_bytes());
         if !name.is_empty() {
-            log::debug!("ignoring an incoming file we did not ask for: {name}");
+            self.events.push_back(SessionEvent::IncomingFile {
+                name,
+                data: data.to_vec(),
+            });
             return;
         }
         self.news_pending = false;

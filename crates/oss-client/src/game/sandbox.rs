@@ -36,6 +36,7 @@ use super::voice;
 use crate::audio::Audio;
 use crate::gfx::{Renderer, StarParams, TextureId};
 
+mod arena_settings;
 mod arenas;
 mod commands;
 mod help;
@@ -133,6 +134,14 @@ pub struct Sandbox {
     news: Vec<String>,
     news_open: bool,
     news_scroll: usize,
+    /// The arena settings window (Esc then E): its list, kept for the arena.
+    arena_settings: Option<arena_settings::Editor>,
+    /// Whether that window is on screen.
+    arena_settings_open: bool,
+    /// The window asked the zone for its list and it has not come yet.
+    settings_wanted: bool,
+    /// Whether the zone lets us open it in this arena.
+    settings_access: arena_settings::Access,
     /// The F1 help pages are up, and which one.
     help_open: bool,
     help_page: usize,
@@ -435,6 +444,10 @@ impl Sandbox {
             news: Vec::new(),
             news_open: false,
             news_scroll: 0,
+            arena_settings: None,
+            arena_settings_open: false,
+            settings_wanted: false,
+            settings_access: arena_settings::Access::Unknown,
             help_open: false,
             help_page: 0,
             help_count: 0,
@@ -761,7 +774,7 @@ impl Sandbox {
         // "Message history (ESC) displays more chat, and you can fly while it
         // is on". The chat line's rule already draws exactly that line between
         // the two kinds of key, so the menu borrows it.
-        input.set_typing(self.menu || self.keys_type());
+        input.set_typing(self.menu || self.arena_settings_open || self.keys_type());
         self.voice.tick(self.clock);
         // The help shows the player's own keys, so it reads the live table. Copied
         // only while it is open, which is the only time anything looks at it.
@@ -1033,6 +1046,11 @@ impl Sandbox {
             edges.clear();
             return;
         }
+        if self.arena_settings_open {
+            self.arena_settings_input(strokes, ctrl);
+            edges.clear();
+            return;
+        }
         if self.news_open {
             for stroke in strokes {
                 // Scrolling takes the repeats, so the news can be held through;
@@ -1075,6 +1093,10 @@ impl Sandbox {
                 self.bot_menu = false;
             } else {
                 self.menu = !self.menu;
+                if self.menu {
+                    // So the menu can offer E where the zone allows it.
+                    self.probe_settings_access();
+                }
             }
             // Continuum shows the whole chat buffer while the menu is open
             // (nullspace `Game.cpp`); leaving it puts the log back at the newest.
@@ -1674,8 +1696,17 @@ impl Sandbox {
                     if let Some(from) = chat::private_sender(kind, name.as_deref(), &text) {
                         self.chat.saw_private(&from);
                     }
+                    if name.is_none() && self.settings_chat(&text) {
+                        continue;
+                    }
                     self.chat_message(kind, name, text);
                 }
+                SessionEvent::IncomingFile { name, data } => self.incoming_file(&name, &data),
+                SessionEvent::TransferProgress {
+                    name,
+                    received,
+                    total,
+                } => self.settings_progress(&name, received, total),
                 SessionEvent::News(text) => {
                     self.news = text.replace('\r', "").lines().map(str::to_string).collect();
                     self.message(
@@ -2216,6 +2247,11 @@ impl Sandbox {
             self.attachments.len(),
         );
         self.arena_change = true;
+        // Who may edit settings is a question for each arena.
+        self.arena_settings = None;
+        self.arena_settings_open = false;
+        self.settings_wanted = false;
+        self.settings_access = arena_settings::Access::Unknown;
         let new_id = if self.is_replay() {
             self.me_id
         } else {
@@ -2751,6 +2787,9 @@ impl Sandbox {
         self.draw_arena_list(&ui, r);
         if self.menu {
             self.draw_menu(&ui, r);
+        }
+        if self.arena_settings_open {
+            self.draw_arena_settings(&ui, r);
         }
         if self.news_open {
             self.draw_news(&ui, r);
