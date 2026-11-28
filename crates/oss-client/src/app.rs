@@ -863,6 +863,13 @@ struct Running {
     /// The window can't be seen (minimised/covered); Windows then stops sending
     /// redraws, so the game is driven from `about_to_wait` without drawing.
     occluded: bool,
+    /// When the GPU last refused a frame as unshowable ([`FrameError::Hidden`]).
+    /// macOS often says nothing to the window when it is covered, but the surface
+    /// then hands back no buffer: drawing straight on spun the loop tens of
+    /// thousands of times a second, and a buffer that never came held it a whole
+    /// second. Until a frame goes through again it is treated as occluded, and a
+    /// frame is only tried every [`HIDDEN_PROBE`].
+    surface_hidden: Option<web_time::Instant>,
     /// The login form to come back to when the player leaves the game, as it was
     /// when they went in. `None` when the run never passed through it.
     front_end: Option<Login>,
@@ -1217,6 +1224,7 @@ impl ApplicationHandler<AppEvent> for App {
                 if let Some(run) = self.running.as_mut() {
                     run.occluded = hidden;
                     if !hidden {
+                        run.surface_hidden = None;
                         run.window.request_redraw();
                     }
                 }
@@ -1328,9 +1336,17 @@ impl ApplicationHandler<AppEvent> for App {
         let Some(run) = self.running.as_ref() else {
             return;
         };
-        if run.occluded {
+        if run.occluded || run.surface_hidden.is_some() {
             // Keep the simulation and connection alive, at a modest rate.
             self.frame(event_loop, false);
+            if let Some(run) = self.running.as_ref()
+                && !run.occluded
+                && run
+                    .surface_hidden
+                    .is_some_and(|t| hidden_probe_due(t, web_time::Instant::now()))
+            {
+                run.window.request_redraw();
+            }
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 web_time::Instant::now() + std::time::Duration::from_millis(5),
             ));
@@ -1485,6 +1501,7 @@ impl App {
             started: web_time::Instant::now(),
             captured: false,
             occluded: false,
+            surface_hidden: None,
         });
     }
 
@@ -2128,10 +2145,18 @@ impl App {
         if let Some(ui) = self.settings.as_mut() {
             draw_settings(ui, &run.screen, &mut run.renderer, run.scale, cursor);
         }
-        match run.renderer.render(stars, 0.0) {
-            Ok(()) | Err(FrameError::Skip) => {}
+        let shown = match run.renderer.render(stars, 0.0) {
+            Ok(()) => {
+                run.surface_hidden = None;
+                true
+            }
+            Err(FrameError::Skip) => true,
+            Err(FrameError::Hidden) => {
+                run.surface_hidden = Some(web_time::Instant::now());
+                false
+            }
             Err(FrameError::Fatal(e)) => return self.fail(event_loop, e),
-        }
+        };
         #[cfg(target_arch = "wasm32")]
         if let Screen::Connecting(conn) = &mut run.screen {
             conn.tell_page();
@@ -2151,8 +2176,21 @@ impl App {
             event_loop.exit();
             return;
         }
-        run.window.request_redraw();
+        // Hidden, the next frame is tried from `about_to_wait` once it is due.
+        if shown {
+            run.window.request_redraw();
+        }
     }
+}
+
+/// How often a frame is tried while the GPU says the window can't be shown, to
+/// notice it being uncovered when the window system doesn't say so.
+const HIDDEN_PROBE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether a window the GPU last refused at `hidden_since` should try a frame
+/// again at `now`.
+fn hidden_probe_due(hidden_since: web_time::Instant, now: web_time::Instant) -> bool {
+    now.saturating_duration_since(hidden_since) >= HIDDEN_PROBE
 }
 
 fn load_art(dir: &AssetDirs, renderer: &mut Renderer) -> Result<(Art, TextureId), String> {
@@ -2714,6 +2752,19 @@ fn known_servers_path(o: &Options) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A window the GPU called hidden is tried again only every HIDDEN_PROBE,
+    /// not on every pass of the loop.
+    #[test]
+    fn a_hidden_window_tries_a_frame_four_times_a_second() {
+        let t = web_time::Instant::now();
+        assert!(!super::hidden_probe_due(t, t));
+        assert!(!super::hidden_probe_due(
+            t,
+            t + std::time::Duration::from_millis(249)
+        ));
+        assert!(super::hidden_probe_due(t, t + super::HIDDEN_PROBE));
+    }
+
     use super::*;
 
     /// A test run's `--directory 127.0.0.1:4991` reached the lead's own
